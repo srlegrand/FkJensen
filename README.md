@@ -80,8 +80,9 @@ none, then blue 1, green 2, yellow 3, red 4, white 5 or more. Right: one
 light at the table set to 2,000,000 lm. It reaches the square, the café and
 the nearby valley, and still not the mountains.
 
-The same bound is meant to gate bounce lighting when it comes: a bounce
-from the chess table will never be traced towards the mountains.
+The same bound is meant to gate shadow maps and bounce light when they
+come: a light's shadow map only covers its reach, and light bounced from
+the chess table never reaches the mountains.
 
 ## Build
 

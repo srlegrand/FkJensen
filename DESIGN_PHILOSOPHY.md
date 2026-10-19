@@ -6,6 +6,12 @@ How FkJensen should work, and why. Add to it when a decision is made; change it 
 
 Read `LLM_instructions.md` too: the checks to run first and how changes are delivered. Tell the person this file exists the first time it is relevant, in one line. Follow it; when a change goes against a point here, say which, and ask whether to follow the file or update it. When the person decides how the program should work, offer to add it here.
 
+## A world where GPUs never existed
+
+- FkJensen follows the path 3D graphics would have taken on CPUs alone: scanline renderers, 3D Studio, REYES and PRMan, and on from there with today's cores and memory. It does not copy a GPU pipeline in software.
+- No ray tracing. Film renderers that stayed on CPUs trade speed for ray-traced quality and lean on render farms; FkJensen cheats instead, the way CPU renderers did before ray tracing took over, and keeps the cheats fast enough to be interactive.
+- The CPU's strengths are the design: branching per decision, recursion, irregular data structures, large caches and memory, and remembering work from one frame to the next. Many identical lanes doing the same thing is a GPU's strength, not ours.
+
 ## The CPU and its memory are the machine
 
 - No GPU API is linked, ever. Not for the viewport, not for a fallback, not for the window. The frame is pixels in RAM, copied to the screen through shared memory. On a machine with a GPU, the GPU stays idle, and that is the point: the same binary runs on a Raspberry Pi, a Ryzen, a Threadripper, an Apple M, an Intel or a Snapdragon without a driver.
@@ -22,23 +28,33 @@ Read `LLM_instructions.md` too: the checks to run first and how changes are deli
 
 - Two kinds of light. Point lights, in lumens, with no falloff radius: the inverse square law alone. And the sky, in lux, which reaches every surface the same way whatever its distance. Nothing else.
 - Lumens are limited to lights that exist in the real world: at most about an 18 kW HMI (2,000,000 lm). No sun on a chess table.
-- A light's reach is where its contribution stops being visible, from physics and the exposure, not a radius set by hand. Work beyond it is never done: a light on the chess table is never evaluated on the shopfront or the mountains, and a bounce from the table will never be traced towards them. This is what makes large environments affordable.
+- A light's reach is where its contribution stops being visible, from physics and the exposure, not a radius set by hand. Work beyond it is never done: a light on the chess table is never evaluated on the shopfront or the mountains, its shadow map only covers its reach, and light bounced from the table never reaches them. This is what makes large environments affordable.
 - Moving lights interactively and seeing the result is the first job of the viewer.
 
 ## Cost follows pixels, not polygons
 
-- Visibility first, shading after: a visibility buffer of depth and triangle id, then one shade per pixel. A hidden surface is never shaded.
-- Tiles own their pixels: one thread rasterises one tile, with no atomics and no locks.
+- REYES is the core: clusters are diced into micropolygons about a pixel across, shaded in world space before visibility, then sampled into the frame (Cook, Carpenter, Catmull 1987). Shading is per micropolygon, not per pixel per frame, and it is kept.
+- Shading results stay in memory between frames, keyed by micropolygon. Moving the camera reuses them; moving a light re-shades only the micropolygons inside its old and new reach. Cost follows what changed, not the size of the frame.
+- Work is decided per region: sparse where the picture is smooth, refined where neighbours disagree (silhouettes, shadow edges, highlights), front to back, stopping where a tile is covered.
+- Tiles (buckets) own their pixels: one thread works one bucket, with no atomics and no locks.
 - Clusters are small in space as well as in count, so culling and light reach work per cluster.
-- A mesh with more vertices than pixels is splatted, not rasterised: project each vertex, depth-test one pixel. Per-frame cost is then proportional to the screen, as ZBrush showed in 1999, Dreams in 2015 and Nanite in 2021.
-- Clusters carry level of detail: meshes are cut into fixed-size clusters at import, each with bounds and coarser levels, and the level whose spacing is about a pixel is the one drawn. Import bakes geometry only.
+- A mesh with more vertices than pixels is splatted, not diced: project each vertex, depth-test one pixel. Per-frame cost is then proportional to the screen, as ZBrush showed on CPUs in 1999.
+- Clusters carry level of detail: meshes are cut into fixed-size clusters at import, each with bounds and coarser levels, and the level whose spacing is about a pixel is the one diced. Import bakes geometry only.
+
+## Cheats, not rays
+
+Each effect uses the CPU-era cheat for it, cached and invalidated by light reach:
+
+- Shadows: one cube shadow map per point light, covering its reach, re-rendered only when the light or geometry in its reach moves (Williams 1978), filtered for soft edges (Reeves, Salesin, Cook 1987). Deep shadow maps for fur and volumes (Lokovic, Veach 2000).
+- Reflections: environment maps, and a cube map rendered from each reflective object, as 3D Studio's Auto Reflect did (Blinn, Newell 1976). Re-rendered only when something it sees changes.
+- Bounce light: the lit micropolygon cache is gathered into a tree of micro lights, far ones merged, near ones kept apart (point-based colour bleeding, Christensen 2008; Lightcuts). The automatic form of placing 16 to 32 lights on a hemisphere to fake GI.
+- Soft sky light: spherical harmonics and precomputed transfer where they fit (Sloan, Kautz, Snyder 2002).
+- Hair: Kajiya-Kay shading (1989).
 
 ## Light is cached, not baked
 
-- Every lighting result is addressed by a world-space key and a resolution, kept in one memory-capped cache with eviction, and filled on demand. The cache is the interface; the technique that fills it (rays, spherical harmonics, screen space) is replaceable.
+- Every lighting result is addressed by a world-space key and a resolution, kept in one memory-capped cache with eviction, and filled on demand. The cache is the interface; the cheat that fills it is replaceable.
 - Nothing about light is baked at import. A scene never exceeds the cache budget; it converges slower.
-- Rays are the oracle that fills caches, against the coarsest level or a distance field, not the per-pixel method.
-- The lit surface cache is also the set of micro lights: far ones gathered into one, near ones kept apart (Lightcuts, Christensen's point-based colour bleeding), so diffuse bounce costs no rays per pixel.
 
 ## Say what is true
 
@@ -48,6 +64,7 @@ Read `LLM_instructions.md` too: the checks to run first and how changes are deli
 
 ## Log
 
+- 19/10/2026: no ray tracing. FkJensen follows a world where GPUs never existed: REYES micropolygons shaded in world space and kept between frames replace the visibility buffer; shadows from shadow maps, reflections from environment and per-object cube maps, bounce from point-based colour bleeding. "Rays are the oracle that fills caches" removed. The current code still rasterises with a visibility buffer and does not follow this yet.
 - 19/10/2026: the sky added as the second light; point lights in lumens, capped at 2,000,000 lm; light reach per cluster. Built-in set extended to a café shopfront at 40 m and mountains at 4 to 12 km.
 - 19/10/2026: USD reading removed; scenes are `.fkj`, the chess set is baked into the program. The point light is the only light type; no ambient term. Lights are dragged on screen.
 - 19/10/2026: file created. CPU and RAM only, Rust, no GPU API; visibility buffer and deferred shading; tiles without atomics; splatting and cluster LOD planned; lighting as a demand-filled cache with micro lights, nothing baked at import. First build: USD viewport with orbit and fly camera and placeable master lights.
