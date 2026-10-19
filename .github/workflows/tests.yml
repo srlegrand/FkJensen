@@ -11,8 +11,10 @@ jobs:
       - run: cargo build --release
       - name: Render the built-in scene headless
         run: |
-          ./target/release/fkjensen --png chess_set.png --size 1280x720
-          ./target/release/fkjensen --png chess_set_moved_light.png --size 1280x720 --light 0.1,0.3,0.2,0.5
+          ./target/release/fkjensen --png set_wide.png --size 1280x720
+          ./target/release/fkjensen --png set_close.png --size 1280x720 --close
+          ./target/release/fkjensen --png light_count.png --size 1280x720 --view lights
+          ./target/release/fkjensen --png brightest_light_count.png --size 1280x720 --view lights --light -0.2,1.1,0.22,2000000
       - uses: actions/upload-artifact@v4
         with:
           name: renders

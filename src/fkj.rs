@@ -11,7 +11,7 @@
 //! ```
 //!
 //! Tags: `MESH` clustered triangles, `INST` copies of a run of clusters at
-//! other transforms, `LITE` point lights. Reserved for the primitives still
+//! other transforms, `LITE` point lights in lumens. Reserved for the primitives still
 //! to come: `PNTS` (points, particles), `CURV` (curves, fur and hair),
 //! `VOLM` (volumes).
 
@@ -205,17 +205,17 @@ pub fn write(scene: &Scene, instances: &[InstanceGroup]) -> Vec<u8> {
         section(&mut out, TAG_INST, 1, &g.0);
     }
 
-    // LITE
+    // LITE, version 2: lumens.
     let mut l = W(Vec::new());
     l.u32(scene.lights.len() as u32);
     l.u32(0);
     for li in &scene.lights {
         l.v3(li.position);
         l.v3(li.color);
-        l.f32(li.intensity);
+        l.f32(li.lumens);
         l.f32(0.0);
     }
-    section(&mut out, TAG_LITE, 1, &l.0);
+    section(&mut out, TAG_LITE, 2, &l.0);
     out.0
 }
 
@@ -284,13 +284,14 @@ pub fn read(bytes: &[u8]) -> Result<(Scene, ReadReport), String> {
     let mut inst_payloads: Vec<&[u8]> = Vec::new();
     for _ in 0..sections {
         let tag: [u8; 4] = r.take(4)?.try_into().unwrap();
-        let _section_version = r.u32()?;
+        let section_version = r.u32()?;
         let len = r.u64()? as usize;
         let payload = r.take(len)?;
         r.at = r.at.div_ceil(8) * 8;
         match tag {
             TAG_MESH => read_mesh(payload, &mut scene)?,
-            TAG_LITE => read_lights(payload, &mut scene)?,
+            TAG_LITE if section_version == 2 => read_lights(payload, &mut scene)?,
+            TAG_LITE => report.skipped.push(format!("LITE version {section_version} (relative units, not lumens)")),
             TAG_INST => inst_payloads.push(payload),
             other => report.skipped.push(String::from_utf8_lossy(&other).into_owned()),
         }
@@ -471,9 +472,9 @@ fn read_lights(b: &[u8], scene: &mut Scene) -> Result<(), String> {
     for _ in 0..n {
         let position = r.v3()?;
         let color = r.v3()?;
-        let intensity = r.f32()?;
+        let lumens = r.f32()?;
         r.f32()?;
-        scene.lights.push(PointLight { position, color, intensity });
+        scene.lights.push(PointLight { position, color, lumens });
     }
     Ok(())
 }
@@ -488,7 +489,7 @@ mod tests {
         let colors: Vec<Vec3> = p.iter().map(|v| (*v * 0.5 + Vec3::splat(0.5)).powf(2.2)).collect();
         let mut s = Scene::new();
         s.push_mesh(&p, &[], &colors, &idx);
-        s.lights.push(PointLight { position: Vec3::new(1.0, 2.0, 3.0), color: Vec3::new(1.0, 0.5, 0.25), intensity: 2.5 });
+        s.lights.push(PointLight { position: Vec3::new(1.0, 2.0, 3.0), color: Vec3::new(1.0, 0.5, 0.25), lumens: 800.0 });
         s
     }
 
@@ -579,5 +580,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn old_relative_lights_are_skipped_not_misread() {
+        let mut bytes = write(&sample(), &[]);
+        // Find the LITE section and mark it version 1.
+        let at = bytes.windows(4).position(|w| w == b"LITE").unwrap();
+        bytes[at + 4..at + 8].copy_from_slice(&1u32.to_le_bytes());
+        let (b, rep) = read(&bytes).unwrap();
+        assert!(b.lights.is_empty());
+        assert_eq!(rep.skipped.len(), 1);
+        assert!(rep.skipped[0].starts_with("LITE version 1"));
     }
 }

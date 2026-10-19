@@ -32,7 +32,7 @@ A reader skips any section whose tag it does not know, using the length.
 |---|---|---|
 | `MESH` | clustered triangle mesh | yes |
 | `INST` | extra copies of mesh clusters at other transforms | yes |
-| `LITE` | point lights | yes |
+| `LITE` | point lights, lumens (section version 2) | yes; version 1 skipped |
 | `PNTS` | points, particles | reserved |
 | `CURV` | curves, fur and hair | reserved |
 | `VOLM` | volumes | reserved |
@@ -54,7 +54,9 @@ All geometry is in world space, metres, Y up.
     T x 3 bytes    triangles: three u8 indices local to their cluster
 
 A cluster holds at most 64 vertices and 124 triangles, so a triangle's
-corners fit in one byte each. Clusters own contiguous runs of vertices and
+corners fit in one byte each. It is also kept small in space: the builder
+closes a cluster before its box grows past 16 typical triangle sizes, since
+a cluster that spans a whole mesh defeats frustum culling and light reach. Clusters own contiguous runs of vertices and
 triangles and are stored in that order.
 
     cluster, 64 bytes
@@ -98,16 +100,22 @@ pawns: one pawn per side is stored, seven copies each come from `INST`.
 
 ## LITE
 
+Section version 2.
+
     u32       light count
     u32       0
     per light, 32 bytes
-      f32 x 3   position
-      f32 x 3   colour, linear RGB
-      f32       intensity
+      f32 x 3   position, metres
+      f32 x 3   colour, linear RGB, luminance 1
+      f32       luminous flux, lumens
       f32       0
 
-Every light is a point light. Irradiance from a light falls off with 1/d²
-and is scaled so that intensity 1 at one scene radius gives irradiance 1.
+Every light is a point light with no falloff radius: intensity is
+lumens / 4π candela, and the illuminance at distance d is that over d² lux.
+Lumens are kept between 1 and 2,000,000 (about an 18 kW HMI). Version 1
+sections, which held a relative intensity, are skipped and reported.
+
+The sky is not stored in the file; it is a viewer setting.
 
 ## The built-in scene
 
@@ -124,11 +132,14 @@ repository:
   5 x 5 texel footprint at each of its UV corners, converted to linear;
 - pawn tops are glass in the source, with no base colour texture: their
   transmission colour is used as albedo;
-- two point lights, a warm key and a cool fill, placed for this viewer.
+- no lights: the file holds geometry only. The lights of the built-in set
+  are in `src/world.rs`.
 
 Stored: 799,384 triangles, 821,485 vertices, 12,903 clusters, 14.7 MB.
 Loaded, with the pawn instances: 1,430,784 triangles, 1,366,001 vertices,
-21,443 clusters.
+21,443 clusters. At start-up it is placed on the table of the procedural
+set in `src/world.rs` (shopfront, square, valley, mountains), which is made
+directly into clusters and is not stored as a file.
 
 ## Not done yet
 

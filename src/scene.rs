@@ -20,14 +20,36 @@ pub const CLUSTER_VERTS: usize = 64;
 /// Most triangles in one cluster.
 pub const CLUSTER_TRIS: usize = 124;
 
-/// The only light type: a point light. Falloff is 1/d², scaled so that
-/// intensity 1 at one scene radius gives irradiance 1.
+/// The brightest point light allowed, in lumens: about what an 18 kW HMI,
+/// the largest common film light, puts out. Lights are kept to what exists
+/// in the real world.
+pub const MAX_LUMENS: f32 = 2_000_000.0;
+/// The dimmest, about a candle's worth (a candle is about 12 lm).
+pub const MIN_LUMENS: f32 = 1.0;
+
+/// A point light. Its strength is its luminous flux in lumens; there is no
+/// falloff radius. Light leaves it equally in every direction, so its
+/// intensity is lumens / 4π candela and the illuminance it puts on a surface
+/// facing it at distance d metres is that over d² lux.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointLight {
     pub position: Vec3,
-    /// Linear RGB.
+    /// Linear RGB, scaled so its luminance is 1 (`lights::normalise_colour`):
+    /// the colour tints the light, the lumens say how strong it is.
     pub color: Vec3,
-    pub intensity: f32,
+    pub lumens: f32,
+}
+
+impl PointLight {
+    /// Luminous intensity in candela.
+    pub fn candela(&self) -> f32 {
+        self.lumens / (4.0 * std::f32::consts::PI)
+    }
+
+    /// Illuminance in lux on a surface facing the light at `d` metres.
+    pub fn lux_at(&self, d: f32) -> f32 {
+        self.candela() / (d * d).max(1e-12)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -61,6 +83,9 @@ pub struct Scene {
     /// Bounds of all positions.
     pub bounds_min: Vec3,
     pub bounds_max: Vec3,
+    /// The subject the camera frames with `F` and opens on (the chess table
+    /// in the built-in scene). The whole scene when not set.
+    pub focus: Option<(Vec3, Vec3)>,
     /// The lights stored with the scene; `R` in the viewer resets to these.
     pub lights: Vec<PointLight>,
 }
@@ -84,6 +109,53 @@ impl Scene {
 
     pub fn radius(&self) -> f32 {
         ((self.bounds_max - self.bounds_min).length() * 0.5).max(1e-3)
+    }
+
+    pub fn focus_bounds(&self) -> (Vec3, Vec3) {
+        self.focus.unwrap_or((self.bounds_min, self.bounds_max))
+    }
+
+    pub fn focus_centre(&self) -> Vec3 {
+        let (a, b) = self.focus_bounds();
+        (a + b) * 0.5
+    }
+
+    pub fn focus_radius(&self) -> f32 {
+        let (a, b) = self.focus_bounds();
+        ((b - a).length() * 0.5).max(1e-3)
+    }
+
+    /// Move every vertex, cluster and light by `d`.
+    pub fn translate(&mut self, d: Vec3) {
+        for p in &mut self.positions {
+            *p += d;
+        }
+        for c in &mut self.clusters {
+            c.centre += d;
+        }
+        for l in &mut self.lights {
+            l.position += d;
+        }
+        self.bounds_min += d;
+        self.bounds_max += d;
+        if let Some((a, b)) = &mut self.focus {
+            *a += d;
+            *b += d;
+        }
+    }
+
+    /// Append another scene's geometry and lights.
+    pub fn append(&mut self, other: Scene) {
+        let vbase = self.positions.len() as u32;
+        let tbase = self.triangle_count() as u32;
+        self.positions.extend(other.positions);
+        self.normals.extend(other.normals);
+        self.colors.extend(other.colors);
+        self.indices.extend(other.indices.iter().map(|i| i + vbase));
+        self.clusters.extend(other.clusters.iter().map(|c| Cluster { first_vertex: c.first_vertex + vbase, first_tri: c.first_tri + tbase, ..*c }));
+        self.bounds_min = self.bounds_min.min(other.bounds_min);
+        self.bounds_max = self.bounds_max.max(other.bounds_max);
+        self.lights.extend(other.lights);
     }
 
     /// Append a mesh already in world space, cutting it into clusters.
@@ -207,18 +279,47 @@ pub fn build_clusters(positions: &[Vec3], tri_indices: &[u32]) -> Vec<BuiltClust
         .collect();
     order.sort_unstable_by_key(|k| k.0);
 
+    // A cluster must also stay small in space, not just in count: the
+    // Morton curve jumps now and then, and a cluster straddling a jump would
+    // span the whole mesh, which defeats frustum culling and light reach.
+    // Its box may not grow past 16 typical triangle sizes (a full cluster of
+    // 124 triangles in a regular patch is about 11 across).
+    let mut sizes: Vec<f32> = (0..n_tris)
+        .map(|t| {
+            let i = t * 3;
+            let (a, b, c) = (positions[tri_indices[i] as usize], positions[tri_indices[i + 1] as usize], positions[tri_indices[i + 2] as usize]);
+            (a - b).length().max((b - c).length()).max((c - a).length())
+        })
+        .collect();
+    let mid = sizes.len() / 2;
+    let typical = *sizes.select_nth_unstable_by(mid, |a, b| a.total_cmp(b)).1;
+    let max_diag = typical * 16.0;
+
     let mut out = Vec::new();
     let mut cur = BuiltCluster { vertices: Vec::new(), local_tris: Vec::new() };
-    // Source vertex -> local index in the current cluster (u8::MAX + 1 = absent).
+    let (mut blo, mut bhi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+    // Source vertex -> local index in the current cluster.
     let mut local: std::collections::HashMap<u32, u8> = std::collections::HashMap::new();
     for &(_, t) in &order {
         let i = t as usize * 3;
         let tri = [tri_indices[i], tri_indices[i + 1], tri_indices[i + 2]];
         let new_verts = tri.iter().enumerate().filter(|(k, v)| !local.contains_key(v) && !tri[..*k].contains(v)).count();
-        if cur.local_tris.len() + 1 > CLUSTER_TRIS || cur.vertices.len() + new_verts > CLUSTER_VERTS {
+        let (mut tlo, mut thi) = (blo, bhi);
+        for v in tri {
+            tlo = tlo.min(positions[v as usize]);
+            thi = thi.max(positions[v as usize]);
+        }
+        let too_big = !cur.local_tris.is_empty() && (thi - tlo).length() > max_diag;
+        if too_big || cur.local_tris.len() + 1 > CLUSTER_TRIS || cur.vertices.len() + new_verts > CLUSTER_VERTS {
             out.push(std::mem::replace(&mut cur, BuiltCluster { vertices: Vec::new(), local_tris: Vec::new() }));
             local.clear();
+            (tlo, thi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+            for v in tri {
+                tlo = tlo.min(positions[v as usize]);
+                thi = thi.max(positions[v as usize]);
+            }
         }
+        (blo, bhi) = (tlo, thi);
         let mut lt = [0u8; 3];
         for (k, v) in tri.iter().enumerate() {
             lt[k] = *local.entry(*v).or_insert_with(|| {
@@ -309,6 +410,25 @@ pub mod tests {
         assert_eq!(seen.len(), idx.len() / 3);
         // Clusters should be well filled, not one triangle each.
         assert!(s.clusters.len() * 40 < idx.len() / 3 * 2, "{} clusters for {} triangles", s.clusters.len(), idx.len() / 3);
+    }
+
+    #[test]
+    fn clusters_stay_small_in_space() {
+        // A long strip of quads: Morton order jumps along it, and no cluster
+        // may span the jump.
+        let mut p = Vec::new();
+        let mut idx = Vec::new();
+        for k in 0..4000u32 {
+            let x = k as f32;
+            p.extend_from_slice(&[Vec3::new(x, 0.0, 0.0), Vec3::new(x + 1.0, 0.0, 0.0), Vec3::new(x + 1.0, 0.0, -1.0), Vec3::new(x, 0.0, -1.0)]);
+            let b = k * 4;
+            idx.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+        }
+        let mut s = Scene::new();
+        s.push_mesh(&p, &[], &[], &idx);
+        for c in &s.clusters {
+            assert!(c.radius < 16.0, "cluster radius {}", c.radius);
+        }
     }
 
     #[test]

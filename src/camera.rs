@@ -80,7 +80,9 @@ impl OrbitCamera {
     }
 
     pub fn fly(&mut self, local: Vec3, dt: f32, fast: bool) {
-        let speed = self.scene_radius * if fast { 2.0 } else { 0.6 };
+        // Scales with how far out the camera sits, so the same keys cross a
+        // table or a valley.
+        let speed = self.scene_radius.max(self.distance) * if fast { 2.0 } else { 0.6 };
         let d = (self.right() * local.x + Vec3::Y * local.y + self.forward() * local.z) * speed * dt;
         self.target += d;
     }

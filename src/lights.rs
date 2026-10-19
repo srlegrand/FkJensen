@@ -4,8 +4,12 @@
 use glam::Vec3;
 
 use crate::raster::{self, Camera};
-use crate::scene::PointLight;
+use crate::scene::{MAX_LUMENS, MIN_LUMENS, PointLight};
 
+/// Most lights in a rig: the renderer keeps one bit per light per cluster.
+pub const MAX_LIGHTS: usize = 64;
+
+/// Tints the `C` key cycles through, before normalising.
 pub const LIGHT_COLOURS: [Vec3; 6] = [
     Vec3::new(1.0, 1.0, 1.0),
     Vec3::new(1.0, 0.85, 0.65),
@@ -14,6 +18,13 @@ pub const LIGHT_COLOURS: [Vec3; 6] = [
     Vec3::new(0.5, 1.0, 0.6),
     Vec3::new(0.9, 0.6, 1.0),
 ];
+
+/// Scale a colour so its luminance (Rec. 709 weights) is 1, so the colour
+/// only tints and the lumens alone set the strength.
+pub fn normalise_colour(c: Vec3) -> Vec3 {
+    let y = c.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+    if y > 0.0 { c / y } else { Vec3::ONE }
+}
 
 /// How far from a light's disc centre, in pixels, a click still grabs it.
 pub const PICK_RADIUS_PX: f32 = 14.0;
@@ -62,10 +73,23 @@ impl LightRig {
         best.map(|(i, _)| i)
     }
 
-    pub fn add(&mut self, position: Vec3, intensity: f32) {
-        let color = LIGHT_COLOURS[self.lights.len() % LIGHT_COLOURS.len()];
-        self.lights.push(PointLight { position, color, intensity });
+    /// Add a light; false when the rig is full.
+    pub fn add(&mut self, position: Vec3, lumens: f32) -> bool {
+        if self.lights.len() >= MAX_LIGHTS {
+            return false;
+        }
+        let color = normalise_colour(LIGHT_COLOURS[self.lights.len() % LIGHT_COLOURS.len()]);
+        self.lights.push(PointLight { position, color, lumens: lumens.clamp(MIN_LUMENS, MAX_LUMENS) });
         self.selected = self.lights.len() - 1;
+        true
+    }
+
+    /// Multiply the selected light's lumens, kept between `MIN_LUMENS` and
+    /// `MAX_LUMENS`.
+    pub fn scale_selected(&mut self, k: f32) {
+        if let Some(l) = self.selected_mut() {
+            l.lumens = (l.lumens * k).clamp(MIN_LUMENS, MAX_LUMENS);
+        }
     }
 
     pub fn remove_selected(&mut self) {
@@ -83,8 +107,8 @@ impl LightRig {
 
     pub fn cycle_colour(&mut self) {
         if let Some(l) = self.selected_mut() {
-            let i = LIGHT_COLOURS.iter().position(|k| (*k - l.color).length() < 1e-3).map(|i| (i + 1) % LIGHT_COLOURS.len()).unwrap_or(0);
-            l.color = LIGHT_COLOURS[i];
+            let i = LIGHT_COLOURS.iter().position(|k| (normalise_colour(*k) - l.color).length() < 1e-3).map(|i| (i + 1) % LIGHT_COLOURS.len()).unwrap_or(0);
+            l.color = normalise_colour(LIGHT_COLOURS[i]);
         }
     }
 }
@@ -178,5 +202,38 @@ mod tests {
         assert!(((q - eye).normalize() - (p - eye).normalize()).length() < 1e-5);
         assert!((q - eye).length() > (p - eye).length());
         assert!((push_pull(eye, p, -2.0) - eye).length() < (p - eye).length());
+    }
+
+    #[test]
+    fn lumens_stay_within_real_lights() {
+        let mut rig = LightRig::new(Vec::new());
+        rig.add(Vec3::ZERO, 800.0);
+        for _ in 0..200 {
+            rig.scale_selected(1.25);
+        }
+        assert_eq!(rig.lights[0].lumens, MAX_LUMENS);
+        for _ in 0..400 {
+            rig.scale_selected(0.8);
+        }
+        assert_eq!(rig.lights[0].lumens, MIN_LUMENS);
+        rig.add(Vec3::ZERO, 1e12);
+        assert_eq!(rig.lights[1].lumens, MAX_LUMENS);
+    }
+
+    #[test]
+    fn rig_is_capped() {
+        let mut rig = LightRig::new(Vec::new());
+        for _ in 0..MAX_LIGHTS {
+            assert!(rig.add(Vec3::ZERO, 100.0));
+        }
+        assert!(!rig.add(Vec3::ZERO, 100.0));
+    }
+
+    #[test]
+    fn colours_are_normalised_to_unit_luminance() {
+        for c in LIGHT_COLOURS {
+            let n = normalise_colour(c);
+            assert!((n.dot(Vec3::new(0.2126, 0.7152, 0.0722)) - 1.0).abs() < 1e-5);
+        }
     }
 }

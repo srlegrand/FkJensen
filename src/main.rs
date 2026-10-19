@@ -2,11 +2,17 @@
 //! rasterised on the cores and copied to the window through shared memory.
 //!
 //! Usage:
-//!   fkjensen                           open the built-in chess set
+//!   fkjensen                           open the built-in set: chess table,
+//!                                      shopfront, mountains
 //!   fkjensen scene.fkj                 open an .fkj scene
 //!   fkjensen --png out.png             render one frame to a file, no window
 //!   fkjensen --size 1920x1080 --png out.png
-//!   fkjensen --light x,y,z[,intensity] replace the stored lights (repeatable)
+//!   fkjensen --light x,y,z[,lumens]    replace the scene's lights (repeatable)
+//!   fkjensen --sky LUX                 sky illuminance, 0 for no sky
+//!   fkjensen --exposure E              display value per cd/m²
+//!   fkjensen --view lights             show how many lights each pixel evaluates
+//!   fkjensen --no-reach                evaluate every light everywhere (to compare)
+//!   fkjensen --close                   start on the close framing of the subject
 //!
 //! Controls are listed in README.md and printed at start.
 
@@ -15,6 +21,7 @@ mod fkj;
 mod lights;
 mod raster;
 mod scene;
+mod world;
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -31,8 +38,12 @@ use winit::window::{Window, WindowId};
 
 use camera::OrbitCamera;
 use lights::{DragPlane, LightRig};
-use raster::{Camera, Frame, RenderSettings};
+use raster::{Camera, Frame, RenderSettings, Sky, View};
 use scene::{PointLight, Scene};
+
+/// The sky the built-in set opens with, in lux: dusk, dark enough for lamps
+/// to show.
+const DEFAULT_SKY_LUX: f32 = 30.0;
 
 /// The chess set, baked into the binary. See docs/format.md and
 /// assets/README.md.
@@ -40,7 +51,7 @@ const CHESS_SET: &[u8] = include_bytes!("../assets/chess_set.fkj");
 
 const CONTROLS: &str = "\
 Controls
-  Lights (the only light type is a point light)
+  Lights: point lights in lumens, 1 lm to 2,000,000 lm, plus the sky
   left drag on a light   move it, facing the camera (stays at its depth)
     + Ctrl               move it level, over the set (keeps its height)
     + wheel              push it away / pull it closer
@@ -49,16 +60,20 @@ Controls
   1 (hold) + click       add a light above the surface under the cursor
   2 (hold) + click       put the selected light above that surface
   Tab                    select next light     Delete   remove selected light
-  + / -                  intensity             C        cycle colour
+  + / -                  lumens x1.25          C        cycle colour
   L                      show / hide lights    R        reset to the scene's lights
+  K                      sky on / off          , / .    sky dimmer / brighter (x2)
+  H                      light count view: how many lights each pixel evaluates
+  X                      light reach off / on (to compare cost and picture)
 
   Camera
   left drag              orbit                 middle drag / shift+left   pan
   right drag             look (fly)            wheel                      dolly
-  W A S D Q E            fly (shift: faster)   F                          frame the scene
+  W A S D Q E            fly (shift: faster)   F    wide view / close on the subject
 
   View
-  [ / ]                  exposure              B    back-face culling
+  [ / ]                  exposure              0    exposure from the sky
+  B                      back-face culling
   G                      wireframe             P    save frame.png
   Esc                    quit
   drop an .fkj file on the window to open it";
@@ -83,6 +98,8 @@ struct App {
     rig: LightRig,
     settings: RenderSettings,
     drag: Option<Drag>,
+    /// Which framing `F` last chose.
+    wide: bool,
     // input state
     mouse: (f32, f32),
     last_mouse: (f32, f32),
@@ -98,7 +115,7 @@ struct App {
 impl App {
     fn new(scene: Scene, scene_name: String) -> Self {
         let mut cam = OrbitCamera::new();
-        cam.frame(scene.centre(), scene.radius());
+        frame_camera(&mut cam, &scene, true);
         let rig = LightRig::new(default_rig(&scene));
         Self {
             window: None,
@@ -106,12 +123,13 @@ impl App {
             surface: None,
             surface_sized: false,
             frame: Frame::new(1, 1),
-            settings: RenderSettings { cull_backfaces: false, wireframe: false, exposure: 1.0, scene_radius: scene.radius() },
+            settings: RenderSettings::new(Sky { lux: DEFAULT_SKY_LUX, on: true }),
             scene,
             scene_name,
             cam,
             rig,
             drag: None,
+            wide: true,
             mouse: (0.0, 0.0),
             last_mouse: (0.0, 0.0),
             buttons: [false; 3],
@@ -129,8 +147,8 @@ impl App {
             Ok(scene) => {
                 self.scene = scene;
                 self.scene_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.cam.frame(self.scene.centre(), self.scene.radius());
-                self.settings.scene_radius = self.scene.radius();
+                self.wide = true;
+                frame_camera(&mut self.cam, &self.scene, self.wide);
                 self.rig = LightRig::new(default_rig(&self.scene));
                 self.drag = None;
             }
@@ -147,16 +165,19 @@ impl App {
         let cam = self.render_camera();
         raster::render(&self.scene, &cam, &self.rig.lights, &self.settings, &mut self.frame);
         if self.rig.show {
-            let floor = self.scene.bounds_min.y;
+            let floor = self.floor();
             for (i, l) in self.rig.lights.iter().enumerate() {
                 let sel = i == self.rig.selected;
-                // A dashed line down to the floor of the scene and a small
-                // mark there, so the light's height reads at a glance.
-                let foot = Vec3::new(l.position.x, floor, l.position.z);
-                let grey = if sel { Vec3::new(1.0, 0.9, 0.2) * 0.7 } else { Vec3::splat(0.35) };
-                raster::draw_line(&mut self.frame, &cam, l.position, foot, grey, true);
-                raster::draw_disc(&mut self.frame, &cam, foot, 2.5, grey, false);
-                raster::draw_disc(&mut self.frame, &cam, l.position, if sel { 7.0 } else { 5.0 }, l.color, false);
+                if sel {
+                    // A dashed line down to the floor and a small mark there,
+                    // so the light's height reads at a glance.
+                    let foot = Vec3::new(l.position.x, floor, l.position.z);
+                    let gold = Vec3::new(1.0, 0.9, 0.2) * 0.7;
+                    raster::draw_line(&mut self.frame, &cam, l.position, foot, gold, true);
+                    raster::draw_disc(&mut self.frame, &cam, foot, 2.5, gold, false);
+                }
+                let disc = (l.color / l.color.max_element()).min(Vec3::ONE);
+                raster::draw_disc(&mut self.frame, &cam, l.position, if sel { 7.0 } else { 4.0 }, disc, false);
                 if sel {
                     raster::draw_disc(&mut self.frame, &cam, l.position, 11.0, Vec3::new(1.0, 0.9, 0.2), true);
                 }
@@ -216,9 +237,13 @@ impl App {
         if k.contains(&KeyCode::PageUp) { nudge += Vec3::Y }
         if k.contains(&KeyCode::PageDown) { nudge -= Vec3::Y }
         if nudge != Vec3::ZERO {
-            // A fifth of the scene's radius per second, five times that with Shift.
-            let speed = self.scene.radius() * if self.shift { 1.0 } else { 0.2 };
+            // A fifth of the subject's radius per second, or a tenth of the
+            // light's distance from the camera if that is more; five times
+            // that with Shift.
+            let eye = self.cam.eye();
+            let base = self.scene.focus_radius();
             if let Some(l) = self.rig.selected_mut() {
+                let speed = (base * 0.2).max(l.position.distance(eye) * 0.1) * if self.shift { 5.0 } else { 1.0 };
                 l.position += nudge * speed * dt;
             }
         }
@@ -236,25 +261,28 @@ impl App {
     fn update_title(&self) {
         let Some(w) = &self.window else { return };
         let s = self.frame.stats;
+        let cut = raster::cut_lux(&self.settings.sky, self.settings.exposure);
         let light = match self.rig.selected() {
             Some(l) => format!(
-                "light {}/{} at ({:.3}, {:.3}, {:.3}) x{:.2}",
+                "light {}/{} {:.0} lm at ({:.2}, {:.2}, {:.2}) reach {}",
                 self.rig.selected + 1,
                 self.rig.lights.len(),
+                l.lumens,
                 l.position.x,
                 l.position.y,
                 l.position.z,
-                l.intensity
+                if self.settings.light_reach { format_metres(raster::light_reach(l, cut)) } else { "off".into() }
             ),
             None => "no lights".into(),
         };
+        let sky = if self.settings.sky.on { format!("sky {:.0} lux", self.settings.sky.lux) } else { "sky off".into() };
+        let skipped = if s.light_evals_all > 0 { 100.0 * (1.0 - s.light_evals as f64 / s.light_evals_all as f64) } else { 0.0 };
         w.set_title(&format!(
-            "FkJensen  {}  {}x{}  {:.0} fps  {light}  {} tris ({} drawn, {}/{} clusters)  setup {:.1} bin {:.1} raster {:.1} shade {:.1} ms  CPU only",
+            "FkJensen  {}  {:.0} fps  {light}  {sky}  light evals {} ({:.0}% skipped)  {} tris ({}/{} clusters)  setup {:.1} bin {:.1} raster {:.1} shade {:.1} ms  CPU only",
             self.scene_name,
-            self.frame.width,
-            self.frame.height,
             self.title_fps,
-            s.tris_in,
+            s.light_evals,
+            skipped,
             s.tris_drawn,
             s.clusters_drawn,
             s.clusters_in,
@@ -265,21 +293,30 @@ impl App {
         ));
     }
 
+    /// Height of the ground under the scene: 0 for the built-in set.
+    fn floor(&self) -> f32 {
+        if self.scene.bounds_min.y < 0.0 && self.scene.bounds_max.y > 0.0 { 0.0 } else { self.scene.bounds_min.y }
+    }
+
     /// Put a light above the surface under the cursor: a new one, or the
     /// selected one when `replace`.
     fn place_light(&mut self, replace: bool) {
         let (x, y) = (self.mouse.0 as usize, self.mouse.1 as usize);
         let Some((p, n)) = raster::unproject(&self.frame, &self.scene, x, y) else { return };
-        // Hold the light off the surface, along its normal, by a share of
-        // the scene's size, so it lights the spot that was clicked.
-        let pos = p + n * self.scene.radius() * 0.25;
+        // Hold the light off the surface, along its normal, so it lights the
+        // spot that was clicked: a quarter of the subject's radius, or a
+        // twentieth of the distance from the camera when that is more.
+        let off = (self.scene.focus_radius() * 0.25).max(p.distance(self.cam.eye()) * 0.05);
+        let pos = p + n * off;
         if replace {
             if let Some(l) = self.rig.selected_mut() {
                 l.position = pos;
                 return;
             }
         }
-        self.rig.add(pos, 1.0);
+        if !self.rig.add(pos, 800.0) {
+            eprintln!("the rig holds {} lights at most", lights::MAX_LIGHTS);
+        }
     }
 
     fn drag_plane(&self) -> DragPlane {
@@ -327,7 +364,10 @@ impl App {
         }
         match code {
             KeyCode::Escape => event_loop.exit(),
-            KeyCode::KeyF => self.cam.frame(self.scene.centre(), self.scene.radius()),
+            KeyCode::KeyF => {
+                self.wide = !self.wide;
+                frame_camera(&mut self.cam, &self.scene, self.wide);
+            }
             KeyCode::KeyB => self.settings.cull_backfaces = !self.settings.cull_backfaces,
             KeyCode::KeyG => self.settings.wireframe = !self.settings.wireframe,
             KeyCode::KeyL => self.rig.show = !self.rig.show,
@@ -337,10 +377,18 @@ impl App {
                 self.drag = None;
                 self.rig.remove_selected();
             }
-            KeyCode::Equal | KeyCode::NumpadAdd => self.scale_light(1.25),
-            KeyCode::Minus | KeyCode::NumpadSubtract => self.scale_light(0.8),
+            KeyCode::Equal | KeyCode::NumpadAdd => self.rig.scale_selected(1.25),
+            KeyCode::Minus | KeyCode::NumpadSubtract => self.rig.scale_selected(0.8),
             KeyCode::BracketRight => self.settings.exposure *= 1.25,
             KeyCode::BracketLeft => self.settings.exposure /= 1.25,
+            KeyCode::Digit0 => self.settings.exposure = raster::default_exposure(self.settings.sky.lux),
+            KeyCode::KeyK => self.settings.sky.on = !self.settings.sky.on,
+            KeyCode::Comma => self.settings.sky.lux = (self.settings.sky.lux / 2.0).max(0.01),
+            KeyCode::Period => self.settings.sky.lux = (self.settings.sky.lux * 2.0).min(120_000.0),
+            KeyCode::KeyH => {
+                self.settings.view = if self.settings.view == View::Shaded { View::LightCount } else { View::Shaded };
+            }
+            KeyCode::KeyX => self.settings.light_reach = !self.settings.light_reach,
             KeyCode::KeyC => self.rig.cycle_colour(),
             KeyCode::KeyP => match save_png(&self.frame, "frame.png") {
                 Ok(()) => eprintln!("saved frame.png"),
@@ -350,22 +398,61 @@ impl App {
         }
     }
 
-    fn scale_light(&mut self, k: f32) {
-        if let Some(l) = self.rig.selected_mut() {
-            l.intensity *= k;
-        }
+}
+
+/// The scene's own lights, or one 800 lm light above and to the side of
+/// the subject when it has none.
+fn default_rig(scene: &Scene) -> Vec<PointLight> {
+    if !scene.lights.is_empty() {
+        return scene.lights.iter().take(lights::MAX_LIGHTS).copied().collect();
+    }
+    let c = scene.focus_centre();
+    let r = scene.focus_radius();
+    vec![PointLight { position: c + Vec3::new(1.2, 1.6, 1.0) * r, color: lights::normalise_colour(lights::LIGHT_COLOURS[1]), lumens: 800.0 }]
+}
+
+/// Frame the subject from the front. Close: from above, filling the view.
+/// Wide: from nine times its radius away, at eye level, so what is behind
+/// the subject is in the picture (for the built-in set, the shop and the
+/// mountains behind the chess table).
+fn frame_camera(cam: &mut OrbitCamera, scene: &Scene, wide: bool) {
+    cam.frame(scene.focus_centre(), scene.focus_radius());
+    cam.yaw = 0.0;
+    if wide {
+        cam.distance = scene.focus_radius() * 9.0;
+        cam.pitch = 0.07;
+    } else {
+        cam.pitch = 0.45;
     }
 }
 
-/// The scene's own lights, or one key light above and to the side when it
-/// has none, so nothing opens black.
-fn default_rig(scene: &Scene) -> Vec<PointLight> {
-    if !scene.lights.is_empty() {
-        return scene.lights.clone();
-    }
-    let c = scene.centre();
-    let r = scene.radius();
-    vec![PointLight { position: c + Vec3::new(1.2, 1.6, 1.0) * r, color: lights::LIGHT_COLOURS[1], intensity: 3.0 }]
+fn format_metres(m: f32) -> String {
+    if m >= 1000.0 { format!("{:.1} km", m / 1000.0) } else if m >= 10.0 { format!("{m:.0} m") } else { format!("{m:.2} m") }
+}
+
+/// The built-in set: the chess set from `assets/chess_set.fkj` on the
+/// table, in the procedural square with the shop and the mountains.
+fn built_in() -> Result<Scene, String> {
+    let mut chess = load_bytes(CHESS_SET, "built-in chess set")?;
+    // Board centred on the table, resting on its top.
+    let c = chess.centre();
+    chess.translate(Vec3::new(-c.x, world::TABLE_TOP - chess.bounds_min.y, -c.z));
+    let (chess_lo, chess_hi) = (chess.bounds_min, chess.bounds_max);
+    let mut scene = world::build();
+    let shop_lights = std::mem::take(&mut scene.lights);
+    scene.append(chess);
+    scene.lights = world::table_lights();
+    scene.lights.extend(shop_lights);
+    // The subject is the board and its pieces, with a margin.
+    scene.focus = Some((Vec3::new(chess_lo.x - 0.05, world::TABLE_TOP - 0.05, chess_lo.z - 0.05), Vec3::new(chess_hi.x + 0.05, chess_hi.y, chess_hi.z + 0.05)));
+    eprintln!(
+        "built-in set: {} triangles, {} clusters, {} lights, {:.1} km across",
+        scene.triangle_count(),
+        scene.clusters.len(),
+        scene.lights.len(),
+        (scene.bounds_max.x - scene.bounds_min.x) / 1000.0
+    );
+    Ok(scene)
 }
 
 impl ApplicationHandler for App {
@@ -499,9 +586,10 @@ fn save_png(frame: &Frame, path: &str) -> Result<(), String> {
 
 fn parse_light(s: &str) -> Option<PointLight> {
     let v: Vec<f32> = s.split(',').map(|x| x.trim().parse().ok()).collect::<Option<_>>()?;
+    let lumens = |l: f32| l.clamp(scene::MIN_LUMENS, scene::MAX_LUMENS);
     match v.as_slice() {
-        [x, y, z] => Some(PointLight { position: Vec3::new(*x, *y, *z), color: Vec3::ONE, intensity: 1.0 }),
-        [x, y, z, i] => Some(PointLight { position: Vec3::new(*x, *y, *z), color: Vec3::ONE, intensity: *i }),
+        [x, y, z] => Some(PointLight { position: Vec3::new(*x, *y, *z), color: Vec3::ONE, lumens: 800.0 }),
+        [x, y, z, l] => Some(PointLight { position: Vec3::new(*x, *y, *z), color: Vec3::ONE, lumens: lumens(*l) }),
         _ => None,
     }
 }
@@ -512,6 +600,11 @@ fn main() {
     let mut png_out: Option<String> = None;
     let mut size = (1280usize, 720usize);
     let mut cli_lights: Vec<PointLight> = Vec::new();
+    let mut sky_lux: Option<f32> = None;
+    let mut exposure: Option<f32> = None;
+    let mut view = View::Shaded;
+    let mut reach = true;
+    let mut close = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -529,14 +622,30 @@ fn main() {
                 match args.get(i + 1).and_then(|s| parse_light(s)) {
                     Some(l) => cli_lights.push(l),
                     None => {
-                        eprintln!("--light takes x,y,z or x,y,z,intensity");
+                        eprintln!("--light takes x,y,z or x,y,z,lumens");
                         std::process::exit(2);
                     }
                 }
                 i += 1;
             }
+            "--sky" => {
+                sky_lux = args.get(i + 1).and_then(|s| s.parse().ok());
+                i += 1;
+            }
+            "--exposure" => {
+                exposure = args.get(i + 1).and_then(|s| s.parse().ok());
+                i += 1;
+            }
+            "--view" => {
+                if args.get(i + 1).map(|s| s.as_str()) == Some("lights") {
+                    view = View::LightCount;
+                }
+                i += 1;
+            }
+            "--no-reach" => reach = false,
+            "--close" => close = true,
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,intensity]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--close]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -552,8 +661,8 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        None => match load_bytes(CHESS_SET, "built-in chess set") {
-            Ok(s) => (s, "chess set".into()),
+        None => match built_in() {
+            Ok(s) => (s, "chess table, shop, mountains".into()),
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(1);
@@ -565,6 +674,19 @@ fn main() {
     }
 
     let mut app = App::new(scene, name);
+    if let Some(l) = sky_lux {
+        app.settings.sky = Sky { lux: l.max(0.0), on: l > 0.0 };
+        app.settings.exposure = raster::default_exposure(l);
+    }
+    if let Some(e) = exposure {
+        app.settings.exposure = e;
+    }
+    app.settings.view = view;
+    if close {
+        app.wide = false;
+        frame_camera(&mut app.cam, &app.scene, false);
+    }
+    app.settings.light_reach = reach;
 
     if let Some(out) = png_out {
         app.frame.resize(size.0, size.1);
@@ -572,7 +694,7 @@ fn main() {
         app.render();
         let s = app.frame.stats;
         eprintln!(
-            "rendered {}x{} in {:.1} ms on {} threads: setup {:.1}, bin {:.1}, raster {:.1}, shade {:.1} ms, {} of {} clusters, {} of {} triangles drawn",
+            "rendered {}x{} in {:.1} ms on {} threads: setup {:.1}, bin {:.1}, raster {:.1}, shade {:.1} ms, {} of {} clusters, {} of {} triangles drawn, {} light evaluations of {} without reach",
             size.0,
             size.1,
             t.elapsed().as_secs_f32() * 1000.0,
@@ -584,7 +706,9 @@ fn main() {
             s.clusters_drawn,
             s.clusters_in,
             s.tris_drawn,
-            s.tris_in
+            s.tris_in,
+            s.light_evals,
+            s.light_evals_all
         );
         if let Err(e) = save_png(&app.frame, &out) {
             eprintln!("cannot write {out}: {e}");
@@ -609,7 +733,7 @@ mod tests {
         let (scene, report) = fkj::read(CHESS_SET).unwrap();
         assert!(report.skipped.is_empty());
         assert!(scene.triangle_count() > 500_000, "{}", scene.triangle_count());
-        assert!(!scene.lights.is_empty());
+        assert!(scene.lights.is_empty(), "the chess file holds geometry only");
         assert!(scene.radius() > 0.1 && scene.radius() < 1.0, "the set is about half a metre across");
         for c in &scene.clusters {
             assert!(c.vertex_count as usize <= scene::CLUSTER_VERTS && c.tri_count as usize <= scene::CLUSTER_TRIS);
@@ -619,8 +743,90 @@ mod tests {
     #[test]
     fn light_argument_parses() {
         assert_eq!(parse_light("1,2,3").unwrap().position, Vec3::new(1.0, 2.0, 3.0));
-        assert_eq!(parse_light("1, 2, 3, 0.5").unwrap().intensity, 0.5);
+        assert_eq!(parse_light("1, 2, 3, 500").unwrap().lumens, 500.0);
+        assert_eq!(parse_light("1,2,3,1e9").unwrap().lumens, scene::MAX_LUMENS);
         assert!(parse_light("1,2").is_none());
         assert!(parse_light("a,b,c").is_none());
+    }
+
+    #[test]
+    fn chess_set_stands_on_the_table() {
+        let scene = built_in().unwrap();
+        let (lo, hi) = scene.focus_bounds();
+        assert!(hi.y > world::TABLE_TOP + 0.05, "pieces above the table top");
+        assert!(lo.y < world::TABLE_TOP && lo.y > world::TABLE_TOP - 0.1);
+        assert_eq!(scene.lights.len(), 2 + 15);
+    }
+
+    /// The point of light reach: whatever the lights at the table and the
+    /// shop do, up to the brightest light allowed, none of them is ever
+    /// evaluated on the mountains, at the default sky and exposure.
+    #[test]
+    fn no_light_reaches_the_mountains() {
+        let mut scene = built_in().unwrap();
+        for l in &mut scene.lights {
+            l.lumens = scene::MAX_LUMENS;
+        }
+        let sky = Sky { lux: DEFAULT_SKY_LUX, on: true };
+        let cut = raster::cut_lux(&sky, raster::default_exposure(sky.lux));
+        let mut mountain_clusters = 0;
+        for c in &scene.clusters {
+            // Mountain clusters: in the range and off the valley floor.
+            if c.centre.z < world::MOUNTAINS_NEAR_Z && c.centre.y > 20.0 {
+                mountain_clusters += 1;
+                for l in &scene.lights {
+                    assert!(l.position.distance(c.centre) > c.radius + raster::light_reach(l, cut));
+                }
+            }
+        }
+        assert!(mountain_clusters > 200, "{mountain_clusters}");
+    }
+
+    /// The table lamps at their default strength do not reach the shop,
+    /// and the shop's lights do not reach the table, while the street lamp
+    /// (12,000 lm) reaches both.
+    #[test]
+    fn table_and_shop_lights_stay_where_they_are() {
+        let scene = built_in().unwrap();
+        let sky = Sky { lux: DEFAULT_SKY_LUX, on: true };
+        let cut = raster::cut_lux(&sky, raster::default_exposure(sky.lux));
+        let table = Vec3::new(0.0, world::TABLE_TOP, 0.0);
+        let shop = Vec3::new(0.0, 2.0, world::SHOP_FRONT_Z);
+        for (i, l) in scene.lights.iter().enumerate() {
+            let r = raster::light_reach(l, cut);
+            if i < 2 {
+                assert!(l.position.distance(shop) > r, "table light {i} reaches the shop: {r} m");
+            } else if l.lumens < 1000.0 {
+                assert!(l.position.distance(table) > r, "shop light {i} reaches the table: {r} m");
+            } else {
+                assert!(l.position.distance(table) < r && l.position.distance(shop) < r);
+            }
+        }
+    }
+
+    /// Rendering the whole set with and without light reach: the picture
+    /// changes by at most one 8-bit step, the work drops.
+    #[test]
+    fn light_reach_does_not_change_the_picture() {
+        let scene = built_in().unwrap();
+        let (w, h) = (320, 180);
+        let mut cam = OrbitCamera::new();
+        frame_camera(&mut cam, &scene, true);
+        let c = Camera { view: cam.view(), proj: cam.proj(w as f32 / h as f32), eye: cam.eye(), near: cam.near() };
+        let sky = Sky { lux: DEFAULT_SKY_LUX, on: true };
+        let mut a = Frame::new(w, h);
+        raster::render(&scene, &c, &scene.lights, &RenderSettings::new(sky), &mut a);
+        let mut b = Frame::new(w, h);
+        raster::render(&scene, &c, &scene.lights, &RenderSettings { light_reach: false, ..RenderSettings::new(sky) }, &mut b);
+        let mut worst = 0;
+        for (x, y) in a.color.iter().zip(&b.color) {
+            for sh in [0, 8, 16] {
+                worst = worst.max((((x >> sh) & 0xff) as i32 - ((y >> sh) & 0xff) as i32).abs());
+            }
+        }
+        assert!(worst <= 1, "worst channel difference {worst}");
+        // The shop is lit by its own fifteen lights, so its pixels still
+        // evaluate most of them; the table, square, valley and mountains do not.
+        assert!(a.stats.light_evals * 2 < b.stats.light_evals, "{} vs {}", a.stats.light_evals, b.stats.light_evals);
     }
 }

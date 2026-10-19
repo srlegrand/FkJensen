@@ -12,9 +12,18 @@
 //!    of the depth and triangle-id buffers. No atomics, no locks: a tile
 //!    belongs to one thread for the pass.
 //! 4. **Shade**: each pixel that has a triangle reconstructs its barycentric
-//!    weights, interpolates position, normal and colour, and is lit once by
-//!    the point lights. There is no ambient term: a surface no light reaches
-//!    is black.
+//!    weights, interpolates position, normal and colour, and is lit once:
+//!    by the sky, which reaches every surface the same way however far it
+//!    is, and by the point lights whose reach includes the pixel's cluster.
+//!
+//! **Light reach.** A point light has no falloff radius: it is lumens and
+//! the inverse square law. But beyond some distance what it adds can no
+//! longer be seen, and that distance is computed every frame
+//! (`light_reach`). In the setup pass each visible cluster gets a bit mask
+//! of the lights whose reach touches its bounding sphere, and the shade pass
+//! only evaluates those. A lamp on the chess table never costs anything on
+//! the shopfront or the mountains. The same bound is meant to gate bounce
+//! lighting when it comes.
 //!
 //! Shading after visibility is what keeps the cost proportional to pixels
 //! rather than to triangles: a triangle covered by another is never shaded.
@@ -55,6 +64,10 @@ pub struct Frame {
 pub struct Stats {
     pub clusters_in: usize,
     pub clusters_drawn: usize,
+    /// Point light evaluations done in the shade pass.
+    pub light_evals: u64,
+    /// What it would have been without light reach: shaded pixels x lights.
+    pub light_evals_all: u64,
     pub tris_in: usize,
     pub tris_drawn: usize,
     pub setup_ms: f32,
@@ -73,19 +86,112 @@ pub struct TriSetup {
     pub inv_w: [f32; 3],
     pub bary: [[f32; 3]; 3],
     pub tri: u32,
+    /// The lights that reach this triangle's cluster, one bit per light.
+    pub lights: u64,
     pub min_x: u16,
     pub min_y: u16,
     pub max_x: u16,
     pub max_y: u16,
 }
 
+/// The sky: light from every direction above, with nothing between it and
+/// any surface, so a mountain 10 km away and a pawn are lit by it alike.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sky {
+    /// Illuminance on an upward-facing surface, in lux.
+    pub lux: f32,
+    pub on: bool,
+}
+
+/// Sky colour seen straight up and at the horizon, luminance about 1.
+const SKY_ZENITH: Vec3 = Vec3::new(0.55, 0.78, 1.45);
+const SKY_HORIZON: Vec3 = Vec3::new(1.15, 1.0, 0.85);
+/// Light coming back up from the ground, as a share of the sky's.
+const GROUND_BOUNCE: f32 = 0.2;
+const GROUND_TINT: Vec3 = Vec3::new(1.0, 1.0, 0.9);
+/// Colour of the sky's light on an upward-facing surface (luminance 1).
+const SKY_IRRADIANCE_TINT: Vec3 = Vec3::new(0.82, 0.95, 1.25);
+
+impl Sky {
+    /// Illuminance in lux, per colour channel, on a surface facing `n`.
+    pub fn irradiance(&self, n: Vec3) -> Vec3 {
+        if !self.on {
+            return Vec3::ZERO;
+        }
+        let up = n.y * 0.5 + 0.5;
+        self.lux * (SKY_IRRADIANCE_TINT * up + GROUND_TINT * GROUND_BOUNCE * (1.0 - up))
+    }
+
+    /// Radiance in cd/m², per colour channel, seen looking along `dir`.
+    pub fn radiance(&self, dir: Vec3) -> Vec3 {
+        if !self.on {
+            return Vec3::ZERO;
+        }
+        let l = self.lux / std::f32::consts::PI;
+        if dir.y >= 0.0 {
+            let t = dir.y.sqrt();
+            l * SKY_HORIZON.lerp(SKY_ZENITH, t)
+        } else {
+            l * GROUND_BOUNCE * GROUND_TINT
+        }
+    }
+}
+
+/// What the shade pass writes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum View {
+    Shaded,
+    /// How many point lights each pixel evaluates: shows light reach.
+    LightCount,
+}
+
 pub struct RenderSettings {
     pub cull_backfaces: bool,
     pub wireframe: bool,
+    /// Display value per cd/m², before the tone curve.
     pub exposure: f32,
-    /// Scene radius, used to scale point light falloff so intensities stay
-    /// sensible across scene sizes.
-    pub scene_radius: f32,
+    pub sky: Sky,
+    /// Skip lights at pixels beyond their reach. Off only to compare.
+    pub light_reach: bool,
+    pub view: View,
+}
+
+impl RenderSettings {
+    pub fn new(sky: Sky) -> Self {
+        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, light_reach: true, view: View::Shaded }
+    }
+}
+
+/// An exposure that keeps sky-lit surfaces in the lower half of the
+/// display, so lamps read against them.
+pub fn default_exposure(sky_lux: f32) -> f32 {
+    std::f32::consts::PI / (8.0 * sky_lux.max(1.0))
+}
+
+/// Largest radiance a surface sends per lux it receives: white diffuse
+/// (1/π) plus the highlight's peak.
+const BRDF_PEAK: f32 = (1.0 + SPECULAR) / std::f32::consts::PI;
+const SPECULAR: f32 = 0.12;
+/// Steepest slope of the tone curve.
+const TONE_SLOPE: f32 = 1.25;
+
+/// Illuminance below which a light's contribution is dropped, in lux.
+///
+/// With the sky on: 1/64 of what the sky gives the darkest-facing surface
+/// (one lit only by ground bounce), a change of about 1.6%, at or under one
+/// 8-bit step in the mid tones. Always also: half an 8-bit step at black for
+/// the current exposure, so with the sky off a light reaches as far as it
+/// can still be seen in the dark.
+pub fn cut_lux(sky: &Sky, exposure: f32) -> f32 {
+    let black_step = 0.5 / (255.0 * 12.92); // linear value of half an sRGB step at 0
+    let floor = black_step / (BRDF_PEAK * TONE_SLOPE * exposure.max(1e-12));
+    let sky_part = if sky.on { sky.lux * GROUND_BOUNCE / 64.0 } else { 0.0 };
+    floor.max(sky_part)
+}
+
+/// How far, in metres, a light's illuminance stays at or above `cut_lux`.
+pub fn light_reach(l: &PointLight, cut: f32) -> f32 {
+    (l.candela() / cut.max(1e-12)).sqrt()
 }
 
 impl Frame {
@@ -192,6 +298,7 @@ fn setup_tri(tri: u32, v: &[ClipVert; 3], width: usize, height: usize, cull: boo
         inv_w,
         bary: [v[0].bary, v[1].bary, v[2].bary],
         tri,
+        lights: 0,
         min_x: min_x as u16,
         min_y: min_y as u16,
         max_x: max_x as u16,
@@ -254,6 +361,12 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &Ren
     let planes = frustum_planes(vp, near);
     let eye = cam.eye;
     let clusters_drawn = std::sync::atomic::AtomicUsize::new(0);
+    let cut = cut_lux(&settings.sky, settings.exposure);
+    let reach: Vec<f32> = lights
+        .iter()
+        .map(|l| if settings.light_reach { light_reach(l, cut) } else { f32::INFINITY })
+        .collect();
+    let n_lights = lights.len().min(64);
     let setups: Vec<TriSetup> = scene
         .clusters
         .par_chunks(64)
@@ -267,6 +380,12 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &Ren
                     continue;
                 }
                 drawn += 1;
+                let mut mask = 0u64;
+                for (i, l) in lights.iter().take(n_lights).enumerate() {
+                    if l.position.distance(c.centre) <= c.radius + reach[i] {
+                        mask |= 1 << i;
+                    }
+                }
                 let fv = c.first_vertex as usize;
                 for (k, p) in scene.positions[fv..fv + c.vertex_count as usize].iter().enumerate() {
                     clip[k] = vp * p.extend(1.0);
@@ -291,14 +410,16 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &Ren
                         ClipVert { p: p2, bary: [0.0, 0.0, 1.0] },
                     ];
                     if p0.w >= near && p1.w >= near && p2.w >= near {
-                        if let Some(s) = setup_tri(tri, &v, width, height, cull) {
+                        if let Some(mut s) = setup_tri(tri, &v, width, height, cull) {
+                            s.lights = mask;
                             out.push(s);
                         }
                     } else {
                         clipped.clear();
                         clip_near(v, near, &mut clipped);
                         for cv in &clipped {
-                            if let Some(s) = setup_tri(tri, cv, width, height, cull) {
+                            if let Some(mut s) = setup_tri(tri, cv, width, height, cull) {
+                                s.lights = mask;
                                 out.push(s);
                             }
                         }
@@ -389,23 +510,42 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &Ren
     let t3 = std::time::Instant::now();
 
     // Pass 4: shade, one row per task.
-    let r2 = settings.scene_radius * settings.scene_radius;
     let exposure = settings.exposure;
-    let bg = pack(Vec3::new(0.10, 0.105, 0.115));
+    let sky = settings.sky;
+    let view = settings.view;
+    let inv_view = cam.view.inverse();
+    let (fx, fy) = (cam.proj.x_axis.x, cam.proj.y_axis.y);
     let tri_id = &frame.tri_id;
     let setups_ref = &setups;
+    let evals = std::sync::atomic::AtomicU64::new(0);
+    let shaded = std::sync::atomic::AtomicU64::new(0);
     frame
         .color
         .par_chunks_mut(width)
         .enumerate()
         .for_each(|(y, row)| {
+            let mut row_evals = 0u64;
+            let mut row_shaded = 0u64;
             for x in 0..width {
                 let id = tri_id[y * width + x];
                 if id == NO_TRI {
-                    row[x] = bg;
+                    // The sky behind everything.
+                    let ndc = Vec2::new((x as f32 + 0.5) / width as f32 * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / height as f32 * 2.0);
+                    let dir = inv_view.transform_vector3(Vec3::new(ndc.x / fx, ndc.y / fy, -1.0)).normalize_or(Vec3::Y);
+                    row[x] = match view {
+                        View::Shaded => pack(tonemap(sky.radiance(dir) * exposure)),
+                        View::LightCount => pack(Vec3::splat(0.02)),
+                    };
                     continue;
                 }
+                row_shaded += 1;
                 let s = &setups_ref[id as usize];
+                if view == View::LightCount {
+                    let k = s.lights.count_ones();
+                    row_evals += k as u64;
+                    row[x] = pack(heat(k));
+                    continue;
+                }
                 let b = barycentrics(s, x as f32 + 0.5, y as f32 + 0.5);
                 // Weights over the source triangle's vertices.
                 let w0 = b[0] * s.bary[0][0] + b[1] * s.bary[1][0] + b[2] * s.bary[2][0];
@@ -421,28 +561,39 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &Ren
                 if n.dot(v) < 0.0 {
                     n = -n;
                 }
-                let mut radiance = Vec3::ZERO;
-                for l in lights {
+                // Radiance in cd/m²: the sky, then each light in reach.
+                let mut radiance = albedo * sky.irradiance(n) / std::f32::consts::PI;
+                let mut bits = s.lights;
+                while bits != 0 {
+                    let i = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    row_evals += 1;
+                    let l = &lights[i];
                     let d = l.position - p;
                     let d2 = d.length_squared().max(1e-12);
                     let ldir = d / d2.sqrt();
-                    let irr = l.color * (l.intensity * r2 / d2);
                     let ndl = n.dot(ldir);
                     if ndl <= 0.0 {
                         continue;
                     }
+                    // Illuminance on this surface, lux per channel.
+                    let e = l.color * (l.candela() / d2 * ndl);
                     let h = (ldir + v).normalize_or(ldir);
-                    let spec = n.dot(h).max(0.0).powf(48.0) * 0.12;
-                    radiance += irr * (albedo * ndl + Vec3::splat(spec * ndl));
+                    let spec = n.dot(h).max(0.0).powf(48.0) * SPECULAR;
+                    radiance += e * (albedo + Vec3::splat(spec)) / std::f32::consts::PI;
                 }
                 row[x] = pack(tonemap(radiance * exposure));
             }
+            evals.fetch_add(row_evals, std::sync::atomic::Ordering::Relaxed);
+            shaded.fetch_add(row_shaded, std::sync::atomic::Ordering::Relaxed);
         });
     let t4 = std::time::Instant::now();
 
     frame.stats = Stats {
         clusters_in: scene.clusters.len(),
         clusters_drawn: clusters_drawn.into_inner(),
+        light_evals: evals.into_inner(),
+        light_evals_all: shaded.into_inner() * n_lights as u64,
         tris_in: scene.triangle_count(),
         tris_drawn: setups.len(),
         setup_ms: (t1 - t0).as_secs_f32() * 1000.0,
@@ -639,7 +790,21 @@ pub fn draw_disc(frame: &mut Frame, cam: &Camera, centre: Vec3, radius_px: f32, 
 fn tonemap(c: Vec3) -> Vec3 {
     // Simple filmic-ish curve, keeps highlights from clipping to white.
     let c = c.max(Vec3::ZERO);
-    c / (Vec3::ONE + c) * 1.25
+    c / (Vec3::ONE + c) * TONE_SLOPE
+}
+
+/// Colour for a count of lights: dark grey for none, then blue, green,
+/// yellow, red, white.
+fn heat(k: u32) -> Vec3 {
+    const RAMP: [Vec3; 6] = [
+        Vec3::new(0.012, 0.012, 0.014),
+        Vec3::new(0.02, 0.08, 0.5),
+        Vec3::new(0.03, 0.45, 0.08),
+        Vec3::new(0.7, 0.6, 0.02),
+        Vec3::new(0.8, 0.08, 0.02),
+        Vec3::new(0.9, 0.9, 0.9),
+    ];
+    RAMP[(k as usize).min(RAMP.len() - 1)]
 }
 
 #[inline]
@@ -664,6 +829,10 @@ mod tests {
         s
     }
 
+    fn settings() -> RenderSettings {
+        RenderSettings { exposure: 0.05, ..RenderSettings::new(Sky { lux: 100.0, on: false }) }
+    }
+
     fn camera(w: usize, h: usize) -> Camera {
         let cam = crate::camera::OrbitCamera { target: Vec3::ZERO, distance: 3.0, yaw: 0.0, pitch: 0.0, fov_y: 45f32.to_radians(), scene_radius: 1.5 };
         Camera { view: cam.view(), proj: cam.proj(w as f32 / h as f32), eye: cam.eye(), near: cam.near() }
@@ -674,8 +843,8 @@ mod tests {
         let scene = quad_scene();
         let (w, h) = (320, 200);
         let mut frame = Frame::new(w, h);
-        let settings = RenderSettings { cull_backfaces: false, wireframe: false, exposure: 1.0, scene_radius: 1.5 };
-        let lights = [PointLight { position: Vec3::new(0.0, 0.0, 3.0), color: Vec3::ONE, intensity: 1.0 }];
+        let settings = settings();
+        let lights = [PointLight { position: Vec3::new(0.0, 0.0, 3.0), color: Vec3::ONE, lumens: 100.0 }];
         render(&scene, &camera(w, h), &lights, &settings, &mut frame);
         assert_eq!(frame.stats.tris_drawn, 2);
         assert_ne!(frame.tri_id[h / 2 * w + w / 2], NO_TRI);
@@ -693,7 +862,7 @@ mod tests {
         scene.push_mesh(&p, &[], &[], &[0, 1, 2]);
         let (w, h) = (160, 100);
         let mut frame = Frame::new(w, h);
-        let settings = RenderSettings { cull_backfaces: false, wireframe: false, exposure: 1.0, scene_radius: 1.5 };
+        let settings = settings();
         render(&scene, &camera(w, h), &[], &settings, &mut frame);
         // Clipping yields one or two pieces, and every drawn pixel has finite depth.
         assert!(frame.stats.tris_drawn >= 1 && frame.stats.tris_drawn <= 2);
@@ -701,19 +870,19 @@ mod tests {
     }
 
     #[test]
-    fn only_point_lights_light_the_scene() {
+    fn lights_fall_off_with_distance_squared() {
         let scene = quad_scene();
         let (w, h) = (160, 100);
-        let settings = RenderSettings { cull_backfaces: false, wireframe: false, exposure: 1.0, scene_radius: 1.5 };
+        let settings = settings();
         let centre = h / 2 * w + w / 2;
         let mut dark = Frame::new(w, h);
         render(&scene, &camera(w, h), &[], &settings, &mut dark);
         assert_ne!(dark.tri_id[centre], NO_TRI);
-        assert_eq!(dark.color[centre], 0, "no lights, no ambient: the quad is black");
+        assert_eq!(dark.color[centre], 0, "no lights, no sky: the quad is black");
         let mut lit = Frame::new(w, h);
-        let near_light = [PointLight { position: Vec3::new(0.0, 0.0, 0.5), color: Vec3::ONE, intensity: 0.05 }];
+        let near_light = [PointLight { position: Vec3::new(0.0, 0.0, 0.5), color: Vec3::ONE, lumens: 50.0 }];
         render(&scene, &camera(w, h), &near_light, &settings, &mut lit);
-        let far_light = [PointLight { position: Vec3::new(0.0, 0.0, 2.0), color: Vec3::ONE, intensity: 0.05 }];
+        let far_light = [PointLight { position: Vec3::new(0.0, 0.0, 2.0), color: Vec3::ONE, lumens: 50.0 }];
         let mut dim = Frame::new(w, h);
         render(&scene, &camera(w, h), &far_light, &settings, &mut dim);
         let g = |c: u32| (c >> 8) & 0xff;
@@ -731,7 +900,7 @@ mod tests {
         scene.push_mesh(&behind, &[], &[], &idx);
         let (w, h) = (200, 150);
         let mut frame = Frame::new(w, h);
-        let settings = RenderSettings { cull_backfaces: false, wireframe: false, exposure: 1.0, scene_radius: 1.5 };
+        let settings = settings();
         render(&scene, &camera(w, h), &[], &settings, &mut frame);
         assert!(frame.stats.clusters_drawn * 2 <= frame.stats.clusters_in + 1, "{:?}", frame.stats);
         assert!(frame.stats.clusters_drawn > 0);
@@ -755,5 +924,65 @@ mod tests {
         let (o, d) = pixel_ray(&cam, w, h, x, y);
         let closest = o + d * (p - o).dot(d);
         assert!(closest.distance(p) < 1e-3, "{closest} vs {p}");
+    }
+
+    #[test]
+    fn the_sky_lights_near_and_far_surfaces_alike() {
+        // A small card 3 m away and a huge one 5 km away, both facing the
+        // camera, same albedo: lit by the sky only they read the same.
+        let mut scene = Scene::new();
+        let card = |c: Vec3, half: f32| [c + Vec3::new(-half, -half, 0.0), c + Vec3::new(half, -half, 0.0), c + Vec3::new(half, half, 0.0), c + Vec3::new(-half, half, 0.0)];
+        scene.push_mesh(&card(Vec3::new(-0.3, 0.0, 0.0), 0.2), &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
+        scene.push_mesh(&card(Vec3::new(1500.0, 0.0, -5000.0), 900.0), &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
+        let (w, h) = (200, 100);
+        let mut frame = Frame::new(w, h);
+        let settings = RenderSettings::new(Sky { lux: 500.0, on: true });
+        render(&scene, &camera(w, h), &[], &settings, &mut frame);
+        let near = frame.color[h / 2 * w + w / 2 - 10];
+        let far = frame.color[h / 2 * w + w / 2 + 30];
+        assert_ne!(frame.tri_id[h / 2 * w + w / 2 - 10], frame.tri_id[h / 2 * w + w / 2 + 30]);
+        assert_eq!(near, far);
+        assert_ne!(near, 0);
+    }
+
+    #[test]
+    fn reach_is_where_illuminance_meets_the_cut() {
+        let sky = Sky { lux: 30.0, on: true };
+        let cut = cut_lux(&sky, default_exposure(sky.lux));
+        for lm in [12.0, 400.0, 12_000.0, crate::scene::MAX_LUMENS] {
+            let l = PointLight { position: Vec3::ZERO, color: Vec3::ONE, lumens: lm };
+            let r = light_reach(&l, cut);
+            assert!((l.lux_at(r) / cut - 1.0).abs() < 1e-3);
+        }
+        // Sky off: only the black-level floor, so lights reach further.
+        let dark = Sky { on: false, ..sky };
+        assert!(cut_lux(&dark, default_exposure(sky.lux)) < cut);
+    }
+
+    #[test]
+    fn lights_are_skipped_on_clusters_out_of_reach() {
+        let mut scene = Scene::new();
+        let (p, idx) = crate::scene::tests::uv_sphere(32);
+        scene.push_mesh(&p, &[], &[], &idx);
+        // Off to the side so the near sphere does not hide it.
+        let far: Vec<Vec3> = p.iter().map(|v| *v * 50.0 + Vec3::new(180.0, 0.0, -400.0)).collect();
+        scene.push_mesh(&far, &[], &[], &idx);
+        let lights = [PointLight { position: Vec3::new(0.0, 1.5, 1.5), color: Vec3::ONE, lumens: 400.0 }];
+        let (w, h) = (200, 150);
+        let settings = RenderSettings::new(Sky { lux: 30.0, on: true });
+        let mut culled = Frame::new(w, h);
+        render(&scene, &camera(w, h), &lights, &settings, &mut culled);
+        let mut full = Frame::new(w, h);
+        render(&scene, &camera(w, h), &lights, &RenderSettings { light_reach: false, ..RenderSettings::new(Sky { lux: 30.0, on: true }) }, &mut full);
+        assert!(culled.stats.light_evals < full.stats.light_evals, "{:?} vs {:?}", culled.stats, full.stats);
+        assert_eq!(full.stats.light_evals, full.stats.light_evals_all);
+        // The picture does not change by more than one 8-bit step anywhere.
+        let mut worst = 0;
+        for (a, b) in culled.color.iter().zip(&full.color) {
+            for sh in [0, 8, 16] {
+                worst = worst.max((((a >> sh) & 0xff) as i32 - ((b >> sh) & 0xff) as i32).abs());
+            }
+        }
+        assert!(worst <= 1, "worst channel difference {worst}");
     }
 }
