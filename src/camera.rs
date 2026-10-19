@@ -35,6 +35,17 @@ impl OrbitCamera {
         self.distance = radius / (self.fov_y * 0.5).tan() * 0.9;
     }
 
+    /// Put the eye at `eye`, looking at `target`.
+    pub fn look_from(&mut self, eye: Vec3, target: Vec3) {
+        let d = target - eye;
+        self.distance = d.length().max(1e-3);
+        let f = d / self.distance;
+        // forward = -(cos p sin y, sin p, cos p cos y)
+        self.pitch = (-f.y).clamp(-1.0, 1.0).asin();
+        self.yaw = (-f.x).atan2(-f.z);
+        self.target = target;
+    }
+
     pub fn forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();

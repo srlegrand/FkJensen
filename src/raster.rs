@@ -73,6 +73,13 @@ pub struct Stats {
     /// Whether every pixel was resolved, or only those of clusters shaded
     /// this frame.
     pub full_resolve: bool,
+    /// Surfels lit again, receivers whose bounce was gathered, receivers in
+    /// view still waiting, and the time spent.
+    pub surfels_lit: u64,
+    pub receivers_updated: usize,
+    pub receivers_pending: usize,
+    pub bounce_ms: f32,
+    pub gather_ms: f32,
     /// Shadow maps rebuilt this frame, and triangles drawn into them.
     pub shadow_maps_built: usize,
     pub shadow_tris: u64,
@@ -122,12 +129,21 @@ const SKY_IRRADIANCE_TINT: Vec3 = Vec3::new(0.82, 0.95, 1.25);
 
 impl Sky {
     /// Illuminance in lux, per colour channel, on a surface facing `n`.
+    #[allow(dead_code)]
     pub fn irradiance(&self, n: Vec3) -> Vec3 {
+        self.irradiance_from(n, true)
+    }
+
+    /// The same, with or without the light the ground sends back up. With
+    /// bounce light on, the ground term is left out: the real ground is in
+    /// the surfel cloud and bounces its own light.
+    pub fn irradiance_from(&self, n: Vec3, ground: bool) -> Vec3 {
         if !self.on {
             return Vec3::ZERO;
         }
         let up = n.y * 0.5 + 0.5;
-        self.lux * (SKY_IRRADIANCE_TINT * up + GROUND_TINT * GROUND_BOUNCE * (1.0 - up))
+        let g = if ground { GROUND_TINT * GROUND_BOUNCE * (1.0 - up) } else { Vec3::ZERO };
+        self.lux * (SKY_IRRADIANCE_TINT * up + g)
     }
 
     /// Radiance in cd/m², per colour channel, seen looking along `dir`.
@@ -163,12 +179,16 @@ pub struct RenderSettings {
     pub light_reach: bool,
     /// Shadow maps for the point lights.
     pub shadows: bool,
+    /// Bounce light (point-based colour bleeding).
+    pub bounce: bool,
+    /// Time per frame for gathering bounce light, in ms; None: all of it.
+    pub bounce_budget_ms: Option<f32>,
     pub view: View,
 }
 
 impl RenderSettings {
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, light_reach: true, shadows: true, view: View::Shaded }
+        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, light_reach: true, shadows: true, bounce: true, bounce_budget_ms: None, view: View::Shaded }
     }
 }
 

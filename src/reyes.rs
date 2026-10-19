@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use glam::{Mat4, Vec3};
 use rayon::prelude::*;
 
+use crate::bounce::{self, Bounce};
 use crate::raster::{self, Camera, Frame, NO_TRI, NOT_VISIBLE, RenderSettings, SPECULAR, Sky, View};
 use crate::scene::{PointLight, Scene};
 use crate::shadow::{CubeShadow, SHADOW_RES};
@@ -98,7 +99,9 @@ pub struct Renderer {
     shadows: Vec<Option<CubeShadow>>,
     prev_lights: Vec<PointLight>,
     prev_reach: Vec<f32>,
-    prev_global: Option<(Sky, f32, bool, bool)>,
+    prev_global: Option<(Sky, f32, bool, bool, bool)>,
+    /// The surfel cloud and the bounce light at each receiver.
+    bounce: Option<Bounce>,
     vis_key: Option<VisKey>,
     vis_stamp: u64,
     levels: Vec<u8>,
@@ -127,6 +130,7 @@ impl Renderer {
             prev_lights: Vec::new(),
             prev_reach: Vec::new(),
             prev_global: None,
+            bounce: None,
             vis_key: None,
             vis_stamp: 0,
             levels: Vec::new(),
@@ -136,6 +140,13 @@ impl Renderer {
             base_view: None,
             frame_no: 0,
         }
+    }
+
+    /// For tests: in which frame each cluster's bounce light was last
+    /// gathered.
+    #[cfg(test)]
+    pub fn bounce_stamps(&self) -> Option<&[u64]> {
+        self.bounce.as_ref().map(|b| &b.stamp[..])
     }
 
     /// Memory held by the shading cache and the shadow maps, in bytes.
@@ -166,8 +177,11 @@ impl Renderer {
         let reach: Vec<f32> = lights.iter().map(|l| if settings.light_reach { raster::light_reach(l, cut) } else { f32::INFINITY }).collect();
 
         // What changed since the last frame decides what is thrown away.
-        let global = (settings.sky, settings.exposure, settings.light_reach, settings.shadows);
-        if self.prev_global != Some(global) || self.prev_lights.len() != lights.len() {
+        let global = (settings.sky, settings.exposure, settings.light_reach, settings.shadows, settings.bounce);
+        let global_changed = self.prev_global != Some(global) || self.prev_lights.len() != lights.len();
+        // Spheres (old and new position, with reach) of lights that changed.
+        let mut spheres: Vec<(Vec3, f32)> = Vec::new();
+        if global_changed {
             full_resolve = true;
             for c in &mut self.cache {
                 c.done = 0;
@@ -175,7 +189,6 @@ impl Renderer {
             }
             self.shadows = (0..lights.len()).map(|_| None).collect();
         } else {
-            let mut spheres: Vec<(Vec3, f32)> = Vec::new();
             for (i, l) in lights.iter().enumerate() {
                 let old = &self.prev_lights[i];
                 if old != l {
@@ -220,6 +233,51 @@ impl Renderer {
         }
         frame.stats.shadow_ms = ts.elapsed().as_secs_f32() * 1000.0;
 
+        // Bounce: light the surfels again where light changed, then throw
+        // away the receivers that bounce could reach from there.
+        let tb = std::time::Instant::now();
+        let shadows: Vec<Option<&CubeShadow>> = (0..lights.len()).map(|i| if settings.shadows { self.shadows[i].as_ref() } else { None }).collect();
+        let sky = settings.sky;
+        if settings.bounce {
+            let b = self.bounce.get_or_insert_with(|| Bounce::new(scene));
+            let all = global_changed;
+            if all || !spheres.is_empty() {
+                let lit = AtomicU64::new(0);
+                // The brightest change, as an intensity (cd): how far the
+                // change in bounce light can be seen.
+                let changed = std::sync::Mutex::new(0f32);
+                b.radiance.par_iter_mut().zip(b.surfels.par_iter()).for_each(|(r, sf)| {
+                    if !all && !spheres.iter().any(|(p, rr)| p.distance(sf.position) <= rr + (sf.area / std::f32::consts::PI).sqrt()) {
+                        return;
+                    }
+                    let in_reach: Vec<usize> = (0..lights.len()).filter(|&i| lights[i].position.distance(sf.position) <= reach[i]).collect();
+                    // Direct light only, without the sky's ground term: the
+                    // ground is in the cloud.
+                    let new = shade_point(sf.position, sf.normal, sf.albedo, sf.position + sf.normal, sky, false, lights, &in_reach, &reach, &shadows).0;
+                    let delta = (new - *r).abs().max_element() * sf.area;
+                    *r = new;
+                    lit.fetch_add(1, Ordering::Relaxed);
+                    if delta > 0.0 {
+                        let mut m = changed.lock().unwrap();
+                        *m = m.max(delta);
+                    }
+                });
+                frame.stats.surfels_lit = lit.into_inner();
+                b.refit();
+                let bounce_reach = (changed.into_inner().unwrap() / cut.max(1e-12)).sqrt();
+                if all {
+                    b.valid.iter_mut().for_each(|v| *v = false);
+                } else {
+                    for (ci, c) in scene.clusters.iter().enumerate() {
+                        if spheres.iter().any(|(p, r)| p.distance(c.centre) <= c.radius + r + bounce_reach) {
+                            b.valid[ci] = false;
+                        }
+                    }
+                }
+            }
+        }
+        frame.stats.bounce_ms = tb.elapsed().as_secs_f32() * 1000.0;
+
         // Visibility, unless the camera and the frame are as they were.
         let vk = VisKey { view: cam.view, proj: cam.proj, size: (frame.width, frame.height), cull: settings.cull_backfaces, wireframe: settings.wireframe };
         if self.vis_key == Some(vk) && frame.vis_stamp == self.vis_stamp && self.vis_stamp != 0 {
@@ -253,11 +311,10 @@ impl Renderer {
         let shaded = AtomicU64::new(0);
         let used = AtomicU64::new(0);
         let clusters_shaded = AtomicU64::new(0);
-        let shadows: Vec<Option<&CubeShadow>> = (0..lights.len()).map(|i| if settings.shadows { self.shadows[i].as_ref() } else { None }).collect();
         let eye = cam.eye;
         let levels = &self.levels;
         let need = &self.need;
-        let sky = settings.sky;
+        let ground = !settings.bounce;
         if settings.view == View::Shaded {
             self.cache.par_iter_mut().enumerate().for_each(|(ci, e)| {
                 let need_tris = need[ci];
@@ -323,7 +380,7 @@ impl Renderer {
                     let side = if back { -1.0 } else { 1.0 };
                     if level == 0 {
                         let v = c.first_vertex as usize + u;
-                        let (d, s, k) = shade_point(scene.positions[v], scene.normals[v] * side, scene.colors[v], eye, sky, lights, &in_reach, &reach, &shadows);
+                        let (d, s, k) = shade_point(scene.positions[v], scene.normals[v] * side, scene.colors[v], eye, sky, ground, lights, &in_reach, &reach, &shadows);
                         if diffuse_too {
                             e.diffuse[off] = d;
                         }
@@ -343,7 +400,7 @@ impl Renderer {
                                 let p = scene.positions[i0] * b0 + scene.positions[i1] * b1 + scene.positions[i2] * b2;
                                 let nn = (scene.normals[i0] * b0 + scene.normals[i1] * b1 + scene.normals[i2] * b2).normalize_or(Vec3::Y) * side;
                                 let a = scene.colors[i0] * b0 + scene.colors[i1] * b1 + scene.colors[i2] * b2;
-                                let (d, s, ev) = shade_point(p, nn, a, eye, sky, lights, &in_reach, &reach, &shadows);
+                                let (d, s, ev) = shade_point(p, nn, a, eye, sky, ground, lights, &in_reach, &reach, &shadows);
                                 if diffuse_too {
                                     e.diffuse[off + k] = d;
                                 }
@@ -368,6 +425,38 @@ impl Renderer {
         frame.stats.light_evals = evals.into_inner();
         frame.stats.light_evals_all = frame.stats.points_shaded * lights.len() as u64;
 
+        // Gather bounce light at visible receivers that need it, nearest the
+        // camera first, within the time budget.
+        let tg = std::time::Instant::now();
+        if settings.bounce && settings.view == View::Shaded {
+            let b = self.bounce.as_mut().expect("made above");
+            let bounce_reach = b.reach(cut);
+            let mut todo: Vec<u32> = self.visible.iter().copied().filter(|&c| !b.valid[c as usize]).collect();
+            todo.sort_by(|a, c| scene.clusters[*a as usize].centre.distance_squared(eye).total_cmp(&scene.clusters[*c as usize].centre.distance_squared(eye)));
+            let mut done = 0;
+            for batch in todo.chunks(32) {
+                if let Some(ms) = settings.bounce_budget_ms {
+                    if tg.elapsed().as_secs_f32() * 1000.0 > ms {
+                        break;
+                    }
+                }
+                let bref = &*b;
+                let results: Vec<(u32, Vec<bounce::Sh>)> = batch.par_iter().map(|&c| (c, bref.gather_cluster(c as usize, bounce_reach))).collect();
+                for (c, shs) in results {
+                    let first = b.first_receiver[c as usize] as usize;
+                    for (k, sh) in shs.into_iter().enumerate() {
+                        b.sh[first + k] = sh;
+                    }
+                    b.valid[c as usize] = true;
+                    b.stamp[c as usize] = frame_no;
+                }
+                done += batch.len();
+            }
+            frame.stats.receivers_updated = done;
+            frame.stats.receivers_pending = todo.len() - done;
+        }
+        frame.stats.gather_ms = tg.elapsed().as_secs_f32() * 1000.0;
+
         // Resolve: each pixel interpolates the shaded points under it.
         let t_res = std::time::Instant::now();
         let (width, height) = (frame.width, frame.height);
@@ -383,10 +472,12 @@ impl Renderer {
         let cache = &self.cache;
         let tri_id = &frame.tri_id;
         let setups = &frame.setups;
+        let bounce = if settings.bounce { self.bounce.as_ref() } else { None };
         self.base.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
             for x in 0..width {
                 let id = tri_id[y * width + x];
-                if !full_resolve && (id == NO_TRI || cache[setups[id as usize].cluster as usize].stamp != frame_no) {
+                let changed = |c: usize| cache[c].stamp == frame_no || bounce.is_some_and(|b| b.stamp[c] == frame_no);
+                if !full_resolve && (id == NO_TRI || !changed(setups[id as usize].cluster as usize)) {
                     // Nothing under this pixel changed: keep it.
                     continue;
                 }
@@ -411,7 +502,20 @@ impl Renderer {
                     b[0] * s.bary[0][2] + b[1] * s.bary[1][2] + b[2] * s.bary[2][2],
                 ];
                 let e = &cache[s.cluster as usize];
-                let radiance = lookup(scene, c, e, s.tri, w);
+                let mut radiance = lookup(scene, c, e, s.tri, w);
+                if let Some(b) = bounce {
+                    // Bounce light, from the cluster's spherical harmonics,
+                    // with the normal turned to the eye.
+                    let t = s.tri as usize * 3;
+                    let (i0, i1, i2) = (scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize);
+                    let p = scene.positions[i0] * w[0] + scene.positions[i1] * w[1] + scene.positions[i2] * w[2];
+                    let mut n = (scene.normals[i0] * w[0] + scene.normals[i1] * w[1] + scene.normals[i2] * w[2]).normalize_or(Vec3::Y);
+                    if n.dot(eye - p) < 0.0 {
+                        n = -n;
+                    }
+                    let albedo = scene.colors[i0] * w[0] + scene.colors[i1] * w[1] + scene.colors[i2] * w[2];
+                    radiance += albedo * b.irradiance_at(scene, s.cluster as usize, s.tri, w, n) * std::f32::consts::FRAC_1_PI;
+                }
                 row[x] = raster::pack(raster::tonemap(radiance * exposure));
             }
         });
@@ -489,13 +593,14 @@ fn shade_point(
     albedo: Vec3,
     eye: Vec3,
     sky: Sky,
+    ground: bool,
     lights: &[PointLight],
     in_reach: &[usize],
     reach: &[f32],
     shadows: &[Option<&CubeShadow>],
 ) -> (Vec3, Vec3, u64) {
     let inv_pi = std::f32::consts::FRAC_1_PI;
-    let mut diffuse = albedo * sky.irradiance(n) * inv_pi;
+    let mut diffuse = albedo * sky.irradiance_from(n, ground) * inv_pi;
     let mut spec = Vec3::ZERO;
     let v = (eye - p).normalize_or(n);
     let mut evals = 0;
@@ -603,7 +708,9 @@ mod tests {
         assert!(s.clusters_shaded > 0 && s.clusters_shaded * 3 < first.clusters_shaded, "{} of {}", s.clusters_shaded, first.clusters_shaded);
         let mut fresh = Frame::new(w, h);
         render(&scene, &cam, &lights, &settings, &mut fresh);
-        assert_eq!(worst(&frame, &fresh), 0);
+        // Bounce light kept beyond the reach of the change differs from a
+        // fresh gather by less than the cut: at most one 8-bit step.
+        assert!(worst(&frame, &fresh) <= 1, "{}", worst(&frame, &fresh));
         // Nothing changed: nothing is shaded.
         r.render(&scene, &cam, &lights, &settings, &mut frame);
         assert_eq!(frame.stats.points_shaded, 0);

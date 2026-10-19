@@ -3,7 +3,7 @@
 A 3D viewport that renders on the CPU and nothing else, following the path
 3D graphics would have taken if GPUs had never existed (see
 `DESIGN_PHILOSOPHY.md`): REYES-style shading kept between frames, shadow
-maps, no ray tracing. No GPU API is linked; the frame is made on the cores
+maps, point-based bounce light, no ray tracing. No GPU API is linked; the frame is made on the cores
 with rayon and copied to the window through shared memory (softbuffer).
 
 It does not read USD. Scenes are in FkJensen's own `.fkj` format
@@ -46,6 +46,37 @@ A map only holds the geometry inside its light's reach: whatever can shadow
 a point the light reaches is nearer the light than that point. Maps are
 kept until their light moves or changes strength. `M` turns them off. The
 sky is not occluded yet.
+
+**Bounce light.** Point-based colour bleeding (Christensen 2008), no rays
+(`src/bounce.rs`). The surfaces become a cloud of discs (surfels): one per
+large triangle, up to six per small cluster binned by facing, 153,753 for
+the built-in set. Each is lit directly, by the sky and the point lights
+through their shadow maps: that lit cloud is the set of micro lights. The
+surfels sit in a tree whose nodes carry summed area, normal and mean
+radiance.
+
+Bounce light is gathered at receivers: one at each vertex of a large
+cluster (a floor, a wall, a table top), blended across its triangles, and
+one for each small cluster. A receiver walks the tree nearest first, taking
+near surfels one by one and far groups as one disc, and lays each onto a
+6 x 8 x 8 cube raster around itself: a small or far disc by its solid
+angle, a large near one by meeting each texel's direction with the disc.
+The raster fills nearest first, so a nearer surface hides what is behind
+it; a surfel seen from behind sends nothing but still hides what is
+beyond, so a receiver under the chess board does not see through it. The
+raster is folded into order-1 spherical harmonics, from which each pixel
+takes the irradiance for its own normal. One bounce. With bounce on, the
+sky's ground term is left out: the real ground is in the cloud.
+
+Light reach applies here too. A changed light relights only the surfels in
+its reach, and throws away only the receivers within its reach plus the
+reach of the brightest change in bounce light. Turning a table lamp up to
+2,000,000 lm does not gather the mountains' bounce light again. In the
+window, gathering gets 30 ms a frame, nearest the camera first, and catches
+up over the following frames; a still render waits for all of it. `I` turns
+bounce off.
+
+![The café at night, lit by one 30,000 lm lamp above the awning, without and with bounce light: the shadowed shopfront under the awning picks up light from the lit pavement](docs/bounce.png)
 
 ### Light reach
 
@@ -113,6 +144,7 @@ Headless, for tests and screenshots (no window, no display needed):
     cargo run --release -- --png out.png --close
     cargo run --release -- --png out.png --view lights --light -0.2,1.1,0.22,2000000
     cargo run --release -- --png out.png --sky 0 --exposure 0.02
+    cargo run --release -- --png out.png --sky 0 --exposure 0.01 --look -6,1.6,-25,0,2.2,-40 --light 1,6,-35,30000
 
 - `--light x,y,z[,lumens]` replaces the scene's lights (800 lm when no
   lumens are given); repeatable. Positions in metres.
@@ -121,14 +153,17 @@ Headless, for tests and screenshots (no window, no display needed):
 - `--view lights` writes the light count view.
 - `--no-reach` evaluates every light at every point, to compare.
 - `--no-shadows` turns shadow maps off.
+- `--no-bounce` turns bounce light off.
 - `--close` starts on the close framing.
+- `--look ex,ey,ez,tx,ty,tz` puts the camera at e looking at t, in metres.
 - `--bench-drag` (with `--png`) then moves the first light 10 cm five times,
   as a drag would, and times each frame.
 
 The window title shows the frame rate, the selected light's lumens,
 position and reach, the sky, whether visibility was kept from the last
 frame, how many shading points were shaded out of those in view, shadow map
-time, and the time of each pass in milliseconds.
+time, how many receivers are still waiting for bounce light, and the time
+of each pass in milliseconds.
 
 ## Controls
 
@@ -147,6 +182,7 @@ time, and the time of each pass in milliseconds.
     H                      light count view: how many lights each pixel evaluates
     X                      light reach off / on (to compare cost and picture)
     M                      shadow maps on / off
+    I                      bounce light on / off
 
     Camera
     left drag              orbit                 middle drag / shift+left   pan
@@ -176,6 +212,8 @@ rig holds 64 lights at most.
    sky, exposure, light reach, shadows or number of lights throws away all
    shading.
 2. **Shadow maps** for lights that have none (`src/shadow.rs`), in parallel.
+   Then **surfels** inside a changed light's reach are lit again, and the
+   bounce receivers that change could reach are thrown away.
 3. **Visibility** (`src/raster.rs`), skipped while the camera has not moved.
    Clusters are culled against the view frustum as a whole (and their
    normal cone, with back-face culling on), then their triangles are set
@@ -192,52 +230,64 @@ rig holds 64 lights at most.
    the exposure throws it away; the highlight depends on the eye and is
    redone when the camera moves. Shading is two-sided: normals face the
    eye, and a triangle seen from its other side is shaded again.
-5. **Resolve.** Each pixel interpolates the shaded micropolygon under it.
-   While visibility is kept, only pixels of clusters shaded this frame are
-   resolved again; the rest of the picture is kept.
+5. **Bounce gather** at visible receivers that have none, nearest the
+   camera first, within the time budget.
+6. **Resolve.** Each pixel interpolates the shaded micropolygon under it
+   and adds bounce light from its receivers for its normal. While
+   visibility is kept, only pixels of clusters shaded or gathered this
+   frame are resolved again; the rest of the picture is kept.
 
 `src/scene.rs` holds the scene and builds clusters. `src/fkj.rs` reads
 and writes `.fkj`. `src/world.rs` makes the table, square, café, valley and
 mountains. `src/lights.rs` is the light rig and the picking and dragging
-maths.
+maths. `src/shadow.rs` and `src/bounce.rs` are the shadow maps and the
+bounce light.
 
 ## Measured
 
 On the machine this was written on (2 cores of an Intel Xeon at 2.1 GHz,
-shared, no SIMD, 19/10/2026), the built-in set (1,521,804 triangles, 24,379
-clusters, 17 lights with shadow maps), 1280 x 720.
+shared, no SIMD, 20/10/2026), the built-in set (1,521,804 triangles, 26,456
+clusters, 17 lights with shadow maps, 153,753 surfels), 1280 x 720, two runs
+each.
 
-First frame, nothing kept, three runs each:
+First frame, nothing kept, everything gathered:
 
 | | wide view | close view |
 |---|---|---|
-| shadow maps (17) | 515 to 622 ms | 525 to 624 ms |
-| visibility | 220 to 230 ms | 196 to 208 ms |
-| shading | 247 to 287 ms (2.2 M points) | 117 to 127 ms (1.1 M points) |
-| resolve | 49 to 55 ms | 52 to 57 ms |
-| total | 1.04 to 1.19 s | 0.90 to 1.01 s |
+| shadow maps (17) | 527 to 613 ms | 517 to 599 ms |
+| lighting the surfels | 127 to 128 ms | 112 to 114 ms |
+| bounce gather | 1.63 to 1.74 s (1,467 clusters) | 2.42 to 2.45 s (7,195 clusters) |
+| visibility | 222 to 240 ms | 197 to 211 ms |
+| shading | 240 to 309 ms (2.2 M points) | 113 to 120 ms (1.1 M points) |
+| resolve | 65 to 69 ms | 75 to 76 ms |
+| total | 2.89 to 3.04 s | 3.45 to 3.56 s |
 
-Dragging the table lamp, `--bench-drag`, five steps each:
+Dragging the table lamp, `--bench-drag`, steps 1 and 5 of each run, with
+the window's 30 ms bounce budget:
 
 | | wide view | close view |
 |---|---|---|
 | visibility | kept | kept |
-| shadow map (1, 1.44 M triangles) | 96 to 125 ms | 112 to 131 ms |
-| shading | 91 to 145 ms (554 K points, 1,129 clusters) | 113 to 165 ms (958 K points, 6,732 clusters) |
-| resolve | 24 to 29 ms | 52 to 72 ms |
-| total | 217 to 298 ms | 277 to 368 ms |
+| shadow map (1, 1.44 M triangles) | 98 to 103 ms | 96 to 129 ms |
+| lighting the surfels | 13 to 21 ms (65 K surfels) | 15 to 16 ms (65 K surfels) |
+| bounce gather | 32 to 36 ms (128 clusters; about 1,050 waiting) | 31 to 39 ms (128 clusters; about 7,060 waiting) |
+| shading | 89 to 140 ms (554 K points) | 101 to 115 ms (937 K points) |
+| resolve | 33 to 41 ms | 64 to 73 ms |
+| total | 272 to 338 ms | 321 to 350 ms |
 
-A frame where nothing changed takes 1 to 2 ms (the window title showed
-230 to 425 fps under a virtual display).
+While a light is being dragged, the bounce light near it lags; after the
+drag stops it catches up, about 2 s for the chess set in the close view.
+In the window, the set's bounce light was complete about 4 s after start.
+A frame where nothing changed takes 1 to 3 ms.
 
-Light reach, first frame of the wide view, on and off:
+Light reach, first frame of the wide view without bounce, on and off:
 
 | | reach on | reach off |
 |---|---|---|
 | triangles drawn into shadow maps | 4,364,338 | 25,913,128 |
-| shadow maps | 622 ms | 1,521 ms |
-| light evaluations | 3,991,394 | 37,538,975 |
-| shading | 287 ms | 2,239 ms |
+| shadow maps | 609 ms | 1,371 ms |
+| light evaluations | 3,991,073 | 37,537,156 |
+| shading | 338 ms | 2,047 ms |
 
 Where a drag frame goes: re-drawing the lamp's shadow map, which holds the
 whole chess set, and re-shading every point in the lamp's reach with all
@@ -247,8 +297,13 @@ Not measured yet: a Raspberry Pi.
 
 ## Not done yet
 
-- Reflections (environment and per-object cube maps) and bounce light
-  (point-based colour bleeding): not started.
+- Reflections (environment and per-object cube maps): not started.
+- Bounce light: one bounce only. A large surfel near a receiver covers its
+  raster through a disc enlarged by a third, so that tiled discs leave no
+  gaps; the outline of a nearby surface counts a little more light than it
+  should. Small clusters have one receiver, so a cluster that wraps a tight
+  curve gets one set of spherical harmonics for all of it. Gathering is
+  the slowest pass of a first frame.
 - The sky is not occluded.
 - A moved light re-shades its points with every light in reach; keeping
   each light's share apart would let it redo only its own.
@@ -261,13 +316,12 @@ Not measured yet: a Raspberry Pi.
 - Points, curves and volumes in `.fkj` (tags reserved).
 - Materials and textures: albedo per vertex only.
 - Light reach is per cluster and per point, not per pixel.
-- The shading cache holds 143 to 178 MB for the views above and is not
+- The shading cache holds 142 to 178 MB for the views above and is not
   capped or evicted yet.
 - Shading points are not shared between neighbouring triangles above
   level 0, so edges are shaded twice.
-- The chess set's clusters were baked before clusters were bounded in
-  space; the procedural set's are bounded.
-- No converter in the repository: the chess set was baked once.
+- No converter in the repository: the chess set was baked from USD outside
+  it (`docs/format.md`).
 - Light rigs and the sky setting are not saved.
 - Text overlay: the numbers are in the window title.
 

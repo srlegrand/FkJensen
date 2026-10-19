@@ -13,11 +13,14 @@
 //!   fkjensen --view lights             show how many lights each pixel evaluates
 //!   fkjensen --no-reach                evaluate every light everywhere (to compare)
 //!   fkjensen --close                   start on the close framing of the subject
+//!   fkjensen --look ex,ey,ez,tx,ty,tz  camera at e looking at t, in metres
 //!   fkjensen --no-shadows              point lights without shadow maps
+//!   fkjensen --no-bounce               no bounce light
 //!   fkjensen --png out.png --bench-drag  then move the first light five times, timing each frame
 //!
 //! Controls are listed in README.md and printed at start.
 
+mod bounce;
 mod camera;
 mod fkj;
 mod lights;
@@ -70,6 +73,7 @@ Controls
   H                      light count view: how many lights each pixel evaluates
   X                      light reach off / on (to compare cost and picture)
   M                      shadow maps on / off
+  I                      bounce light on / off
 
   Camera
   left drag              orbit                 middle drag / shift+left   pan
@@ -130,7 +134,9 @@ impl App {
             surface: None,
             surface_sized: false,
             frame: Frame::new(1, 1),
-            settings: RenderSettings::new(Sky { lux: DEFAULT_SKY_LUX, on: true }),
+            // In the window, bounce light is gathered for 30 ms a frame and
+            // catches up over the following frames.
+            settings: RenderSettings { bounce_budget_ms: Some(30.0), ..RenderSettings::new(Sky { lux: DEFAULT_SKY_LUX, on: true }) },
             scene,
             scene_name,
             cam,
@@ -285,7 +291,7 @@ impl App {
         };
         let sky = if self.settings.sky.on { format!("sky {:.0} lux", self.settings.sky.lux) } else { "sky off".into() };
         w.set_title(&format!(
-            "FkJensen  {}  {:.0} fps  {light}  {sky}  {}  shaded {} of {} points  shadows {} ({:.0} ms)  setup {:.0} raster {:.0} shade {:.0} resolve {:.0} ms  CPU only",
+            "FkJensen  {}  {:.0} fps  {light}  {sky}  {}  shaded {} of {} points  shadows {} ({:.0} ms)  bounce {}  setup {:.0} raster {:.0} shade {:.0} resolve {:.0} ms  CPU only",
             self.scene_name,
             self.title_fps,
             if s.visibility_kept { "visibility kept" } else { "visibility new" },
@@ -293,6 +299,7 @@ impl App {
             s.points_used,
             if self.settings.shadows { "on" } else { "off" },
             s.shadow_ms,
+            if !self.settings.bounce { "off".to_string() } else if s.receivers_pending > 0 { format!("{} receivers to go", s.receivers_pending) } else { "done".to_string() },
             s.setup_ms + s.bin_ms,
             s.raster_ms,
             s.shade_ms,
@@ -397,6 +404,7 @@ impl App {
             }
             KeyCode::KeyX => self.settings.light_reach = !self.settings.light_reach,
             KeyCode::KeyM => self.settings.shadows = !self.settings.shadows,
+            KeyCode::KeyI => self.settings.bounce = !self.settings.bounce,
             KeyCode::KeyC => self.rig.cycle_colour(),
             KeyCode::KeyP => match save_png(&self.frame, "frame.png") {
                 Ok(()) => eprintln!("saved frame.png"),
@@ -614,7 +622,9 @@ fn main() {
     let mut reach = true;
     let mut close = false;
     let mut shadows = true;
+    let mut bounce = true;
     let mut bench_drag = false;
+    let mut look: Option<(Vec3, Vec3)> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -655,9 +665,22 @@ fn main() {
             "--no-reach" => reach = false,
             "--close" => close = true,
             "--no-shadows" => shadows = false,
+            "--no-bounce" => bounce = false,
             "--bench-drag" => bench_drag = true,
+            "--look" => {
+                // --look ex,ey,ez,tx,ty,tz: camera at e looking at t.
+                let v: Option<Vec<f32>> = args.get(i + 1).map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
+                match v {
+                    Some(v) if v.len() == 6 => look = Some((Vec3::new(v[0], v[1], v[2]), Vec3::new(v[3], v[4], v[5]))),
+                    _ => {
+                        eprintln!("--look takes ex,ey,ez,tx,ty,tz");
+                        std::process::exit(2);
+                    }
+                }
+                i += 1;
+            }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-shadows] [--close] [--bench-drag]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-shadows] [--no-bounce] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -698,16 +721,22 @@ fn main() {
         app.wide = false;
         frame_camera(&mut app.cam, &app.scene, false);
     }
+    if let Some((eye, target)) = look {
+        app.cam.look_from(eye, target);
+    }
     app.settings.light_reach = reach;
     app.settings.shadows = shadows;
+    app.settings.bounce = bounce;
 
     if let Some(out) = png_out {
+        // A still frame waits for all the bounce light.
+        app.settings.bounce_budget_ms = None;
         app.frame.resize(size.0, size.1);
         let t = Instant::now();
         app.render();
         let s = app.frame.stats;
         eprintln!(
-            "rendered {}x{} in {:.1} ms on {} threads: shadows {:.1} ms ({} maps, {} triangles), setup {:.1}, bin {:.1}, raster {:.1}, shade {:.1}, resolve {:.1} ms; {} of {} clusters, {} of {} triangles; {} shading points, {} light evaluations of {} without reach; cache {:.0} MB",
+            "rendered {}x{} in {:.1} ms on {} threads: shadows {:.1} ms ({} maps, {} triangles), bounce: {} surfels lit in {:.1} ms, {} receivers gathered in {:.1} ms; setup {:.1}, bin {:.1}, raster {:.1}, shade {:.1}, resolve {:.1} ms; {} of {} clusters, {} of {} triangles; {} shading points, {} light evaluations of {} without reach; cache {:.0} MB",
             size.0,
             size.1,
             t.elapsed().as_secs_f32() * 1000.0,
@@ -715,6 +744,10 @@ fn main() {
             s.shadow_ms,
             s.shadow_maps_built,
             s.shadow_tris,
+            s.surfels_lit,
+            s.bounce_ms,
+            s.receivers_updated,
+            s.gather_ms,
             s.setup_ms,
             s.bin_ms,
             s.raster_ms,
@@ -736,7 +769,9 @@ fn main() {
         eprintln!("wrote {out}");
         if bench_drag {
             // Move the first light 10 cm at a time, as a drag would, and
-            // time each frame with everything kept from the one before.
+            // time each frame with everything kept from the one before, with
+            // the window's bounce budget.
+            app.settings.bounce_budget_ms = Some(30.0);
             for step in 1..=5 {
                 if let Some(l) = app.rig.lights.get_mut(0) {
                     l.position.x += 0.1;
@@ -745,12 +780,17 @@ fn main() {
                 app.render();
                 let s = app.frame.stats;
                 eprintln!(
-                    "drag step {step}: {:.1} ms: visibility {}, shadows {:.1} ms ({} maps, {} triangles), shade {:.1} ms ({} points in {} clusters), resolve {:.1} ms",
+                    "drag step {step}: {:.1} ms: visibility {}, shadows {:.1} ms ({} maps, {} triangles), bounce {:.1} ms ({} surfels lit) + gather {:.1} ms ({} receivers, {} waiting), shade {:.1} ms ({} points in {} clusters), resolve {:.1} ms",
                     t.elapsed().as_secs_f32() * 1000.0,
                     if s.visibility_kept { "kept" } else { "redone" },
                     s.shadow_ms,
                     s.shadow_maps_built,
                     s.shadow_tris,
+                    s.bounce_ms,
+                    s.surfels_lit,
+                    s.gather_ms,
+                    s.receivers_updated,
+                    s.receivers_pending,
                     s.shade_ms,
                     s.points_shaded,
                     s.clusters_shaded,
@@ -875,5 +915,36 @@ mod tests {
         // The shop is lit by its own fifteen lights, so its pixels still
         // evaluate most of them; the table, square, valley and mountains do not.
         assert!(a.stats.light_evals * 2 < b.stats.light_evals, "{} vs {}", a.stats.light_evals, b.stats.light_evals);
+    }
+
+    /// A table lamp turned up to the brightest light allowed changes the
+    /// bounce light on the table and the square, and not on the mountains:
+    /// their bounce light is not gathered again.
+    #[test]
+    fn bounce_changes_stay_local() {
+        let scene = built_in().unwrap();
+        let mut lights = scene.lights.clone();
+        let (w, h) = (192, 108);
+        let mut cam = OrbitCamera::new();
+        frame_camera(&mut cam, &scene, true);
+        let c = Camera { view: cam.view(), proj: cam.proj(w as f32 / h as f32), eye: cam.eye(), near: cam.near() };
+        let settings = RenderSettings::new(Sky { lux: DEFAULT_SKY_LUX, on: true });
+        let mut r = reyes::Renderer::new();
+        let mut f = Frame::new(w, h);
+        r.render(&scene, &c, &lights, &settings, &mut f);
+        lights[0].lumens = scene::MAX_LUMENS;
+        r.render(&scene, &c, &lights, &settings, &mut f);
+        let regathered = f.stats.receivers_updated;
+        assert!(regathered > 0);
+        let stamps = r.bounce_stamps().unwrap();
+        let second = stamps.iter().copied().max().unwrap();
+        let mut mountains = 0;
+        for (ci, cl) in scene.clusters.iter().enumerate() {
+            if cl.centre.z < world::MOUNTAINS_NEAR_Z && cl.centre.y > 20.0 && stamps[ci] != 0 {
+                mountains += 1;
+                assert!(stamps[ci] < second, "mountain cluster {ci} gathered again");
+            }
+        }
+        assert!(mountains > 20, "{mountains} mountain clusters in view");
     }
 }

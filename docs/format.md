@@ -120,12 +120,16 @@ The sky is not stored in the file; it is a viewer setting.
 ## The built-in scene
 
 `assets/chess_set.fkj` is compiled into the program and opens when no file
-is given. It was baked once, on 19/10/2026, from the USD Working Group's
+is given. It was baked on 19/10/2026, and again on 20/10/2026, from the USD Working Group's
 Open Chess Set (`full_assets/OpenChessSet/chess_set.usda` at
 https://github.com/usd-wg/assets), by a converter that is not part of this
 repository:
 
 - every mesh, in world space, with the pawn point instancers expanded;
+- winding as USD authors it: 17 of the 21 meshes are `leftHanded`, and
+  their triangles are turned counter-clockwise (the first bake missed
+  this, so their normals pointed inwards);
+- clusters bounded in space as well as in count;
 - vertex normals smoothed from the faces where the source has none,
   face-varying ones averaged onto vertices;
 - each vertex's albedo is the average of the base colour texture over a
@@ -135,9 +139,9 @@ repository:
 - no lights: the file holds geometry only. The lights of the built-in set
   are in `src/world.rs`.
 
-Stored: 799,384 triangles, 821,485 vertices, 12,903 clusters, 14.7 MB.
-Loaded, with the pawn instances: 1,430,784 triangles, 1,366,001 vertices,
-21,443 clusters. At start-up it is placed on the table of the procedural
+Stored: 799,384 triangles, 815,974 vertices, 14,252 clusters, 14.7 MB.
+Loaded, with the pawn instances: 1,430,784 triangles, 1,355,968 vertices,
+23,520 clusters. At start-up it is placed on the table of the procedural
 set in `src/world.rs` (shopfront, square, valley, mountains), which is made
 directly into clusters and is not stored as a file.
 
