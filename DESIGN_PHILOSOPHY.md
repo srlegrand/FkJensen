@@ -13,6 +13,16 @@ Read `LLM_instructions.md` too: the checks to run first and how changes are deli
 - The operating system is not the bottleneck and is not fought. Threads are pinned and pages are locked only where a measurement shows a gain. A direct DRM/KMS target for Linux is allowed later; a kernel of its own is not.
 - Memory bandwidth, not arithmetic, is the budget: about 3.75 GB/s per core on a 16-core Zen 5. Data is laid out for it: structure of arrays, 8-wide packets, nothing allocated in the frame.
 
+## Scenes are in our own format
+
+- FkJensen does not read USD or any interchange format at run time. A scene is an `.fkj` file (`docs/format.md`), laid out for this renderer: clusters with their bounds and normal cones, quantised attributes, tagged sections a reader can skip. Loading is a decode, not a conversion.
+- Photoreal CG needs four kinds of primitive: polygon meshes, points (particles), curves (fur, hair) and volumes. The format reserves a section for each; meshes come first.
+
+## The only light is a point light
+
+- One light type, the point light. No ambient term: what no light reaches is black.
+- Moving lights interactively and seeing the result is the first job of the viewer.
+
 ## Cost follows pixels, not polygons
 
 - Visibility first, shading after: a visibility buffer of depth and triangle id, then one shade per pixel. A hidden surface is never shaded.
@@ -35,4 +45,5 @@ Read `LLM_instructions.md` too: the checks to run first and how changes are deli
 
 ## Log
 
+- 19/10/2026: USD reading removed; scenes are `.fkj`, the chess set is baked into the program. The point light is the only light type; no ambient term. Lights are dragged on screen.
 - 19/10/2026: file created. CPU and RAM only, Rust, no GPU API; visibility buffer and deferred shading; tiles without atomics; splatting and cluster LOD planned; lighting as a demand-filled cache with micro lights, nothing baked at import. First build: USD viewport with orbit and fly camera and placeable master lights.

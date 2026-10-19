@@ -2,14 +2,19 @@
 //!
 //! One frame is four passes, each parallel across cores with rayon:
 //!
-//! 1. **Setup**: every triangle is projected, clipped against the near plane,
-//!    optionally back-face culled, and gets a screen-space record.
+//! 1. **Setup**: clusters are tested against the view frustum (and, with
+//!    back-face culling on, against their normal cone) as a whole; the
+//!    vertices of each surviving cluster are projected into a small local
+//!    array and its triangles are clipped against the near plane, optionally
+//!    back-face culled, and given a screen-space record.
 //! 2. **Bin**: each record is listed in every 64 x 64 tile its box touches.
 //! 3. **Visibility**: each tile is rasterised by one thread into its own part
 //!    of the depth and triangle-id buffers. No atomics, no locks: a tile
 //!    belongs to one thread for the pass.
 //! 4. **Shade**: each pixel that has a triangle reconstructs its barycentric
-//!    weights, interpolates position, normal and colour, and is lit once.
+//!    weights, interpolates position, normal and colour, and is lit once by
+//!    the point lights. There is no ambient term: a surface no light reaches
+//!    is black.
 //!
 //! Shading after visibility is what keeps the cost proportional to pixels
 //! rather than to triangles: a triangle covered by another is never shaded.
@@ -20,7 +25,7 @@
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use rayon::prelude::*;
 
-use crate::scene::{Light, Scene};
+use crate::scene::{Cluster, PointLight, Scene};
 
 pub const TILE: usize = 64;
 pub const NO_TRI: u32 = u32::MAX;
@@ -48,6 +53,8 @@ pub struct Frame {
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Stats {
+    pub clusters_in: usize,
+    pub clusters_drawn: usize,
     pub tris_in: usize,
     pub tris_drawn: usize,
     pub setup_ms: f32,
@@ -75,7 +82,6 @@ pub struct TriSetup {
 pub struct RenderSettings {
     pub cull_backfaces: bool,
     pub wireframe: bool,
-    pub ambient: f32,
     pub exposure: f32,
     /// Scene radius, used to scale point light falloff so intensities stay
     /// sensible across scene sizes.
@@ -163,13 +169,14 @@ fn setup_tri(tri: u32, v: &[ClipVert; 3], width: usize, height: usize, cull: boo
         x[i] = (v[i].p.x * iw * 0.5 + 0.5) * w;
         y[i] = (0.5 - v[i].p.y * iw * 0.5) * h;
     }
-    // Signed area in screen space (y down): positive = clockwise on screen =
-    // counter-clockwise in a y-up world, the front face.
+    // Signed area in screen space (y down). A triangle wound counter-
+    // clockwise as seen from its front (right-handed, the USD and OpenGL
+    // convention) has negative area here, so positive area is a back face.
     let area = (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0]);
     if area == 0.0 || !area.is_finite() {
         return None;
     }
-    if cull && area < 0.0 {
+    if cull && area > 0.0 {
         return None;
     }
     let min_x = x.iter().cloned().fold(f32::INFINITY, f32::min).floor().max(0.0);
@@ -200,62 +207,105 @@ fn setup_tri(tri: u32, v: &[ClipVert; 3], width: usize, height: usize, cull: boo
     Some(s)
 }
 
-pub fn render(scene: &Scene, cam: &Camera, lights: &[Light], settings: &RenderSettings, frame: &mut Frame) {
+/// The frustum planes (left, right, bottom, top, near) of a view-projection
+/// matrix, normalised, as (normal, d) with inside meaning `n.dot(p) + d >= 0`.
+/// The projection is infinite, so there is no far plane.
+fn frustum_planes(vp: Mat4, near: f32) -> [Vec4; 5] {
+    let (r0, r1, r3) = (vp.row(0), vp.row(1), vp.row(3));
+    let norm = |p: Vec4| p / p.truncate().length().max(1e-20);
+    [norm(r3 + r0), norm(r3 - r0), norm(r3 + r1), norm(r3 - r1), norm(r3 - Vec4::new(0.0, 0.0, 0.0, near))]
+}
+
+/// Whether a cluster can be skipped: outside a frustum plane, or (with
+/// back-face culling) every face turned away from the eye.
+fn cluster_hidden(c: &Cluster, planes: &[Vec4; 5], eye: Vec3, cull_backfaces: bool) -> bool {
+    for p in planes {
+        if p.truncate().dot(c.centre) + p.w < -c.radius {
+            return true;
+        }
+    }
+    if cull_backfaces && c.cone_cos > 0.0 {
+        let d = c.centre - eye;
+        let dist = d.length();
+        if dist > c.radius {
+            // The cone of view directions to the sphere is asin(r/d) wide.
+            // Every face is back-facing when each view direction is within
+            // 90 degrees of every face normal.
+            let spread = c.cone_cos.clamp(-1.0, 1.0).acos();
+            let limit = std::f32::consts::FRAC_PI_2 - spread - (c.radius / dist).asin();
+            if limit > 0.0 && (d / dist).dot(c.cone_axis).clamp(-1.0, 1.0).acos() < limit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &RenderSettings, frame: &mut Frame) {
     let width = frame.width;
     let height = frame.height;
     let vp = cam.proj * cam.view;
     let t0 = std::time::Instant::now();
 
-    // Pass 1: project vertices, then set up triangles in parallel chunks.
-    let clip: Vec<Vec4> = scene
-        .positions
-        .par_chunks(4096)
-        .flat_map_iter(|chunk| chunk.iter().map(move |p| vp * p.extend(1.0)))
-        .collect();
-
+    // Pass 1: cull clusters, then project each survivor's vertices into a
+    // local array and set up its triangles.
     let cull = settings.cull_backfaces;
     let near = cam.near;
+    let planes = frustum_planes(vp, near);
+    let eye = cam.eye;
+    let clusters_drawn = std::sync::atomic::AtomicUsize::new(0);
     let setups: Vec<TriSetup> = scene
-        .indices
-        .par_chunks(3 * 2048)
-        .enumerate()
-        .flat_map_iter(move |(ci, chunk)| {
-            let base_tri = (ci * 2048) as u32;
-            let mut out: Vec<TriSetup> = Vec::with_capacity(chunk.len() / 3);
+        .clusters
+        .par_chunks(64)
+        .flat_map_iter(|chunk| {
+            let mut out: Vec<TriSetup> = Vec::new();
             let mut clipped: Vec<[ClipVert; 3]> = Vec::new();
-            for (k, t) in chunk.chunks_exact(3).enumerate() {
-                let tri = base_tri + k as u32;
-                let p0 = clip[t[0] as usize];
-                let p1 = clip[t[1] as usize];
-                let p2 = clip[t[2] as usize];
-                // Trivial rejects against the frustum in clip space.
-                if (p0.w < near && p1.w < near && p2.w < near)
-                    || (p0.x > p0.w && p1.x > p1.w && p2.x > p2.w)
-                    || (p0.x < -p0.w && p1.x < -p1.w && p2.x < -p2.w)
-                    || (p0.y > p0.w && p1.y > p1.w && p2.y > p2.w)
-                    || (p0.y < -p0.w && p1.y < -p1.w && p2.y < -p2.w)
-                {
+            let mut clip = [Vec4::ZERO; crate::scene::CLUSTER_VERTS];
+            let mut drawn = 0;
+            for c in chunk {
+                if cluster_hidden(c, &planes, eye, cull) {
                     continue;
                 }
-                let v = [
-                    ClipVert { p: p0, bary: [1.0, 0.0, 0.0] },
-                    ClipVert { p: p1, bary: [0.0, 1.0, 0.0] },
-                    ClipVert { p: p2, bary: [0.0, 0.0, 1.0] },
-                ];
-                if p0.w >= near && p1.w >= near && p2.w >= near {
-                    if let Some(s) = setup_tri(tri, &v, width, height, cull) {
-                        out.push(s);
+                drawn += 1;
+                let fv = c.first_vertex as usize;
+                for (k, p) in scene.positions[fv..fv + c.vertex_count as usize].iter().enumerate() {
+                    clip[k] = vp * p.extend(1.0);
+                }
+                for tri in c.first_tri..c.first_tri + c.tri_count {
+                    let t = tri as usize * 3;
+                    let p0 = clip[scene.indices[t] as usize - fv];
+                    let p1 = clip[scene.indices[t + 1] as usize - fv];
+                    let p2 = clip[scene.indices[t + 2] as usize - fv];
+                    // Trivial rejects against the frustum in clip space.
+                    if (p0.w < near && p1.w < near && p2.w < near)
+                        || (p0.x > p0.w && p1.x > p1.w && p2.x > p2.w)
+                        || (p0.x < -p0.w && p1.x < -p1.w && p2.x < -p2.w)
+                        || (p0.y > p0.w && p1.y > p1.w && p2.y > p2.w)
+                        || (p0.y < -p0.w && p1.y < -p1.w && p2.y < -p2.w)
+                    {
+                        continue;
                     }
-                } else {
-                    clipped.clear();
-                    clip_near(v, near, &mut clipped);
-                    for c in &clipped {
-                        if let Some(s) = setup_tri(tri, c, width, height, cull) {
+                    let v = [
+                        ClipVert { p: p0, bary: [1.0, 0.0, 0.0] },
+                        ClipVert { p: p1, bary: [0.0, 1.0, 0.0] },
+                        ClipVert { p: p2, bary: [0.0, 0.0, 1.0] },
+                    ];
+                    if p0.w >= near && p1.w >= near && p2.w >= near {
+                        if let Some(s) = setup_tri(tri, &v, width, height, cull) {
                             out.push(s);
+                        }
+                    } else {
+                        clipped.clear();
+                        clip_near(v, near, &mut clipped);
+                        for cv in &clipped {
+                            if let Some(s) = setup_tri(tri, cv, width, height, cull) {
+                                out.push(s);
+                            }
                         }
                     }
                 }
             }
+            clusters_drawn.fetch_add(drawn, std::sync::atomic::Ordering::Relaxed);
             out.into_iter()
         })
         .collect();
@@ -339,9 +389,6 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[Light], settings: &RenderSe
     let t3 = std::time::Instant::now();
 
     // Pass 4: shade, one row per task.
-    let eye = cam.eye;
-    let sky = Vec3::new(0.55, 0.65, 0.80) * settings.ambient;
-    let ground = Vec3::new(0.25, 0.22, 0.20) * settings.ambient;
     let r2 = settings.scene_radius * settings.scene_radius;
     let exposure = settings.exposure;
     let bg = pack(Vec3::new(0.10, 0.105, 0.115));
@@ -374,17 +421,12 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[Light], settings: &RenderSe
                 if n.dot(v) < 0.0 {
                     n = -n;
                 }
-                let hemi = n.y * 0.5 + 0.5;
-                let mut radiance = albedo * (sky * hemi + ground * (1.0 - hemi));
+                let mut radiance = Vec3::ZERO;
                 for l in lights {
-                    let (ldir, irr) = match *l {
-                        Light::Point { position, color, intensity } => {
-                            let d = position - p;
-                            let d2 = d.length_squared().max(1e-6);
-                            (d / d2.sqrt(), color * (intensity * r2 / d2))
-                        }
-                        Light::Distant { direction, color, intensity } => (-direction, color * intensity),
-                    };
+                    let d = l.position - p;
+                    let d2 = d.length_squared().max(1e-12);
+                    let ldir = d / d2.sqrt();
+                    let irr = l.color * (l.intensity * r2 / d2);
                     let ndl = n.dot(ldir);
                     if ndl <= 0.0 {
                         continue;
@@ -399,6 +441,8 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[Light], settings: &RenderSe
     let t4 = std::time::Instant::now();
 
     frame.stats = Stats {
+        clusters_in: scene.clusters.len(),
+        clusters_drawn: clusters_drawn.into_inner(),
         tris_in: scene.triangle_count(),
         tris_drawn: setups.len(),
         setup_ms: (t1 - t0).as_secs_f32() * 1000.0,
@@ -520,16 +564,51 @@ pub fn unproject(frame: &Frame, scene: &Scene, x: usize, y: usize) -> Option<(Ve
     Some((p, n))
 }
 
-/// Draw a filled disc into the colour buffer, depth-tested at its centre.
-pub fn draw_disc(frame: &mut Frame, cam: &Camera, centre: Vec3, radius_px: f32, color: Vec3, ring: bool) {
-    let vp = cam.proj * cam.view;
-    let c = vp * centre.extend(1.0);
+/// A world point on screen: pixel x, y and 1/w. None when behind the near
+/// plane.
+pub fn project(cam: &Camera, width: usize, height: usize, p: Vec3) -> Option<(f32, f32, f32)> {
+    let c = cam.proj * cam.view * p.extend(1.0);
     if c.w <= cam.near {
-        return;
+        return None;
     }
     let iw = 1.0 / c.w;
-    let sx = (c.x * iw * 0.5 + 0.5) * frame.width as f32;
-    let sy = (0.5 - c.y * iw * 0.5) * frame.height as f32;
+    Some(((c.x * iw * 0.5 + 0.5) * width as f32, (0.5 - c.y * iw * 0.5) * height as f32, iw))
+}
+
+/// The world-space ray through a pixel centre: (origin at the eye, unit
+/// direction).
+pub fn pixel_ray(cam: &Camera, width: usize, height: usize, x: f32, y: f32) -> (Vec3, Vec3) {
+    let ndc = Vec2::new(x / width as f32 * 2.0 - 1.0, 1.0 - y / height as f32 * 2.0);
+    // The direction in view space comes straight from the projection's
+    // focal terms; going through the inverse of the whole matrix loses
+    // precision with a small near plane.
+    let d_view = Vec3::new(ndc.x / cam.proj.x_axis.x, ndc.y / cam.proj.y_axis.y, -1.0);
+    let d = cam.view.inverse().transform_vector3(d_view);
+    (cam.eye, d.normalize_or(Vec3::NEG_Z))
+}
+
+/// Draw a one-pixel line between two world points, without depth test,
+/// dashed when `dashed`.
+pub fn draw_line(frame: &mut Frame, cam: &Camera, a: Vec3, b: Vec3, color: Vec3, dashed: bool) {
+    let (Some(pa), Some(pb)) = (project(cam, frame.width, frame.height, a), project(cam, frame.width, frame.height, b)) else { return };
+    let packed = pack(color);
+    let steps = (pb.0 - pa.0).abs().max((pb.1 - pa.1).abs()).ceil().min(8192.0) as usize;
+    for i in 0..=steps {
+        if dashed && (i / 4) % 2 == 1 {
+            continue;
+        }
+        let t = if steps == 0 { 0.0 } else { i as f32 / steps as f32 };
+        let x = (pa.0 + (pb.0 - pa.0) * t) as i32;
+        let y = (pa.1 + (pb.1 - pa.1) * t) as i32;
+        if x >= 0 && y >= 0 && (x as usize) < frame.width && (y as usize) < frame.height {
+            frame.color[y as usize * frame.width + x as usize] = packed;
+        }
+    }
+}
+
+/// Draw a filled disc into the colour buffer, depth-tested at its centre.
+pub fn draw_disc(frame: &mut Frame, cam: &Camera, centre: Vec3, radius_px: f32, color: Vec3, ring: bool) {
+    let Some((sx, sy, iw)) = project(cam, frame.width, frame.height, centre) else { return };
     let (cx, cy) = (sx as i32, sy as i32);
     let occluded = if cx >= 0 && cy >= 0 && (cx as usize) < frame.width && (cy as usize) < frame.height {
         frame.depth[cy as usize * frame.width + cx as usize] > iw
@@ -574,11 +653,6 @@ pub fn pack(c: Vec3) -> u32 {
     (to8(c.x) << 16) | (to8(c.y) << 8) | to8(c.z)
 }
 
-#[allow(dead_code)]
-pub fn screen_to_ndc(x: f32, y: f32, width: usize, height: usize) -> Vec2 {
-    Vec2::new(x / width as f32 * 2.0 - 1.0, 1.0 - y / height as f32 * 2.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,8 +674,8 @@ mod tests {
         let scene = quad_scene();
         let (w, h) = (320, 200);
         let mut frame = Frame::new(w, h);
-        let settings = RenderSettings { cull_backfaces: false, wireframe: false, ambient: 0.3, exposure: 1.0, scene_radius: 1.5 };
-        let lights = [Light::Point { position: Vec3::new(0.0, 0.0, 3.0), color: Vec3::ONE, intensity: 1.0 }];
+        let settings = RenderSettings { cull_backfaces: false, wireframe: false, exposure: 1.0, scene_radius: 1.5 };
+        let lights = [PointLight { position: Vec3::new(0.0, 0.0, 3.0), color: Vec3::ONE, intensity: 1.0 }];
         render(&scene, &camera(w, h), &lights, &settings, &mut frame);
         assert_eq!(frame.stats.tris_drawn, 2);
         assert_ne!(frame.tri_id[h / 2 * w + w / 2], NO_TRI);
@@ -619,10 +693,67 @@ mod tests {
         scene.push_mesh(&p, &[], &[], &[0, 1, 2]);
         let (w, h) = (160, 100);
         let mut frame = Frame::new(w, h);
-        let settings = RenderSettings { cull_backfaces: false, wireframe: false, ambient: 0.3, exposure: 1.0, scene_radius: 1.5 };
+        let settings = RenderSettings { cull_backfaces: false, wireframe: false, exposure: 1.0, scene_radius: 1.5 };
         render(&scene, &camera(w, h), &[], &settings, &mut frame);
         // Clipping yields one or two pieces, and every drawn pixel has finite depth.
         assert!(frame.stats.tris_drawn >= 1 && frame.stats.tris_drawn <= 2);
         assert!(frame.depth.iter().all(|d| d.is_finite()));
+    }
+
+    #[test]
+    fn only_point_lights_light_the_scene() {
+        let scene = quad_scene();
+        let (w, h) = (160, 100);
+        let settings = RenderSettings { cull_backfaces: false, wireframe: false, exposure: 1.0, scene_radius: 1.5 };
+        let centre = h / 2 * w + w / 2;
+        let mut dark = Frame::new(w, h);
+        render(&scene, &camera(w, h), &[], &settings, &mut dark);
+        assert_ne!(dark.tri_id[centre], NO_TRI);
+        assert_eq!(dark.color[centre], 0, "no lights, no ambient: the quad is black");
+        let mut lit = Frame::new(w, h);
+        let near_light = [PointLight { position: Vec3::new(0.0, 0.0, 0.5), color: Vec3::ONE, intensity: 0.05 }];
+        render(&scene, &camera(w, h), &near_light, &settings, &mut lit);
+        let far_light = [PointLight { position: Vec3::new(0.0, 0.0, 2.0), color: Vec3::ONE, intensity: 0.05 }];
+        let mut dim = Frame::new(w, h);
+        render(&scene, &camera(w, h), &far_light, &settings, &mut dim);
+        let g = |c: u32| (c >> 8) & 0xff;
+        assert!(g(lit.color[centre]) > g(dim.color[centre]), "a closer light is brighter (1/d²)");
+        assert!(g(dim.color[centre]) > 0);
+    }
+
+    #[test]
+    fn clusters_outside_the_view_are_skipped() {
+        let mut scene = Scene::new();
+        let (p, idx) = crate::scene::tests::uv_sphere(64);
+        // One sphere in front of the camera, one far behind it.
+        scene.push_mesh(&p, &[], &[], &idx);
+        let behind: Vec<Vec3> = p.iter().map(|v| *v * 0.5 + Vec3::new(0.0, 0.0, 20.0)).collect();
+        scene.push_mesh(&behind, &[], &[], &idx);
+        let (w, h) = (200, 150);
+        let mut frame = Frame::new(w, h);
+        let settings = RenderSettings { cull_backfaces: false, wireframe: false, exposure: 1.0, scene_radius: 1.5 };
+        render(&scene, &camera(w, h), &[], &settings, &mut frame);
+        assert!(frame.stats.clusters_drawn * 2 <= frame.stats.clusters_in + 1, "{:?}", frame.stats);
+        assert!(frame.stats.clusters_drawn > 0);
+        // Back-face culling drops roughly the far half of the front sphere too.
+        let before = frame.stats.clusters_drawn;
+        let settings = RenderSettings { cull_backfaces: true, ..settings };
+        let mut culled = Frame::new(w, h);
+        render(&scene, &camera(w, h), &[], &settings, &mut culled);
+        assert!(culled.stats.clusters_drawn < before, "{} vs {}", culled.stats.clusters_drawn, before);
+        // And the picture is the same: no visible pixel is lost.
+        let covered = |f: &Frame| f.tri_id.iter().filter(|t| **t != NO_TRI).count();
+        assert_eq!(covered(&frame), covered(&culled));
+    }
+
+    #[test]
+    fn pixel_ray_goes_through_projected_point() {
+        let (w, h) = (320, 200);
+        let cam = camera(w, h);
+        let p = Vec3::new(0.3, -0.2, 0.4);
+        let (x, y, _) = project(&cam, w, h, p).unwrap();
+        let (o, d) = pixel_ray(&cam, w, h, x, y);
+        let closest = o + d * (p - o).dot(d);
+        assert!(closest.distance(p) < 1e-3, "{closest} vs {p}");
     }
 }
