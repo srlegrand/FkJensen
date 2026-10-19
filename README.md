@@ -35,7 +35,7 @@ the time of each pass in milliseconds: setup, bin, raster, shade.
 Test scenes: the USD Working Group assets
 (https://github.com/usd-wg/assets, `full_assets/`) open directly:
 `OpenChessSet/chess_set.usda`, `CarbonFrameBike/CarbonFrameBike.usdz`,
-`Teapot/Teapot.usd`, `McUsd/McUsd.usda` (which has a light in the file).
+`Teapot/Teapot.usd`, `McUsd/McUsd.usda` (which has a distant light in the file; file lights are read with USD's intensity conventions mapped to the renderer's, a distant light at the USD fallback of 50000 giving irradiance 2).
 
 ## Controls
 

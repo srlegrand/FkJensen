@@ -71,6 +71,7 @@ pub fn load(path: &Path) -> Result<LoadReport, String> {
         .map_err(|e| e.to_string())?;
 
     let mut xf = geom::XformCache::default();
+    let mut light_prims: Vec<(usd::Prim, String)> = Vec::new();
 
     for p in &paths {
         let prim = match stage.prim(p.clone()) {
@@ -90,11 +91,7 @@ pub fn load(path: &Path) -> Result<LoadReport, String> {
                     }
                 }
             }
-            "SphereLight" | "DistantLight" | "RectLight" | "DiskLight" => {
-                if let Some(l) = read_light(&prim, &ty, &mut xf, &correction) {
-                    scene.lights.push(l);
-                }
-            }
+            "SphereLight" | "DistantLight" | "RectLight" | "DiskLight" => light_prims.push((prim, ty)),
             _ => {}
         }
     }
@@ -102,6 +99,12 @@ pub fn load(path: &Path) -> Result<LoadReport, String> {
     if !scene.bounds_min.is_finite() {
         scene.bounds_min = Vec3::ZERO;
         scene.bounds_max = Vec3::ZERO;
+    }
+    let radius = scene.radius();
+    for (prim, ty) in &light_prims {
+        if let Some(l) = read_light(prim, ty, &mut xf, &correction, radius) {
+            scene.lights.push(l);
+        }
     }
     let read_secs = t1.elapsed().as_secs_f64();
 
@@ -274,17 +277,38 @@ fn is_visible(prim: &usd::Prim) -> bool {
     true
 }
 
-fn read_light(prim: &usd::Prim, ty: &str, xf: &mut geom::XformCache, correction: &Mat4) -> Option<Light> {
+fn read_light(prim: &usd::Prim, ty: &str, xf: &mut geom::XformCache, correction: &Mat4, scene_radius: f32) -> Option<Light> {
     let api = lux::LightAPI::from_prim_unchecked(prim.clone());
     let intensity = api.intensity().ok().flatten().unwrap_or(1.0);
+    let exposure = prim.attribute("inputs:exposure").get::<f32>().ok().flatten().unwrap_or(0.0);
+    let intensity = intensity * 2f32.powf(exposure);
     let color = api.color().ok().flatten().map(|c| v3(&c)).unwrap_or(Vec3::ONE);
     let world = *correction * to_mat4(&xf.local_to_world_transform(prim).ok()?);
     match ty {
         "DistantLight" => {
-            // A USD light shines down its local -Z.
+            // A USD light shines down its local -Z. USD's fallback intensity
+            // for a distant light is 50000; that is mapped to irradiance 2.
             let dir = world.transform_vector3(-Vec3::Z).normalize_or(-Vec3::Y);
-            Some(Light::Distant { direction: dir, color, intensity })
+            Some(Light::Distant { direction: dir, color, intensity: intensity / 50000.0 * 2.0 })
         }
-        _ => Some(Light::Point { position: world.transform_point3(Vec3::ZERO), color, intensity }),
+        _ => {
+            // Area lights: USD intensity is a radiance; irradiance at distance
+            // d is about intensity * area / d². The renderer scales point
+            // lights by scene radius², so divide the area by it.
+            let scale = world.transform_vector3(Vec3::X).length().max(1e-6);
+            let area = match ty {
+                "RectLight" => {
+                    let w = prim.attribute("inputs:width").get::<f32>().ok().flatten().unwrap_or(1.0);
+                    let h = prim.attribute("inputs:height").get::<f32>().ok().flatten().unwrap_or(1.0);
+                    w * h * scale * scale
+                }
+                _ => {
+                    let r = prim.attribute("inputs:radius").get::<f32>().ok().flatten().unwrap_or(0.5) * scale;
+                    std::f32::consts::PI * r * r
+                }
+            };
+            let r2 = (scene_radius * scene_radius).max(1e-12);
+            Some(Light::Point { position: world.transform_point3(Vec3::ZERO), color, intensity: intensity * area / r2 })
+        }
     }
 }
