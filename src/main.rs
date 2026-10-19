@@ -1,10 +1,10 @@
-//! cpuview: a CPU-only USD viewport. No GPU API is linked; the frame is
+//! fkjensen: a CPU-only USD viewport. No GPU API is linked; the frame is
 //! rasterised on the cores and copied to the window through shared memory.
 //!
 //! Usage:
-//!   cpuview scene.usd                 open a window
-//!   cpuview scene.usd --png out.png   render one frame to a file, no window
-//!   cpuview scene.usd --size 1920x1080 --png out.png
+//!   fkjensen scene.usd                 open a window
+//!   fkjensen scene.usd --png out.png   render one frame to a file, no window
+//!   fkjensen scene.usd --size 1920x1080 --png out.png
 //!
 //! Controls are listed in README.md and printed at start.
 
@@ -208,7 +208,7 @@ impl App {
         let s = self.frame.stats;
         let name = self.scene_path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or("no file".into());
         w.set_title(&format!(
-            "cpuview  {name}  {}x{}  {:.0} fps  {} tris ({} drawn)  {} lights  setup {:.1} bin {:.1} raster {:.1} shade {:.1} ms  CPU only",
+            "FkJensen  {name}  {}x{}  {:.0} fps  {} tris ({} drawn)  {} lights  setup {:.1} bin {:.1} raster {:.1} shade {:.1} ms  CPU only",
             self.frame.width, self.frame.height, self.title_fps, s.tris_in, s.tris_drawn, self.rig.lights.len(),
             s.setup_ms, s.bin_ms, s.raster_ms, s.shade_ms
         ));
@@ -316,7 +316,7 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("cpuview").with_inner_size(PhysicalSize::new(1280, 720));
+        let attrs = Window::default_attributes().with_title("FkJensen").with_inner_size(PhysicalSize::new(1280, 720));
         let window = Rc::new(event_loop.create_window(attrs).expect("window"));
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface = softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
@@ -439,7 +439,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: cpuview [scene.usd] [--png out.png] [--size WxH]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.usd] [--png out.png] [--size WxH]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),

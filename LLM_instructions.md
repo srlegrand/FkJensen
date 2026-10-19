@@ -1,0 +1,44 @@
+# Instructions for AI assistants
+
+The one instruction file for any AI assistant working on this repository: what to check before starting, and how changes are delivered. Read this file and `DESIGN_PHILOSOPHY.md` before working here, and follow both. With every change, update `README.md` and the pages in `docs/` that describe what changed.
+
+## Checks to run first
+
+At the start of a session, run these and report each to the person as passed or failed, with the fix when it failed.
+
+1. **Design philosophy.** Read `DESIGN_PHILOSOPHY.md` and tell the person it exists. When a request goes against it, say which point and ask whether to follow the file or update it.
+2. **A workspace that runs commands** and keeps files between turns. Without it you can only advise.
+3. **The program builds and its tests pass.** Clone the repository, `cargo test --release`. No system libraries are needed. Report how many tests passed. Test scenes come from https://github.com/usd-wg/assets (`full_assets/`); clone it beside the repository with `GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1`.
+4. **GitHub access.** Check that you can read `srlegrand/FkJensen` (private: the Claude GitHub App must be installed on Simon's account with access to it). If it cannot be read, ask the person to attach the repository or to send the current `main` as a tarball. Do not push: the person pushes.
+5. **Report** one list: what passed, what failed, what the person has to do.
+
+## The loop
+
+1. The person asks for a change in plain words.
+2. The assistant works in its own clone. Before every change it fetches `main` and starts from it. It builds, runs `cargo test --release`, renders at least one test scene headless (`--png`) and looks at the image, and updates `README.md` and `docs/`. It fetches `main` again just before making the patch and rebases if anything came in.
+3. The assistant makes one patch of everything since `origin/main`: `git diff --binary origin/main > fkjensen-<what>-<DDMMYYYY-HHMM>.patch`. The suffix is new every time, so the chat shows a new download. It checks the patch applies on a clean copy of `main` (`git worktree add` on `origin/main`, `git apply`).
+4. The assistant sends the patch and any screenshot worth looking at, with the block of commands below filled in, and says what changed, what was tested and what was not. One patch and one block per response.
+5. The person clicks "Download all" and pastes:
+
+       cd ~/Software/FkJensen && \
+       git pull --rebase origin main && \
+       git apply ~/Downloads/fkjensen-<what>-<suffix>.patch && \
+       git add -A && \
+       git commit -m "<what changed>" && \
+       git push origin main && \
+       cargo run --release -- <scene.usd>
+
+   The commands are joined with `&&`: a patch that does not apply is never followed by a commit. The block holds no other commands; deletions travel in the patch. `cargo run` comes last so the program can stay open.
+6. When `git apply` fails, the person pastes the terminal output; the assistant fetches `main`, rebases, tests again and sends a new patch.
+7. Until the person says a patch is pushed, the assistant keeps its work committed locally and makes the next patch on top of it.
+
+## Conventions
+
+- Tests with every feature; `cargo test --release` passes before a change is handed over.
+- Documentation with every change: `README.md`, and `docs/` pages for anything with a page. Every page has a "Not done yet" list.
+- A screenshot in `docs/` when something visible changed, taken from `--png` or from the running program.
+- Say what was tested and what was not. Numbers in the docs are measured and say on what hardware.
+- No GPU API, ever: no wgpu, Vulkan, OpenGL, Metal, DirectX, no shader files. The frame reaches the screen through softbuffer. A dependency that pulls a GPU API in is a bug.
+- Dates DD/MM/YYYY. No em dashes.
+- Files under 100 MB in the repository, patches under 30 MB in the chat.
+- Credit: FkJensen was created by Simon Legrand. No attribution to AI tools anywhere in the repository, commits or pull requests.

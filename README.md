@@ -1,4 +1,4 @@
-# cpuview
+# FkJensen
 
 A 3D viewport that renders on the CPU and nothing else. No GPU API is
 linked (no Vulkan, OpenGL, Metal, wgpu): the frame is rasterised on the
