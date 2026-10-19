@@ -13,6 +13,8 @@
 //!   fkjensen --view lights             show how many lights each pixel evaluates
 //!   fkjensen --no-reach                evaluate every light everywhere (to compare)
 //!   fkjensen --close                   start on the close framing of the subject
+//!   fkjensen --no-shadows              point lights without shadow maps
+//!   fkjensen --png out.png --bench-drag  then move the first light five times, timing each frame
 //!
 //! Controls are listed in README.md and printed at start.
 
@@ -20,7 +22,9 @@ mod camera;
 mod fkj;
 mod lights;
 mod raster;
+mod reyes;
 mod scene;
+mod shadow;
 mod world;
 
 use std::num::NonZeroU32;
@@ -65,6 +69,7 @@ Controls
   K                      sky on / off          , / .    sky dimmer / brighter (x2)
   H                      light count view: how many lights each pixel evaluates
   X                      light reach off / on (to compare cost and picture)
+  M                      shadow maps on / off
 
   Camera
   left drag              orbit                 middle drag / shift+left   pan
@@ -98,6 +103,8 @@ struct App {
     rig: LightRig,
     settings: RenderSettings,
     drag: Option<Drag>,
+    /// Shading, visibility and shadow maps kept between frames.
+    renderer: reyes::Renderer,
     /// Which framing `F` last chose.
     wide: bool,
     // input state
@@ -129,6 +136,7 @@ impl App {
             cam,
             rig,
             drag: None,
+            renderer: reyes::Renderer::new(),
             wide: true,
             mouse: (0.0, 0.0),
             last_mouse: (0.0, 0.0),
@@ -163,7 +171,7 @@ impl App {
 
     fn render(&mut self) {
         let cam = self.render_camera();
-        raster::render(&self.scene, &cam, &self.rig.lights, &self.settings, &mut self.frame);
+        self.renderer.render(&self.scene, &cam, &self.rig.lights, &self.settings, &mut self.frame);
         if self.rig.show {
             let floor = self.floor();
             for (i, l) in self.rig.lights.iter().enumerate() {
@@ -276,20 +284,19 @@ impl App {
             None => "no lights".into(),
         };
         let sky = if self.settings.sky.on { format!("sky {:.0} lux", self.settings.sky.lux) } else { "sky off".into() };
-        let skipped = if s.light_evals_all > 0 { 100.0 * (1.0 - s.light_evals as f64 / s.light_evals_all as f64) } else { 0.0 };
         w.set_title(&format!(
-            "FkJensen  {}  {:.0} fps  {light}  {sky}  light evals {} ({:.0}% skipped)  {} tris ({}/{} clusters)  setup {:.1} bin {:.1} raster {:.1} shade {:.1} ms  CPU only",
+            "FkJensen  {}  {:.0} fps  {light}  {sky}  {}  shaded {} of {} points  shadows {} ({:.0} ms)  setup {:.0} raster {:.0} shade {:.0} resolve {:.0} ms  CPU only",
             self.scene_name,
             self.title_fps,
-            s.light_evals,
-            skipped,
-            s.tris_drawn,
-            s.clusters_drawn,
-            s.clusters_in,
-            s.setup_ms,
-            s.bin_ms,
+            if s.visibility_kept { "visibility kept" } else { "visibility new" },
+            s.points_shaded,
+            s.points_used,
+            if self.settings.shadows { "on" } else { "off" },
+            s.shadow_ms,
+            s.setup_ms + s.bin_ms,
             s.raster_ms,
-            s.shade_ms
+            s.shade_ms,
+            s.resolve_ms
         ));
     }
 
@@ -389,6 +396,7 @@ impl App {
                 self.settings.view = if self.settings.view == View::Shaded { View::LightCount } else { View::Shaded };
             }
             KeyCode::KeyX => self.settings.light_reach = !self.settings.light_reach,
+            KeyCode::KeyM => self.settings.shadows = !self.settings.shadows,
             KeyCode::KeyC => self.rig.cycle_colour(),
             KeyCode::KeyP => match save_png(&self.frame, "frame.png") {
                 Ok(()) => eprintln!("saved frame.png"),
@@ -605,6 +613,8 @@ fn main() {
     let mut view = View::Shaded;
     let mut reach = true;
     let mut close = false;
+    let mut shadows = true;
+    let mut bench_drag = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -644,8 +654,10 @@ fn main() {
             }
             "--no-reach" => reach = false,
             "--close" => close = true,
+            "--no-shadows" => shadows = false,
+            "--bench-drag" => bench_drag = true,
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--close]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-shadows] [--close] [--bench-drag]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -687,6 +699,7 @@ fn main() {
         frame_camera(&mut app.cam, &app.scene, false);
     }
     app.settings.light_reach = reach;
+    app.settings.shadows = shadows;
 
     if let Some(out) = png_out {
         app.frame.resize(size.0, size.1);
@@ -694,27 +707,61 @@ fn main() {
         app.render();
         let s = app.frame.stats;
         eprintln!(
-            "rendered {}x{} in {:.1} ms on {} threads: setup {:.1}, bin {:.1}, raster {:.1}, shade {:.1} ms, {} of {} clusters, {} of {} triangles drawn, {} light evaluations of {} without reach",
+            "rendered {}x{} in {:.1} ms on {} threads: shadows {:.1} ms ({} maps, {} triangles), setup {:.1}, bin {:.1}, raster {:.1}, shade {:.1}, resolve {:.1} ms; {} of {} clusters, {} of {} triangles; {} shading points, {} light evaluations of {} without reach; cache {:.0} MB",
             size.0,
             size.1,
             t.elapsed().as_secs_f32() * 1000.0,
             rayon::current_num_threads(),
+            s.shadow_ms,
+            s.shadow_maps_built,
+            s.shadow_tris,
             s.setup_ms,
             s.bin_ms,
             s.raster_ms,
             s.shade_ms,
+            s.resolve_ms,
             s.clusters_drawn,
             s.clusters_in,
             s.tris_drawn,
             s.tris_in,
+            s.points_shaded,
             s.light_evals,
-            s.light_evals_all
+            s.light_evals_all,
+            app.renderer.memory() as f64 / 1e6
         );
         if let Err(e) = save_png(&app.frame, &out) {
             eprintln!("cannot write {out}: {e}");
             std::process::exit(1);
         }
         eprintln!("wrote {out}");
+        if bench_drag {
+            // Move the first light 10 cm at a time, as a drag would, and
+            // time each frame with everything kept from the one before.
+            for step in 1..=5 {
+                if let Some(l) = app.rig.lights.get_mut(0) {
+                    l.position.x += 0.1;
+                }
+                let t = Instant::now();
+                app.render();
+                let s = app.frame.stats;
+                eprintln!(
+                    "drag step {step}: {:.1} ms: visibility {}, shadows {:.1} ms ({} maps, {} triangles), shade {:.1} ms ({} points in {} clusters), resolve {:.1} ms",
+                    t.elapsed().as_secs_f32() * 1000.0,
+                    if s.visibility_kept { "kept" } else { "redone" },
+                    s.shadow_ms,
+                    s.shadow_maps_built,
+                    s.shadow_tris,
+                    s.shade_ms,
+                    s.points_shaded,
+                    s.clusters_shaded,
+                    s.resolve_ms
+                );
+            }
+            let drag_out = out.replace(".png", "_dragged.png");
+            if save_png(&app.frame, &drag_out).is_ok() {
+                eprintln!("wrote {drag_out}");
+            }
+        }
         return;
     }
 
@@ -815,9 +862,9 @@ mod tests {
         let c = Camera { view: cam.view(), proj: cam.proj(w as f32 / h as f32), eye: cam.eye(), near: cam.near() };
         let sky = Sky { lux: DEFAULT_SKY_LUX, on: true };
         let mut a = Frame::new(w, h);
-        raster::render(&scene, &c, &scene.lights, &RenderSettings::new(sky), &mut a);
+        reyes::render(&scene, &c, &scene.lights, &RenderSettings::new(sky), &mut a);
         let mut b = Frame::new(w, h);
-        raster::render(&scene, &c, &scene.lights, &RenderSettings { light_reach: false, ..RenderSettings::new(sky) }, &mut b);
+        reyes::render(&scene, &c, &scene.lights, &RenderSettings { light_reach: false, ..RenderSettings::new(sky) }, &mut b);
         let mut worst = 0;
         for (x, y) in a.color.iter().zip(&b.color) {
             for sh in [0, 8, 16] {

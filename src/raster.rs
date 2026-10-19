@@ -1,35 +1,23 @@
-//! A tile-binned CPU rasteriser with a visibility buffer and deferred shading.
+//! Visibility: which surface each pixel sees.
 //!
-//! One frame is four passes, each parallel across cores with rayon:
+//! Three passes, each parallel across cores with rayon:
 //!
 //! 1. **Setup**: clusters are tested against the view frustum (and, with
 //!    back-face culling on, against their normal cone) as a whole; the
 //!    vertices of each surviving cluster are projected into a small local
 //!    array and its triangles are clipped against the near plane, optionally
-//!    back-face culled, and given a screen-space record.
-//! 2. **Bin**: each record is listed in every 64 x 64 tile its box touches.
-//! 3. **Visibility**: each tile is rasterised by one thread into its own part
-//!    of the depth and triangle-id buffers. No atomics, no locks: a tile
-//!    belongs to one thread for the pass.
-//! 4. **Shade**: each pixel that has a triangle reconstructs its barycentric
-//!    weights, interpolates position, normal and colour, and is lit once:
-//!    by the sky, which reaches every surface the same way however far it
-//!    is, and by the point lights whose reach includes the pixel's cluster.
+//!    back-face culled, and given a screen-space record. Each visible
+//!    cluster also gets a dicing level from the screen size of its
+//!    triangles, for the shading in `reyes.rs`.
+//! 2. **Bin**: each record is listed in every 64 x 64 bucket its box touches.
+//! 3. **Hide**: each bucket is rasterised by one thread into its own part
+//!    of the depth and triangle-id buffers. No atomics, no locks.
 //!
-//! **Light reach.** A point light has no falloff radius: it is lumens and
-//! the inverse square law. But beyond some distance what it adds can no
-//! longer be seen, and that distance is computed every frame
-//! (`light_reach`). In the setup pass each visible cluster gets a bit mask
-//! of the lights whose reach touches its bounding sphere, and the shade pass
-//! only evaluates those. A lamp on the chess table never costs anything on
-//! the shopfront or the mountains. The same bound is meant to gate bounce
-//! lighting when it comes.
+//! Nothing is shaded here. Shading happens on diced micropolygons in world
+//! space and is kept between frames (`reyes.rs`); when the camera has not
+//! moved, this whole module is skipped.
 //!
-//! Shading after visibility is what keeps the cost proportional to pixels
-//! rather than to triangles: a triangle covered by another is never shaded.
-//!
-//! No SIMD yet: the inner loops are plain scalar Rust. That is the next step
-//! and the layout (SoA records, per-tile ownership) is chosen for it.
+//! Also here: the sky, light reach, and small drawing helpers.
 
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use rayon::prelude::*;
@@ -58,22 +46,42 @@ pub struct Frame {
     /// Per-frame setup records, kept so the app can pick (unproject a pixel).
     pub setups: Vec<TriSetup>,
     pub stats: Stats,
+    /// Which renderer's visibility the buffers hold (0: none), so a
+    /// renderer only reuses visibility it made itself in this frame.
+    pub vis_stamp: u64,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Stats {
     pub clusters_in: usize,
     pub clusters_drawn: usize,
-    /// Point light evaluations done in the shade pass.
+    /// Point light evaluations done while shading this frame.
     pub light_evals: u64,
-    /// What it would have been without light reach: shaded pixels x lights.
+    /// What they would have been without light reach: shading points
+    /// shaded this frame x lights.
     pub light_evals_all: u64,
     pub tris_in: usize,
     pub tris_drawn: usize,
+    /// Whether visibility was kept from the last frame (camera unchanged).
+    pub visibility_kept: bool,
+    /// Shading points shaded this frame (the rest came from the cache).
+    pub points_shaded: u64,
+    /// Shading points the frame used.
+    pub points_used: u64,
+    /// Clusters that had any shading done this frame.
+    pub clusters_shaded: usize,
+    /// Whether every pixel was resolved, or only those of clusters shaded
+    /// this frame.
+    pub full_resolve: bool,
+    /// Shadow maps rebuilt this frame, and triangles drawn into them.
+    pub shadow_maps_built: usize,
+    pub shadow_tris: u64,
     pub setup_ms: f32,
     pub bin_ms: f32,
     pub raster_ms: f32,
+    pub shadow_ms: f32,
     pub shade_ms: f32,
+    pub resolve_ms: f32,
 }
 
 /// A triangle after projection: screen positions, 1/w, and each corner's
@@ -86,8 +94,8 @@ pub struct TriSetup {
     pub inv_w: [f32; 3],
     pub bary: [[f32; 3]; 3],
     pub tri: u32,
-    /// The lights that reach this triangle's cluster, one bit per light.
-    pub lights: u64,
+    /// The cluster the triangle belongs to.
+    pub cluster: u32,
     pub min_x: u16,
     pub min_y: u16,
     pub max_x: u16,
@@ -153,12 +161,14 @@ pub struct RenderSettings {
     pub sky: Sky,
     /// Skip lights at pixels beyond their reach. Off only to compare.
     pub light_reach: bool,
+    /// Shadow maps for the point lights.
+    pub shadows: bool,
     pub view: View,
 }
 
 impl RenderSettings {
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, light_reach: true, view: View::Shaded }
+        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, light_reach: true, shadows: true, view: View::Shaded }
     }
 }
 
@@ -171,7 +181,7 @@ pub fn default_exposure(sky_lux: f32) -> f32 {
 /// Largest radiance a surface sends per lux it receives: white diffuse
 /// (1/π) plus the highlight's peak.
 const BRDF_PEAK: f32 = (1.0 + SPECULAR) / std::f32::consts::PI;
-const SPECULAR: f32 = 0.12;
+pub const SPECULAR: f32 = 0.12;
 /// Steepest slope of the tone curve.
 const TONE_SLOPE: f32 = 1.25;
 
@@ -205,6 +215,7 @@ impl Frame {
             tri_id: vec![NO_TRI; n],
             setups: Vec::new(),
             stats: Stats::default(),
+            vis_stamp: 0,
         }
     }
 
@@ -298,7 +309,7 @@ fn setup_tri(tri: u32, v: &[ClipVert; 3], width: usize, height: usize, cull: boo
         inv_w,
         bary: [v[0].bary, v[1].bary, v[2].bary],
         tri,
-        lights: 0,
+        cluster: 0,
         min_x: min_x as u16,
         min_y: min_y as u16,
         max_x: max_x as u16,
@@ -317,7 +328,7 @@ fn setup_tri(tri: u32, v: &[ClipVert; 3], width: usize, height: usize, cull: boo
 /// The frustum planes (left, right, bottom, top, near) of a view-projection
 /// matrix, normalised, as (normal, d) with inside meaning `n.dot(p) + d >= 0`.
 /// The projection is infinite, so there is no far plane.
-fn frustum_planes(vp: Mat4, near: f32) -> [Vec4; 5] {
+pub fn frustum_planes(vp: Mat4, near: f32) -> [Vec4; 5] {
     let (r0, r1, r3) = (vp.row(0), vp.row(1), vp.row(3));
     let norm = |p: Vec4| p / p.truncate().length().max(1e-20);
     [norm(r3 + r0), norm(r3 - r0), norm(r3 + r1), norm(r3 - r1), norm(r3 - Vec4::new(0.0, 0.0, 0.0, near))]
@@ -348,7 +359,27 @@ fn cluster_hidden(c: &Cluster, planes: &[Vec4; 5], eye: Vec3, cull_backfaces: bo
     false
 }
 
-pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &RenderSettings, frame: &mut Frame) {
+/// Shading points per micropolygon edge target, in pixels.
+pub const SHADING_RATE_PX: f32 = 2.0;
+/// Finest dicing level: a triangle is cut into 2^level parts per edge.
+pub const MAX_DICE_LEVEL: u8 = 5;
+/// Dicing level of a cluster that is not on screen.
+pub const NOT_VISIBLE: u8 = u8::MAX;
+
+/// Dicing level for a cluster whose longest on-screen triangle edge is
+/// `edge_px` pixels: the smallest level whose micropolygon edges are at most
+/// `SHADING_RATE_PX`, up to `MAX_DICE_LEVEL`.
+pub fn dice_level(edge_px: f32) -> u8 {
+    if !(edge_px > SHADING_RATE_PX) {
+        return 0;
+    }
+    ((edge_px / SHADING_RATE_PX).log2().ceil() as i32).clamp(0, MAX_DICE_LEVEL as i32) as u8
+}
+
+/// Work out what each pixel sees. Fills `frame.depth`, `frame.tri_id` and
+/// `frame.setups`, and returns each cluster's dicing level (`NOT_VISIBLE`
+/// for clusters culled whole).
+pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, frame: &mut Frame) -> Vec<u8> {
     let width = frame.width;
     let height = frame.height;
     let vp = cam.proj * cam.view;
@@ -356,40 +387,30 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &Ren
 
     // Pass 1: cull clusters, then project each survivor's vertices into a
     // local array and set up its triangles.
-    let cull = settings.cull_backfaces;
     let near = cam.near;
     let planes = frustum_planes(vp, near);
     let eye = cam.eye;
-    let clusters_drawn = std::sync::atomic::AtomicUsize::new(0);
-    let cut = cut_lux(&settings.sky, settings.exposure);
-    let reach: Vec<f32> = lights
-        .iter()
-        .map(|l| if settings.light_reach { light_reach(l, cut) } else { f32::INFINITY })
-        .collect();
-    let n_lights = lights.len().min(64);
-    let setups: Vec<TriSetup> = scene
+    let parts: Vec<(Vec<TriSetup>, Vec<(u32, u8)>)> = scene
         .clusters
         .par_chunks(64)
-        .flat_map_iter(|chunk| {
+        .enumerate()
+        .map(|(ci, chunk)| {
             let mut out: Vec<TriSetup> = Vec::new();
+            let mut levels: Vec<(u32, u8)> = Vec::new();
             let mut clipped: Vec<[ClipVert; 3]> = Vec::new();
             let mut clip = [Vec4::ZERO; crate::scene::CLUSTER_VERTS];
-            let mut drawn = 0;
-            for c in chunk {
+            for (k, c) in chunk.iter().enumerate() {
+                let cluster = (ci * 64 + k) as u32;
                 if cluster_hidden(c, &planes, eye, cull) {
                     continue;
-                }
-                drawn += 1;
-                let mut mask = 0u64;
-                for (i, l) in lights.iter().take(n_lights).enumerate() {
-                    if l.position.distance(c.centre) <= c.radius + reach[i] {
-                        mask |= 1 << i;
-                    }
                 }
                 let fv = c.first_vertex as usize;
                 for (k, p) in scene.positions[fv..fv + c.vertex_count as usize].iter().enumerate() {
                     clip[k] = vp * p.extend(1.0);
                 }
+                // Longest triangle edge on screen, for the dicing level.
+                let mut edge_px = 0f32;
+                let to_px = |p: Vec4| Vec2::new((p.x / p.w * 0.5 + 0.5) * width as f32, (0.5 - p.y / p.w * 0.5) * height as f32);
                 for tri in c.first_tri..c.first_tri + c.tri_count {
                     let t = tri as usize * 3;
                     let p0 = clip[scene.indices[t] as usize - fv];
@@ -410,30 +431,44 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &Ren
                         ClipVert { p: p2, bary: [0.0, 0.0, 1.0] },
                     ];
                     if p0.w >= near && p1.w >= near && p2.w >= near {
+                        let (a, b, cc) = (to_px(p0), to_px(p1), to_px(p2));
+                        edge_px = edge_px.max(a.distance(b)).max(b.distance(cc)).max(cc.distance(a));
                         if let Some(mut s) = setup_tri(tri, &v, width, height, cull) {
-                            s.lights = mask;
+                            s.cluster = cluster;
                             out.push(s);
                         }
                     } else {
+                        // Crosses the near plane: as close as it gets, so
+                        // dice it as finely as allowed.
+                        edge_px = f32::INFINITY;
                         clipped.clear();
                         clip_near(v, near, &mut clipped);
                         for cv in &clipped {
                             if let Some(mut s) = setup_tri(tri, cv, width, height, cull) {
-                                s.lights = mask;
+                                s.cluster = cluster;
                                 out.push(s);
                             }
                         }
                     }
                 }
+                levels.push((cluster, dice_level(edge_px)));
             }
-            clusters_drawn.fetch_add(drawn, std::sync::atomic::Ordering::Relaxed);
-            out.into_iter()
+            (out, levels)
         })
         .collect();
+    let mut level = vec![NOT_VISIBLE; scene.clusters.len()];
+    let mut setups: Vec<TriSetup> = Vec::with_capacity(parts.iter().map(|p| p.0.len()).sum());
+    for (s, l) in parts {
+        setups.extend(s);
+        for (c, lv) in l {
+            level[c as usize] = lv;
+        }
+    }
+    let clusters_drawn = level.iter().filter(|l| **l != NOT_VISIBLE).count();
     let t1 = std::time::Instant::now();
 
-    // Pass 2: bin into tiles. Each chunk of records writes its own per-tile
-    // lists; the lists are then joined per tile.
+    // Pass 2: bin into buckets. Each chunk of records writes its own per-
+    // bucket lists; the lists are then joined per bucket.
     let tiles_x = width.div_ceil(TILE);
     let tiles_y = height.div_ceil(TILE);
     let n_tiles = tiles_x * tiles_y;
@@ -470,9 +505,8 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &Ren
         .collect();
     let t2 = std::time::Instant::now();
 
-    // Pass 3: visibility. Each tile is rasterised into its own rows of the
-    // frame buffers through a per-tile scratch, then copied out, so the
-    // buffers are written without sharing.
+    // Pass 3: hide. Each bucket is rasterised into a scratch of its own,
+    // then copied out, so the buffers are written without sharing.
     let tile_results: Vec<(Vec<f32>, Vec<u32>)> = (0..n_tiles)
         .into_par_iter()
         .map(|t| {
@@ -488,7 +522,7 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &Ren
             let mut id = vec![NO_TRI; tw * th];
             for &sid in &tile_lists[t] {
                 let s = &setups[sid as usize];
-                raster_tri(s, sid, x0, y0, x1, y1, tw, &mut depth, &mut id, settings.wireframe);
+                raster_tri(s, sid, x0, y0, x1, y1, tw, &mut depth, &mut id, wireframe);
             }
             (depth, id)
         })
@@ -509,99 +543,22 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &Ren
     }
     let t3 = std::time::Instant::now();
 
-    // Pass 4: shade, one row per task.
-    let exposure = settings.exposure;
-    let sky = settings.sky;
-    let view = settings.view;
-    let inv_view = cam.view.inverse();
-    let (fx, fy) = (cam.proj.x_axis.x, cam.proj.y_axis.y);
-    let tri_id = &frame.tri_id;
-    let setups_ref = &setups;
-    let evals = std::sync::atomic::AtomicU64::new(0);
-    let shaded = std::sync::atomic::AtomicU64::new(0);
-    frame
-        .color
-        .par_chunks_mut(width)
-        .enumerate()
-        .for_each(|(y, row)| {
-            let mut row_evals = 0u64;
-            let mut row_shaded = 0u64;
-            for x in 0..width {
-                let id = tri_id[y * width + x];
-                if id == NO_TRI {
-                    // The sky behind everything.
-                    let ndc = Vec2::new((x as f32 + 0.5) / width as f32 * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / height as f32 * 2.0);
-                    let dir = inv_view.transform_vector3(Vec3::new(ndc.x / fx, ndc.y / fy, -1.0)).normalize_or(Vec3::Y);
-                    row[x] = match view {
-                        View::Shaded => pack(tonemap(sky.radiance(dir) * exposure)),
-                        View::LightCount => pack(Vec3::splat(0.02)),
-                    };
-                    continue;
-                }
-                row_shaded += 1;
-                let s = &setups_ref[id as usize];
-                if view == View::LightCount {
-                    let k = s.lights.count_ones();
-                    row_evals += k as u64;
-                    row[x] = pack(heat(k));
-                    continue;
-                }
-                let b = barycentrics(s, x as f32 + 0.5, y as f32 + 0.5);
-                // Weights over the source triangle's vertices.
-                let w0 = b[0] * s.bary[0][0] + b[1] * s.bary[1][0] + b[2] * s.bary[2][0];
-                let w1 = b[0] * s.bary[0][1] + b[1] * s.bary[1][1] + b[2] * s.bary[2][1];
-                let w2 = b[0] * s.bary[0][2] + b[1] * s.bary[1][2] + b[2] * s.bary[2][2];
-                let t = s.tri as usize * 3;
-                let (i0, i1, i2) = (scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize);
-                let p = scene.positions[i0] * w0 + scene.positions[i1] * w1 + scene.positions[i2] * w2;
-                let mut n = (scene.normals[i0] * w0 + scene.normals[i1] * w1 + scene.normals[i2] * w2).normalize_or(Vec3::Y);
-                let albedo = scene.colors[i0] * w0 + scene.colors[i1] * w1 + scene.colors[i2] * w2;
-                let v = (eye - p).normalize_or(Vec3::Y);
-                // Two-sided: face the normal towards the viewer.
-                if n.dot(v) < 0.0 {
-                    n = -n;
-                }
-                // Radiance in cd/m²: the sky, then each light in reach.
-                let mut radiance = albedo * sky.irradiance(n) / std::f32::consts::PI;
-                let mut bits = s.lights;
-                while bits != 0 {
-                    let i = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    row_evals += 1;
-                    let l = &lights[i];
-                    let d = l.position - p;
-                    let d2 = d.length_squared().max(1e-12);
-                    let ldir = d / d2.sqrt();
-                    let ndl = n.dot(ldir);
-                    if ndl <= 0.0 {
-                        continue;
-                    }
-                    // Illuminance on this surface, lux per channel.
-                    let e = l.color * (l.candela() / d2 * ndl);
-                    let h = (ldir + v).normalize_or(ldir);
-                    let spec = n.dot(h).max(0.0).powf(48.0) * SPECULAR;
-                    radiance += e * (albedo + Vec3::splat(spec)) / std::f32::consts::PI;
-                }
-                row[x] = pack(tonemap(radiance * exposure));
-            }
-            evals.fetch_add(row_evals, std::sync::atomic::Ordering::Relaxed);
-            shaded.fetch_add(row_shaded, std::sync::atomic::Ordering::Relaxed);
-        });
-    let t4 = std::time::Instant::now();
-
-    frame.stats = Stats {
-        clusters_in: scene.clusters.len(),
-        clusters_drawn: clusters_drawn.into_inner(),
-        light_evals: evals.into_inner(),
-        light_evals_all: shaded.into_inner() * n_lights as u64,
-        tris_in: scene.triangle_count(),
-        tris_drawn: setups.len(),
-        setup_ms: (t1 - t0).as_secs_f32() * 1000.0,
-        bin_ms: (t2 - t1).as_secs_f32() * 1000.0,
-        raster_ms: (t3 - t2).as_secs_f32() * 1000.0,
-        shade_ms: (t4 - t3).as_secs_f32() * 1000.0,
-    };
+    frame.stats.clusters_in = scene.clusters.len();
+    frame.stats.clusters_drawn = clusters_drawn;
+    frame.stats.tris_in = scene.triangle_count();
+    frame.stats.tris_drawn = setups.len();
+    frame.stats.setup_ms = (t1 - t0).as_secs_f32() * 1000.0;
+    frame.stats.bin_ms = (t2 - t1).as_secs_f32() * 1000.0;
+    frame.stats.raster_ms = (t3 - t2).as_secs_f32() * 1000.0;
     frame.setups = setups;
+    level
+}
+
+/// The direction of the view ray through pixel (x, y), for the sky behind
+/// everything.
+pub fn sky_dir(cam: &Camera, width: usize, height: usize, x: usize, y: usize, inv_view: &Mat4) -> Vec3 {
+    let ndc = Vec2::new((x as f32 + 0.5) / width as f32 * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / height as f32 * 2.0);
+    inv_view.transform_vector3(Vec3::new(ndc.x / cam.proj.x_axis.x, ndc.y / cam.proj.y_axis.y, -1.0)).normalize_or(Vec3::Y)
 }
 
 #[inline]
@@ -787,7 +744,7 @@ pub fn draw_disc(frame: &mut Frame, cam: &Camera, centre: Vec3, radius_px: f32, 
 }
 
 #[inline]
-fn tonemap(c: Vec3) -> Vec3 {
+pub fn tonemap(c: Vec3) -> Vec3 {
     // Simple filmic-ish curve, keeps highlights from clipping to white.
     let c = c.max(Vec3::ZERO);
     c / (Vec3::ONE + c) * TONE_SLOPE
@@ -795,7 +752,7 @@ fn tonemap(c: Vec3) -> Vec3 {
 
 /// Colour for a count of lights: dark grey for none, then blue, green,
 /// yellow, red, white.
-fn heat(k: u32) -> Vec3 {
+pub fn heat(k: u32) -> Vec3 {
     const RAMP: [Vec3; 6] = [
         Vec3::new(0.012, 0.012, 0.014),
         Vec3::new(0.02, 0.08, 0.5),
@@ -821,6 +778,7 @@ pub fn pack(c: Vec3) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reyes::render;
 
     fn quad_scene() -> Scene {
         let mut s = Scene::new();
