@@ -1,0 +1,13 @@
+[package]
+name = "cpuview"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glam = "0.34.1"
+openusd = "0.8"
+openusd-schemas = { version = "0.8.0", features = ["geom", "lux"] }
+png = "0.18.1"
+rayon = "1.12.0"
+softbuffer = "0.4.8"
+winit = "0.30.13"
