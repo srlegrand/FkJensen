@@ -30,7 +30,7 @@ use rayon::prelude::*;
 use crate::bounce::{self, Bounce};
 use crate::raster::{self, Camera, Frame, NO_TRI, NOT_VISIBLE, RenderSettings, SPECULAR, Sky, View};
 use crate::scene::{PointLight, Scene};
-use crate::shadow::{CubeShadow, SHADOW_RES};
+use crate::shadow::CubeShadow;
 
 /// Shading kept for one cluster.
 #[derive(Default)]
@@ -99,7 +99,7 @@ pub struct Renderer {
     shadows: Vec<Option<CubeShadow>>,
     prev_lights: Vec<PointLight>,
     prev_reach: Vec<f32>,
-    prev_global: Option<(Sky, f32, bool, bool, bool)>,
+    prev_global: Option<(Sky, f32, bool, bool, bool, usize)>,
     /// The surfel cloud and the bounce light at each receiver.
     bounce: Option<Bounce>,
     vis_key: Option<VisKey>,
@@ -177,7 +177,7 @@ impl Renderer {
         let reach: Vec<f32> = lights.iter().map(|l| if settings.light_reach { raster::light_reach(l, cut) } else { f32::INFINITY }).collect();
 
         // What changed since the last frame decides what is thrown away.
-        let global = (settings.sky, settings.exposure, settings.light_reach, settings.shadows, settings.bounce);
+        let global = (settings.sky, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.bounce, settings.shadow_res);
         let global_changed = self.prev_global != Some(global) || self.prev_lights.len() != lights.len();
         // Spheres (old and new position, with reach) of lights that changed.
         let mut spheres: Vec<(Vec3, f32)> = Vec::new();
@@ -222,7 +222,7 @@ impl Renderer {
                     // With light reach off, a map still has to stop somewhere:
                     // the whole scene.
                     let r = if reach[i].is_finite() { reach[i] } else { scene.radius() * 4.0 + lights[i].position.distance(scene.centre()) };
-                    (i, CubeShadow::build(scene, lights[i].position, r, SHADOW_RES))
+                    (i, CubeShadow::build(scene, lights[i].position, r, settings.shadow_res))
                 })
                 .collect();
             frame.stats.shadow_maps_built = built.len();

@@ -179,6 +179,8 @@ pub struct RenderSettings {
     pub light_reach: bool,
     /// Shadow maps for the point lights.
     pub shadows: bool,
+    /// Texels per cube face edge of each shadow map.
+    pub shadow_res: usize,
     /// Bounce light (point-based colour bleeding).
     pub bounce: bool,
     /// Time per frame for gathering bounce light, in ms; None: all of it.
@@ -188,7 +190,7 @@ pub struct RenderSettings {
 
 impl RenderSettings {
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, light_reach: true, shadows: true, bounce: true, bounce_budget_ms: None, view: View::Shaded }
+        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, bounce: true, bounce_budget_ms: None, view: View::Shaded }
     }
 }
 

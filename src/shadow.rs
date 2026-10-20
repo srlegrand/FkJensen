@@ -12,7 +12,7 @@ use rayon::prelude::*;
 
 use crate::scene::Scene;
 
-/// Texels per cube face edge.
+/// Texels per cube face edge, by default (`--shadow-res` changes it).
 pub const SHADOW_RES: usize = 512;
 /// Nothing nearer the light than this is drawn into its map, in metres.
 const NEAR: f32 = 0.002;

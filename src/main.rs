@@ -16,6 +16,8 @@
 //!   fkjensen --look ex,ey,ez,tx,ty,tz  camera at e looking at t, in metres
 //!   fkjensen --no-shadows              point lights without shadow maps
 //!   fkjensen --no-bounce               no bounce light
+//!   fkjensen --no-chess                the built-in set without the chess set
+//!   fkjensen --shadow-res N            shadow map texels per cube face edge (512)
 //!   fkjensen --png out.png --bench-drag  then move the first light five times, timing each frame
 //!
 //! Controls are listed in README.md and printed at start.
@@ -448,7 +450,22 @@ fn format_metres(m: f32) -> String {
 
 /// The built-in set: the chess set from `assets/chess_set.fkj` on the
 /// table, in the procedural square with the shop and the mountains.
+#[cfg(test)]
 fn built_in() -> Result<Scene, String> {
+    built_in_with(true)
+}
+
+/// The built-in set, with or without the chess set (1.4 M triangles; the
+/// set without it is about 90 K, for machines with little memory).
+fn built_in_with(with_chess: bool) -> Result<Scene, String> {
+    if !with_chess {
+        let mut scene = world::build();
+        let shop_lights = std::mem::take(&mut scene.lights);
+        scene.lights = world::table_lights();
+        scene.lights.extend(shop_lights);
+        eprintln!("built-in set without the chess set: {} triangles, {} clusters, {} lights", scene.triangle_count(), scene.clusters.len(), scene.lights.len());
+        return Ok(scene);
+    }
     let mut chess = load_bytes(CHESS_SET, "built-in chess set")?;
     // Board centred on the table, resting on its top.
     let c = chess.centre();
@@ -600,6 +617,14 @@ fn save_png(frame: &Frame, path: &str) -> Result<(), String> {
     w.write_image_data(&data).map_err(|e| e.to_string())
 }
 
+/// The most memory the process has held, from Linux's /proc.
+fn peak_memory_mb() -> Option<f64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / 1024.0)
+}
+
 fn parse_light(s: &str) -> Option<PointLight> {
     let v: Vec<f32> = s.split(',').map(|x| x.trim().parse().ok()).collect::<Option<_>>()?;
     let lumens = |l: f32| l.clamp(scene::MIN_LUMENS, scene::MAX_LUMENS);
@@ -625,6 +650,8 @@ fn main() {
     let mut bounce = true;
     let mut bench_drag = false;
     let mut look: Option<(Vec3, Vec3)> = None;
+    let mut no_chess = false;
+    let mut shadow_res: Option<usize> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -667,6 +694,15 @@ fn main() {
             "--no-shadows" => shadows = false,
             "--no-bounce" => bounce = false,
             "--bench-drag" => bench_drag = true,
+            "--no-chess" => no_chess = true,
+            "--shadow-res" => {
+                shadow_res = args.get(i + 1).and_then(|s| s.parse().ok());
+                if shadow_res.is_none() {
+                    eprintln!("--shadow-res takes a number of texels, e.g. 128");
+                    std::process::exit(2);
+                }
+                i += 1;
+            }
             "--look" => {
                 // --look ex,ey,ez,tx,ty,tz: camera at e looking at t.
                 let v: Option<Vec<f32>> = args.get(i + 1).map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
@@ -680,7 +716,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-shadows] [--no-bounce] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-shadows] [--no-bounce] [--no-chess] [--shadow-res N] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -696,7 +732,7 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        None => match built_in() {
+        None => match built_in_with(!no_chess) {
             Ok(s) => (s, "chess table, shop, mountains".into()),
             Err(e) => {
                 eprintln!("{e}");
@@ -726,6 +762,9 @@ fn main() {
     }
     app.settings.light_reach = reach;
     app.settings.shadows = shadows;
+    if let Some(r) = shadow_res {
+        app.settings.shadow_res = r.clamp(16, 4096);
+    }
     app.settings.bounce = bounce;
 
     if let Some(out) = png_out {
@@ -767,6 +806,9 @@ fn main() {
             std::process::exit(1);
         }
         eprintln!("wrote {out}");
+        if let Some(mb) = peak_memory_mb() {
+            eprintln!("peak memory {mb:.0} MB");
+        }
         if bench_drag {
             // Move the first light 10 cm at a time, as a drag would, and
             // time each frame with everything kept from the one before, with

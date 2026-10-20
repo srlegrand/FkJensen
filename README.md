@@ -156,6 +156,20 @@ Headless, for tests and screenshots (no window, no display needed):
 - `--no-bounce` turns bounce light off.
 - `--close` starts on the close framing.
 - `--look ex,ey,ez,tx,ty,tz` puts the camera at e looking at t, in metres.
+- `--no-chess` leaves the chess set out of the built-in set (about 90 K
+  triangles instead of 1.5 M), for machines with little memory.
+- `--shadow-res N` sets the shadow map texels per cube face edge (512).
+- After `--png`, the peak memory of the run is printed (Linux).
+
+Peak memory of a 320 x 180 `--png` render on x86-64, 20/10/2026:
+
+| | peak memory |
+|---|---|
+| `--no-chess --no-shadows --no-bounce` | 25 MB |
+| `--no-chess --no-bounce --shadow-res 128` | 32 MB |
+| `--no-chess --shadow-res 128` | 46 MB |
+| `--no-shadows --no-bounce` (with the chess set) | 341 MB |
+| everything on | 473 MB |
 - `--bench-drag` (with `--png`) then moves the first light 10 cm five times,
   as a drag would, and times each frame.
 
@@ -317,7 +331,11 @@ Not measured yet: a Raspberry Pi.
 - Materials and textures: albedo per vertex only.
 - Light reach is per cluster and per point, not per pixel.
 - The shading cache holds 142 to 178 MB for the views above and is not
-  capped or evicted yet.
+  capped or evicted yet. With the chess set the program needs at least
+  341 MB: geometry is decoded to f32 at load and every visible triangle
+  gets a setup record each frame, so it does not fit a 256 MB Raspberry
+  Pi 1. Quantised geometry in memory, cluster level of detail and
+  per-bucket setup are what it needs.
 - Shading points are not shared between neighbouring triangles above
   level 0, so edges are shaded twice.
 - No converter in the repository: the chess set was baked from USD outside
