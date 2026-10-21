@@ -17,8 +17,8 @@ At the start of a session, run these and report each to the person as passed or 
 1. The person asks for a change in plain words.
 2. The assistant works in its own clone. Before every change it fetches `main` and starts from it. It builds, runs `cargo test --release`, renders the built-in scene headless (`--png`) and looks at the image, and updates `README.md` and `docs/`. It fetches `main` again just before making the patch and rebases if anything came in.
 3. The assistant makes one patch of everything since `origin/main`: `git diff --binary origin/main > fkjensen-<what>-<DDMMYYYY-HHMM>.patch`. The suffix is new every time, so the chat shows a new download. It checks the patch applies on a clean copy of `main` (`git worktree add` on `origin/main`, `git apply`).
-4. The assistant sends the patch and any screenshot worth looking at, with the block of commands below filled in, and says what changed, what was tested and what was not. One patch and one block per response.
-5. The person clicks "Download all" and pastes:
+4. The assistant sends the patch and any screenshot worth looking at, with the two blocks of commands below filled in, and says what changed, what was tested and what was not. One patch and two blocks per response, every time: one for the local machine, one for the Raspberry Pi.
+5. The person clicks "Download all" and pastes the local block on the desktop:
 
        cd ~/Software/FkJensen && \
        git pull --rebase origin main && \
@@ -29,6 +29,16 @@ At the start of a session, run these and report each to the person as passed or 
        cargo run --release
 
    The commands are joined with `&&`: a patch that does not apply is never followed by a commit. The block holds no other commands; deletions travel in the patch. `cargo run` comes last so the program can stay open.
+
+   Then the Pi block, also on the desktop, after the local block has pushed. It cross-compiles for the Pi 1 (ARMv6, 32-bit), copies the binary over and runs it there headless, so the output comes back to the desktop terminal:
+
+       cd ~/Software/FkJensen && \
+       cross build --release --target arm-unknown-linux-gnueabihf && \
+       scp target/arm-unknown-linux-gnueabihf/release/fkjensen simon@RPi-1:~/ && \
+       ssh simon@RPi-1 './fkjensen --hardware && ./fkjensen --png pi.png' && \
+       scp simon@RPi-1:~/pi.png ~/Downloads/fkjensen-pi.png
+
+   The `ssh` line holds whatever the change needs tested on the Pi; it always starts with `--hardware`. The rendered image comes back to `~/Downloads` to be looked at or attached.
 6. When `git apply` fails, the person pastes the terminal output; the assistant fetches `main`, rebases, tests again and sends a new patch.
 7. Until the person says a patch is pushed, the assistant keeps its work committed locally and makes the next patch on top of it.
 
