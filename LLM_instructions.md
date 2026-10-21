@@ -8,7 +8,7 @@ At the start of a session, run these and report each to the person as passed or 
 
 1. **Design philosophy.** Read `DESIGN_PHILOSOPHY.md` and tell the person it exists. When a request goes against it, say which point and ask whether to follow the file or update it.
 2. **A workspace that runs commands** and keeps files between turns. Without it you can only advise.
-3. **The program builds and its tests pass.** Clone the repository, `cargo test --release`, and `cargo test --release` in `tools/fkj-import`. No system libraries are needed. Report how many tests passed. The test scene, the chess set, is built into the program (`assets/chess_set.fkj`); nothing else needs fetching. Models in `assets/local/` are optional: the set and the tests run without them.
+3. **The program builds and its tests pass.** Clone the repository, `cargo test --release`, and `cargo test --release` in `tools/fkj-import`. No system libraries are needed. Report how many tests passed. The test scene, the chess set, is built into the program (`assets/chess_set.fkj`); nothing else needs fetching. The T-rex and the car are in `assets/models/`; the tests do not need them.
 4. **GitHub access.** Check that you can read `srlegrand/FkJensen` (private: the Claude GitHub App must be installed on Simon's account with access to it). If it cannot be read, ask the person to attach the repository or to send the current `main` as a tarball. Do not push: the person pushes.
 5. **Report** one list: what passed, what failed, what the person has to do.
 
@@ -28,26 +28,26 @@ At the start of a session, run these and report each to the person as passed or 
        git push origin main && \
        cargo run --release
 
-   The commands are joined with `&&`: a patch that does not apply is never followed by a commit. The block holds no other commands; deletions travel in the patch. The one exception: when the assistant sends `.fkj` models, which never go in the patch, the block moves them from `~/Downloads` into `assets/local/` before `cargo run`. `cargo run` comes last so the program can stay open.
+   The commands are joined with `&&`: a patch that does not apply is never followed by a commit. The block holds no other commands; deletions travel in the patch. The one exception: when the assistant sends `.fkj` models too large for a patch, the block moves them from `~/Downloads` into `assets/models/` before the commit. `cargo run` comes last so the program can stay open.
 
    Then the Pi block, also on the desktop, after the local block has pushed. It cross-compiles for the Pi 1 (ARMv6, 32-bit), copies the binary over and runs it there headless, so the output comes back to the desktop terminal:
 
        cd ~/Software/FkJensen && \
        cross build --release --target arm-unknown-linux-gnueabihf && \
        scp target/arm-unknown-linux-gnueabihf/release/fkjensen simon@RPi-1:~/ && \
-       ssh simon@RPi-1 'mkdir -p ~/assets/local' && \
-       scp assets/local/*.fkj simon@RPi-1:~/assets/local/ && \
+       ssh simon@RPi-1 'mkdir -p ~/assets/models' && \
+       scp assets/models/*.fkj simon@RPi-1:~/assets/models/ && \
        ssh simon@RPi-1 './fkjensen --hardware && ./fkjensen --png pi.png' && \
        scp simon@RPi-1:~/pi.png ~/Downloads/fkjensen-pi.png
 
-   The models go to `~/assets/local/` on the Pi, beside the binary, where the program looks for them; the two lines are left out when `assets/local/` holds no `.fkj`. The `ssh` line holds whatever the change needs tested on the Pi; it always starts with `--hardware`. The rendered image comes back to `~/Downloads` to be looked at or attached.
+   The models go to `~/assets/models/` on the Pi, beside the binary, where the program looks for them; the two lines can be left out when they have not changed. The `ssh` line holds whatever the change needs tested on the Pi; it always starts with `--hardware`. The rendered image comes back to `~/Downloads` to be looked at or attached.
 6. When `git apply` fails, the person pastes the terminal output; the assistant fetches `main`, rebases, tests again and sends a new patch.
 7. Until the person says a patch is pushed, the assistant keeps its work committed locally and makes the next patch on top of it.
 
 ## Conventions
 
 - Tests with every feature; `cargo test --release` passes, in the repository and in `tools/fkj-import`, before a change is handed over.
-- Third-party models and their `.fkj` files stay in `assets/local/`, which git ignores. They are never committed, and screenshots in `docs/` do not show them.
+- Published models live in `assets/models/`, credited in `assets/README.md`. Models that must not be published go in `assets/local/`, which git ignores.
 - Documentation with every change: `README.md`, and `docs/` pages for anything with a page. Every page has a "Not done yet" list.
 - A screenshot in `docs/` when something visible changed, taken from `--png` or from the running program.
 - To explain or check a stage, render its visual debug view (`--png out.png --debug-view NAME`, or `all`) and look at it. Those views are 64-bit only and are never a reason to hold back the Raspberry Pi build; a new stage gets a view.

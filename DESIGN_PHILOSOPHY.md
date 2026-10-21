@@ -74,6 +74,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 21/10/2026: the T-rex and the car move into the repository (`assets/models/`) so that anyone who clones it sees them; credits in `assets/README.md`.
 - 21/10/2026: visual debug views (`--visual-debug`, `--debug-view NAME|all`), 21 of them, 64-bit builds only, so that each stage of the renderer can be shown in a screenshot.
 - 21/10/2026: per-triangle texture tiles at the dicer's grid points, levels 1 to 5, baked at import (tools/fkj-import, glTF and FBX) and streamed per cluster and level from the file into a capped cache. Third-party models live in assets/local, outside the repository.
 - 21/10/2026: without X or Wayland, frames go straight to the Linux framebuffer (/dev/fb0) and input comes from /dev/input; the render resolution follows the screen through the machine's pixel budget.

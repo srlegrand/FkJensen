@@ -762,16 +762,22 @@ fn load_file(path: &Path) -> Result<Scene, String> {
 /// the repository.
 const SET_MODELS: [(&str, Vec3, f32); 2] = [("trex.fkj", Vec3::new(-8.0, 0.0, -21.0), 30.0), ("car.fkj", Vec3::new(4.5, 0.0, -9.0), -35.0)];
 
-/// Where models are looked for: $FKJENSEN_ASSETS, then assets/local in the
-/// current folder, then beside the program.
+/// Where models are looked for: $FKJENSEN_ASSETS; then assets/models (in
+/// the repository) and assets/local (kept out of it), each in the current
+/// folder, in the source tree the program was built from, and beside the
+/// program.
 fn assets_dirs() -> Vec<PathBuf> {
     let mut d = Vec::new();
     if let Some(p) = std::env::var_os("FKJENSEN_ASSETS") {
         d.push(PathBuf::from(p));
     }
-    d.push(PathBuf::from("assets/local"));
-    if let Some(exe) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
-        d.push(exe.join("assets/local"));
+    let exe = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    for sub in ["assets/models", "assets/local"] {
+        d.push(PathBuf::from(sub));
+        d.push(Path::new(env!("CARGO_MANIFEST_DIR")).join(sub));
+        if let Some(e) = &exe {
+            d.push(e.join(sub));
+        }
     }
     d
 }

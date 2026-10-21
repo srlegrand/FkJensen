@@ -1,4 +1,4 @@
 target/
 frame.png
-# Models converted with tools/fkj-import: kept out of the repository.
+# Models not to be published (published ones go in assets/models/).
 assets/local/

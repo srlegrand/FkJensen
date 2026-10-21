@@ -184,8 +184,8 @@ Models come in through `tools/fkj-import`, which reads glTF (.glb, .gltf)
 and binary FBX and writes `.fkj`:
 
     cd tools/fkj-import && cargo build --release && cd ../..
-    tools/fkj-import/target/release/fkj-import trex.glb -o assets/local/trex.fkj --length 12.3
-    tools/fkj-import/target/release/fkj-import car.fbx -o assets/local/car.fkj --length 4.79 --textures path/to/textures
+    tools/fkj-import/target/release/fkj-import trex.glb -o assets/models/trex.fkj --length 12.3
+    tools/fkj-import/target/release/fkj-import car.fbx -o assets/models/car.fkj --length 4.79 --textures path/to/textures
 
 It sets the model on the ground, centred, Y up, in metres (`--length`:
 longest horizontal side; `--height`; `--rotate-x`, `--rotate-y` in
@@ -203,10 +203,12 @@ its tiles at that level are read with one positioned read and kept in a
 cache capped by the machine's plan (an eighth of available memory). Only
 visible triangles' textures, at the size they are seen at, reach memory.
 
-The built-in set places `trex.fkj` and `car.fkj` on the square when they
-are found in `$FKJENSEN_ASSETS`, `assets/local/` or `assets/local/` beside
-the program. `assets/local/` is not in the repository: models stay with
-whoever has the rights to them.
+The built-in set places `trex.fkj` and `car.fkj` on the square. They are
+in the repository, in `assets/models/` (credits in `assets/README.md`).
+Models are looked for in `$FKJENSEN_ASSETS`, then `assets/models/` and
+`assets/local/` in the current folder, in the source tree the program was
+built from, and beside the program. `assets/local/` is ignored by git, for
+models that are not to be published.
 
 Measured on 21/10/2026 (2 cores of a Xeon at 2.1 GHz):
 
@@ -423,7 +425,7 @@ bounce light. `src/texture.rs` is the texture tiles and their cache;
 On the machine this was written on (2 cores of an Intel Xeon at 2.1 GHz,
 shared, no SIMD, 20/10/2026), the built-in set (1,521,804 triangles, 26,456
 clusters, 17 lights with shadow maps, 153,753 surfels), 1280 x 720, two runs
-each. These tables are without the models in `assets/local/`; with the
+each. These tables are without the T-rex and the car; with the
 T-rex and the car (45,395 more triangles, 21/10/2026) the first frame of
 the wide view took about 4.0 s, 2.7 s of it bounce gather.
 
