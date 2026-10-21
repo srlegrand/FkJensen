@@ -769,10 +769,8 @@ mod tests {
     }
 
     fn world() -> (Scene, Vec<PointLight>) {
-        let mut s = crate::world::build();
-        let mut lights = crate::world::table_lights();
-        lights.extend(std::mem::take(&mut s.lights));
-        (s, lights)
+        let s = crate::world::build();
+        (s, crate::world::small_lights())
     }
 
     fn worst(a: &Frame, b: &Frame) -> i32 {

@@ -1,15 +1,12 @@
-//! The built-in set around the chess board, made procedurally at start-up,
-//! in metres, Y up, the camera looking towards -Z:
+//! The built-in set, made procedurally at start-up, in metres, Y up, the
+//! camera looking towards -Z:
 //!
-//! - foreground: a table, 0.78 m high, with the chess set on it, at the origin;
-//! - mid ground: a café shopfront 40 m away across a paved square, with an
-//!   awning, windows, a door, a sign, tables outside, neighbouring
-//!   buildings, a street lamp and a string of festoon bulbs;
+//! - a paved ground plane around the origin, where the T-rex and the car
+//!   stand (`assets/models/`, placed by `main.rs`);
 //! - far background: mountains from 4 km to 12 km away, up to about 2 km
 //!   high, on a valley floor that runs to the horizon.
 //!
-//! Everything is real geometry, cut into the same clusters as the chess set.
-//! The point is distance: the lights at the table cannot reach the shop and
+//! Everything is real geometry, cut into clusters. The point is distance:
 //! nothing but the sky reaches the mountains, and the renderer skips that
 //! work (see `raster.rs`, light reach).
 
@@ -18,10 +15,12 @@ use glam::Vec3;
 use crate::lights::normalise_colour;
 use crate::scene::{PointLight, Scene};
 
-/// Height of the table top.
-pub const TABLE_TOP: f32 = 0.78;
-/// Distance from the table to the shop's front wall.
-pub const SHOP_FRONT_Z: f32 = -40.0;
+/// Where the T-rex and the car stand, and which way they face (degrees
+/// about Y).
+pub const TREX_AT: Vec3 = Vec3::new(0.0, 0.0, 0.0);
+pub const TREX_YAW: f32 = 30.0;
+pub const CAR_AT: Vec3 = Vec3::new(7.5, 0.0, 5.0);
+pub const CAR_YAW: f32 = -35.0;
 /// Nearest edge of the mountain range.
 pub const MOUNTAINS_NEAR_Z: f32 = -4000.0;
 pub const MOUNTAINS_FAR_Z: f32 = -12000.0;
@@ -46,18 +45,6 @@ impl Mesh {
             self.c.push(col);
         }
         self.i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    }
-
-    /// An axis-aligned box, every face outward.
-    fn cube(&mut self, lo: Vec3, hi: Vec3, col: Vec3) {
-        let v = |x: bool, y: bool, z: bool| Vec3::new(if x { hi.x } else { lo.x }, if y { hi.y } else { lo.y }, if z { hi.z } else { lo.z });
-        let (f, t) = (false, true);
-        self.quad(v(f, f, t), v(t, f, t), v(t, t, t), v(f, t, t), col); // +z
-        self.quad(v(t, f, f), v(f, f, f), v(f, t, f), v(t, t, f), col); // -z
-        self.quad(v(t, f, t), v(t, f, f), v(t, t, f), v(t, t, t), col); // +x
-        self.quad(v(f, f, f), v(f, f, t), v(f, t, t), v(f, t, f), col); // -x
-        self.quad(v(f, t, t), v(t, t, t), v(t, t, f), v(f, t, f), col); // +y
-        self.quad(v(f, f, f), v(t, f, f), v(t, f, t), v(f, f, t), col); // -y
     }
 
     /// A horizontal grid at height `y`, `nx` x `nz` cells, facing up.
@@ -182,24 +169,15 @@ fn mountains(scene: &mut Scene) {
     scene.push_mesh(&p, &[], &c, &idx);
 }
 
-/// The table, square, shop, valley and mountains, and their lights. Returns
-/// the scene and where the chess set's board centre goes.
+/// The ground plane, the valley and the mountains. No lights: see
+/// `set_lights`.
 pub fn build() -> Scene {
     let mut scene = Scene::new();
-
-    // Table: 1.1 m square top, four legs.
-    let wood = Vec3::new(0.28, 0.15, 0.08);
-    let mut m = Mesh::default();
-    m.cube(Vec3::new(-0.55, TABLE_TOP - 0.04, -0.55), Vec3::new(0.55, TABLE_TOP, 0.55), wood);
-    for (x, z) in [(-0.48, -0.48), (0.43, -0.48), (-0.48, 0.43), (0.43, 0.43)] {
-        m.cube(Vec3::new(x, 0.0, z), Vec3::new(x + 0.05, TABLE_TOP - 0.04, z + 0.05), wood * 0.8);
-    }
-    m.into_scene(&mut scene);
 
     // The square: 1 m paving slabs, so the clusters stay small and a light
     // only touches the ones near it.
     let mut m = Mesh::default();
-    m.ground(-40.0, 40.0, -62.0, 12.0, 0.0, 80, 74, |x, z| {
+    m.ground(-50.0, 50.0, -50.0, 50.0, 0.0, 100, 100, |x, z| {
         let v = 0.24 + hash(x.floor() as i32, z.floor() as i32) * 0.05;
         Vec3::new(v, v * 0.97, v * 0.93)
     });
@@ -214,7 +192,7 @@ pub fn build() -> Scene {
         let v = hash((x / 37.0) as i32, (z / 37.0) as i32) * 0.03;
         Vec3::new(0.09 + v, 0.12 + v, 0.06)
     };
-    let plaza = [-40.0, 40.0, -62.0, 12.0];
+    let plaza = [-50.0, 50.0, -50.0, 50.0];
     let r1 = [-400.0, 400.0, -450.0, 400.0];
     let r2 = [-4000.0, 4000.0, -4000.0, 4000.0];
     let r3 = [-24000.0, 24000.0, -16000.0, 8000.0];
@@ -223,112 +201,31 @@ pub fn build() -> Scene {
     m.ring(r3, r2, -0.05, 500.0, grass);
     m.into_scene(&mut scene);
 
-    shopfront(&mut scene);
     mountains(&mut scene);
 
-    scene.focus = Some((Vec3::new(-0.55, 0.0, -0.55), Vec3::new(0.55, TABLE_TOP + 0.15, 0.55)));
+    // Until the models are added, the subject is the middle of the plane.
+    scene.focus = Some((Vec3::new(-6.0, 0.0, -6.0), Vec3::new(6.0, 5.0, 6.0)));
     scene
 }
 
-fn shopfront(scene: &mut Scene) {
-    let z = SHOP_FRONT_Z;
-    let mut m = Mesh::default();
-    let render = Vec3::new(0.62, 0.55, 0.45);
-    let dark_green = Vec3::new(0.04, 0.12, 0.08);
-    let glass = Vec3::new(0.02, 0.025, 0.03);
-    let frame = Vec3::new(0.05, 0.05, 0.05);
-
-    // The café: 18 m wide, two storeys, 8 m deep.
-    m.cube(Vec3::new(-9.0, 0.0, z - 8.0), Vec3::new(9.0, 7.2, z), render);
-    // Shop window, two panes, and its frame, standing just proud of the wall.
-    m.cube(Vec3::new(-7.5, 0.5, z), Vec3::new(-0.6, 3.0, z + 0.05), frame);
-    m.cube(Vec3::new(-7.35, 0.65, z + 0.05), Vec3::new(-4.15, 2.85, z + 0.06), glass);
-    m.cube(Vec3::new(-3.95, 0.65, z + 0.05), Vec3::new(-0.75, 2.85, z + 0.06), glass);
-    // Door.
-    m.cube(Vec3::new(0.6, 0.0, z), Vec3::new(2.2, 2.5, z + 0.06), dark_green);
-    m.cube(Vec3::new(0.85, 1.1, z + 0.06), Vec3::new(1.95, 2.25, z + 0.07), glass);
-    // Second window right of the door.
-    m.cube(Vec3::new(3.0, 0.5, z), Vec3::new(7.5, 3.0, z + 0.05), frame);
-    m.cube(Vec3::new(3.15, 0.65, z + 0.05), Vec3::new(7.35, 2.85, z + 0.06), glass);
-    // Sign band.
-    m.cube(Vec3::new(-8.5, 3.55, z), Vec3::new(8.5, 4.35, z + 0.12), dark_green);
-    m.cube(Vec3::new(-3.0, 3.75, z + 0.12), Vec3::new(3.0, 4.15, z + 0.13), Vec3::new(0.75, 0.65, 0.35));
-    // Awning, sloping out and down over the windows.
-    let stripe = |k: usize| if k % 2 == 0 { Vec3::new(0.55, 0.06, 0.05) } else { Vec3::new(0.85, 0.82, 0.75) };
-    let n_stripes = 24;
-    for k in 0..n_stripes {
-        let x0 = -8.0 + 16.0 * k as f32 / n_stripes as f32;
-        let x1 = -8.0 + 16.0 * (k + 1) as f32 / n_stripes as f32;
-        let (back, front) = (Vec3::new(0.0, 3.45, z + 0.1), Vec3::new(0.0, 2.75, z + 1.9));
-        m.quad(Vec3::new(x0, front.y, front.z), Vec3::new(x1, front.y, front.z), Vec3::new(x1, back.y, back.z), Vec3::new(x0, back.y, back.z), stripe(k));
-        // Underside, so it is not see-through from below.
-        m.quad(Vec3::new(x0, back.y - 0.02, back.z), Vec3::new(x1, back.y - 0.02, back.z), Vec3::new(x1, front.y - 0.02, front.z), Vec3::new(x0, front.y - 0.02, front.z), stripe(k) * 0.6);
-    }
-    // Upstairs windows.
-    for k in 0..5 {
-        let x = -7.5 + k as f32 * 3.3;
-        m.cube(Vec3::new(x, 4.9, z), Vec3::new(x + 1.6, 6.6, z + 0.05), frame);
-        m.cube(Vec3::new(x + 0.1, 5.0, z + 0.05), Vec3::new(x + 1.5, 6.5, z + 0.06), glass);
-    }
-    // Roof edge.
-    m.cube(Vec3::new(-9.2, 7.2, z - 8.2), Vec3::new(9.2, 7.45, z + 0.2), Vec3::new(0.18, 0.17, 0.16));
-    // Pavement and kerb.
-    m.cube(Vec3::new(-20.0, 0.0, z), Vec3::new(20.0, 0.12, z + 4.0), Vec3::new(0.35, 0.34, 0.32));
-    // Neighbours.
-    m.cube(Vec3::new(-20.0, 0.0, z - 9.0), Vec3::new(-9.0, 8.0, z - 0.3), Vec3::new(0.35, 0.22, 0.18));
-    m.cube(Vec3::new(9.0, 0.0, z - 8.5), Vec3::new(19.0, 6.6, z - 0.4), Vec3::new(0.55, 0.57, 0.6));
-    for k in 0..3 {
-        let x = -18.5 + k as f32 * 3.4;
-        for row in 0..2 {
-            let y = 1.2 + row as f32 * 3.2;
-            m.cube(Vec3::new(x, y, z - 0.3), Vec3::new(x + 1.4, y + 1.8, z - 0.25), glass);
-        }
-    }
-    for k in 0..3 {
-        let x = 10.0 + k as f32 * 3.0;
-        for row in 0..2 {
-            let y = 1.2 + row as f32 * 2.9;
-            m.cube(Vec3::new(x, y, z - 0.4), Vec3::new(x + 1.5, y + 1.9, z - 0.35), glass);
-        }
-    }
-    // Tables and chairs outside.
-    for (k, x) in [-6.0f32, -2.5, 4.5].iter().enumerate() {
-        let tz = z + 2.6 + (k % 2) as f32 * 0.3;
-        let metal = Vec3::new(0.06, 0.06, 0.06);
-        m.cube(Vec3::new(x - 0.35, 0.72, tz - 0.35), Vec3::new(x + 0.35, 0.75, tz + 0.35), metal);
-        m.cube(Vec3::new(x - 0.03, 0.12, tz - 0.03), Vec3::new(x + 0.03, 0.72, tz + 0.03), metal);
-        for side in [-1.0f32, 1.0] {
-            let cx = x + side * 0.7;
-            m.cube(Vec3::new(cx - 0.2, 0.45, tz - 0.2), Vec3::new(cx + 0.2, 0.48, tz + 0.2), Vec3::new(0.3, 0.17, 0.08));
-            m.cube(Vec3::new(cx + side * 0.18 - 0.02, 0.48, tz - 0.2), Vec3::new(cx + side * 0.18 + 0.02, 0.95, tz + 0.2), Vec3::new(0.3, 0.17, 0.08));
-        }
-    }
-    // Street lamp, half way between the table and the shop.
-    let lamp = Vec3::new(6.5, 5.6, -20.0);
-    m.cube(Vec3::new(lamp.x - 0.07, 0.0, lamp.z - 0.07), Vec3::new(lamp.x + 0.07, lamp.y + 0.15, lamp.z + 0.07), Vec3::new(0.05, 0.06, 0.06));
-    m.cube(Vec3::new(lamp.x - 0.3, lamp.y + 0.1, lamp.z - 0.2), Vec3::new(lamp.x + 0.3, lamp.y + 0.25, lamp.z + 0.2), Vec3::new(0.05, 0.06, 0.06));
-    m.into_scene(scene);
-
-    // The café's festoon string, sagging between the awning ends.
-    let warm = normalise_colour(Vec3::new(1.0, 0.72, 0.42));
-    let n = 14;
-    for k in 0..n {
-        let t = k as f32 / (n - 1) as f32;
-        let x = -8.5 + 17.0 * t;
-        let sag = 0.45 * (1.0 - (2.0 * t - 1.0).powi(2));
-        scene.lights.push(PointLight { position: Vec3::new(x, 4.6 - sag, z + 2.3), color: warm, lumens: 200.0 });
-    }
-    // An LED street light: about 12,000 lm.
-    scene.lights.push(PointLight { position: lamp, color: normalise_colour(Vec3::new(0.9, 0.95, 1.0)), lumens: 12_000.0 });
+/// The lights of the set: a warm key, a cool fill and a rim, sized like
+/// film lights on a night exterior.
+pub fn set_lights() -> Vec<PointLight> {
+    vec![
+        // An 18 kW HMI's worth, high and to the front left.
+        PointLight { position: Vec3::new(-14.0, 16.0, 18.0), color: normalise_colour(Vec3::new(1.0, 0.85, 0.7)), lumens: 1_000_000.0 },
+        PointLight { position: Vec3::new(16.0, 5.0, 6.0), color: normalise_colour(Vec3::new(0.7, 0.8, 1.0)), lumens: 40_000.0 },
+        PointLight { position: Vec3::new(3.0, 10.0, -16.0), color: normalise_colour(Vec3::new(1.0, 1.0, 1.0)), lumens: 200_000.0 },
+    ]
 }
 
-/// The lights at the chess table: a small warm lamp as key, a dimmer cool
-/// fill. Positions are relative to the table top's centre.
-pub fn table_lights() -> Vec<PointLight> {
-    let top = Vec3::new(0.0, TABLE_TOP, 0.0);
+/// Two small lamps near the origin (400 lm and 120 lm), whose reach is a
+/// few metres: for tests that need a light to touch only part of the set.
+#[cfg(test)]
+pub fn small_lights() -> Vec<PointLight> {
     vec![
-        PointLight { position: top + Vec3::new(-0.2, 0.32, 0.22), color: normalise_colour(Vec3::new(1.0, 0.8, 0.6)), lumens: 400.0 },
-        PointLight { position: top + Vec3::new(0.3, 0.2, -0.25), color: normalise_colour(Vec3::new(0.65, 0.8, 1.0)), lumens: 120.0 },
+        PointLight { position: Vec3::new(-0.2, 1.1, 0.22), color: normalise_colour(Vec3::new(1.0, 0.8, 0.6)), lumens: 400.0 },
+        PointLight { position: Vec3::new(0.3, 1.0, -0.25), color: normalise_colour(Vec3::new(0.65, 0.8, 1.0)), lumens: 120.0 },
     ]
 }
 
@@ -337,24 +234,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn three_distances_are_where_they_say() {
+    fn ground_and_mountains_are_where_they_say() {
         let s = build();
-        let (fmin, fmax) = s.focus_bounds();
-        assert!(fmax.y < 1.0 && fmin.x > -1.0 && fmax.x < 1.0, "the table is about a metre across");
-        assert!(fmin.y >= 0.0);
-        // Shop geometry and mountain geometry exist at their distances.
-        let mut shop = 0;
+        let mut ground = 0;
         let mut far = 0;
         for c in &s.clusters {
-            if c.centre.z < SHOP_FRONT_Z + 1.0 && c.centre.z > SHOP_FRONT_Z - 12.0 && c.centre.y > 0.5 {
-                shop += 1;
+            if c.centre.length() < 30.0 && c.centre.y.abs() < 0.5 {
+                ground += 1;
             }
             if c.centre.z < MOUNTAINS_NEAR_Z + 500.0 && c.centre.y > 100.0 {
                 far += 1;
             }
         }
-        assert!(shop > 10, "{shop} shop clusters");
+        assert!(ground > 50, "{ground} ground clusters near the origin");
         assert!(far > 100, "{far} mountain clusters");
+        // Nothing stands on the plane but what main.rs places there.
+        assert!(s.clusters.iter().filter(|c| c.centre.length() < 100.0).all(|c| c.centre.y < 0.5));
         let peak = s.positions.iter().map(|p| p.y).fold(0.0, f32::max);
         assert!(peak > 1200.0 && peak < 2500.0, "peak {peak}");
     }

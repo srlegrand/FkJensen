@@ -8,7 +8,7 @@ At the start of a session, run these and report each to the person as passed or 
 
 1. **Design philosophy.** Read `DESIGN_PHILOSOPHY.md` and tell the person it exists. When a request goes against it, say which point and ask whether to follow the file or update it.
 2. **A workspace that runs commands** and keeps files between turns. Without it you can only advise.
-3. **The program builds and its tests pass.** Clone the repository, `cargo test --release`, and `cargo test --release` in `tools/fkj-import`. No system libraries are needed. Report how many tests passed. The test scene, the chess set, is built into the program (`assets/chess_set.fkj`); nothing else needs fetching. The T-rex and the car are in `assets/models/`; the tests do not need them.
+3. **The program builds and its tests pass.** Clone the repository, `cargo test --release`, and `cargo test --release` in `tools/fkj-import`. No system libraries are needed. Report how many tests passed. The built-in set is the ground and mountains of `src/world.rs` with the T-rex and the car from `assets/models/`, stored with Git LFS (`git lfs install` before cloning, or `git lfs pull` after); the tests do not need them.
 4. **GitHub access.** Check that you can read `srlegrand/FkJensen` (private: the Claude GitHub App must be installed on Simon's account with access to it). If it cannot be read, ask the person to attach the repository or to send the current `main` as a tarball. Do not push: the person pushes.
 5. **Report** one list: what passed, what failed, what the person has to do.
 
@@ -17,7 +17,7 @@ At the start of a session, run these and report each to the person as passed or 
 1. The person asks for a change in plain words.
 2. The assistant works in its own clone. Before every change it fetches `main` and starts from it. It builds, runs `cargo test --release`, renders the built-in scene headless (`--png`) and looks at the image, and updates `README.md` and `docs/`. It fetches `main` again just before making the patch and rebases if anything came in.
 3. The assistant makes one patch of everything since `origin/main`: `git diff --binary origin/main > fkjensen-<what>-<DDMMYYYY-HHMM>.patch`. The suffix is new every time, so the chat shows a new download. It checks the patch applies on a clean copy of `main` (`git worktree add` on `origin/main`, `git apply`).
-4. The assistant sends the patch and any screenshot worth looking at, with the two blocks of commands below filled in, and says what changed, what was tested and what was not. One patch and two blocks per response, every time: one for the local machine, one for the Raspberry Pi.
+4. The assistant sends the patch and any screenshot worth looking at, with the two blocks of commands below filled in, and says what changed, what was tested and what was not. One patch and three blocks per response, every time: one for the local machine, one for the Raspberry Pi, one for the Windows machine.
 5. The person clicks "Download all" and pastes the local block on the desktop:
 
        cd ~/Software/FkJensen && \
@@ -36,11 +36,21 @@ At the start of a session, run these and report each to the person as passed or 
        cross build --release --target arm-unknown-linux-gnueabihf && \
        scp target/arm-unknown-linux-gnueabihf/release/fkjensen simon@RPi-1:~/ && \
        ssh simon@RPi-1 'mkdir -p ~/assets/models' && \
-       scp assets/models/*.fkj simon@RPi-1:~/assets/models/ && \
+       scp assets/models/trex.fkj assets/models/car.fkj simon@RPi-1:~/assets/models/ && \
        ssh simon@RPi-1 './fkjensen --hardware && ./fkjensen --png pi.png' && \
        scp simon@RPi-1:~/pi.png ~/Downloads/fkjensen-pi.png
 
-   The models go to `~/assets/models/` on the Pi, beside the binary, where the program looks for them; the two lines can be left out when they have not changed. The `ssh` line holds whatever the change needs tested on the Pi; it always starts with `--hardware`. The rendered image comes back to `~/Downloads` to be looked at or attached.
+   The low-resolution models go to `~/assets/models/` on the Pi, beside the binary, where the program looks for them (the high-resolution T-rex never fits a Pi); the two lines can be left out when they have not changed. The `ssh` line holds whatever the change needs tested on the Pi; it always starts with `--hardware`. The rendered image comes back to `~/Downloads` to be looked at or attached.
+   Then the Windows block, in PowerShell on the Windows machine (Git, Git LFS, the MSVC build tools and Rust installed), after the local block has pushed. It builds natively from GitHub's `main`:
+
+       cd $HOME\Software
+       if (Test-Path FkJensen) { git -C FkJensen checkout main; git -C FkJensen pull --rebase origin main; git -C FkJensen lfs pull } else { git lfs install; git clone -b main https://github.com/srlegrand/FkJensen.git }
+       cd FkJensen
+       cargo test --release
+       cargo run --release -- --hardware
+       cargo run --release -- --png $HOME\Downloads\fkjensen-win.png --debug-view all
+       cargo run --release -- --visual-debug
+
 6. When `git apply` fails, the person pastes the terminal output; the assistant fetches `main`, rebases, tests again and sends a new patch.
 7. Until the person says a patch is pushed, the assistant keeps its work committed locally and makes the next patch on top of it.
 

@@ -10,16 +10,19 @@ It does not read USD. Scenes are in FkJensen's own `.fkj` format
 (`docs/format.md`), with geometry already cut into the clusters the renderer
 draws.
 
-The built-in set has three distances, all real geometry, in metres:
+The built-in set, all real geometry, in metres:
 
-- foreground: the Open Chess Set on a table, under two small lamps;
-- mid ground: a café shopfront 40 m away across a paved square, with a
-  string of festoon bulbs and a street lamp;
+- a T-rex (10.8 M triangles, a ZBrush sculpt, with its texture baked to
+  vertex colours and tiles) and a car (17 K triangles), on a 100 m paved
+  ground plane;
 - far background: mountains 4 to 12 km away, up to about 2 km high.
+
+On machines whose plan leaves it out (see Fitting the machine), the T-rex is
+its 28 K-triangle version.
 
 ![The set from the wide view](docs/set_wide.png)
 
-![The chess table from the close view](docs/set_close.png)
+![The set from the close view](docs/set_close.png)
 
 ## Light
 
@@ -30,11 +33,12 @@ in lumens. There is no falloff radius: the light gives lumens / 4π candela,
 and a surface facing it at d metres receives that over d² lux. Lumens are
 kept between 1 and 2,000,000, about the output of an 18 kW HMI, the largest
 common film light, so nothing brighter than a real lamp can be made. The
-set opens with a 400 lm lamp and a 120 lm fill at the table, fourteen
-200 lm festoon bulbs at the café and a 12,000 lm LED street lamp.
+set opens with three lights sized like film lights on a night exterior: a
+1,000,000 lm warm key high to the front left, a 40,000 lm cool fill and a
+200,000 lm rim behind.
 
 **The sky.** Light from the whole sky, with nothing between it and any
-surface, so a mountain 10 km away and a pawn are lit by it the same way. It
+surface, so a mountain 10 km away and the T-rex are lit by it the same way. It
 is set by its illuminance on an upward-facing surface, in lux; the set
 opens at 30 lux, dusk. The sky behind the scene is drawn from the same
 values.
@@ -49,34 +53,34 @@ sky is not occluded yet.
 
 **Bounce light.** Point-based colour bleeding (Christensen 2008), no rays
 (`src/bounce.rs`). The surfaces become a cloud of discs (surfels): one per
-large triangle, up to six per small cluster binned by facing, 153,753 for
+large triangle, up to six per small cluster binned by facing, 561,573 for
 the built-in set. Each is lit directly, by the sky and the point lights
 through their shadow maps: that lit cloud is the set of micro lights. The
 surfels sit in a tree whose nodes carry summed area, normal and mean
 radiance.
 
 Bounce light is gathered at receivers: one at each vertex of a large
-cluster (a floor, a wall, a table top), blended across its triangles, and
+cluster (a floor, a wall), blended across its triangles, and
 one for each small cluster. A receiver walks the tree nearest first, taking
 near surfels one by one and far groups as one disc, and lays each onto a
 6 x 8 x 8 cube raster around itself: a small or far disc by its solid
 angle, a large near one by meeting each texel's direction with the disc.
 The raster fills nearest first, so a nearer surface hides what is behind
 it; a surfel seen from behind sends nothing but still hides what is
-beyond, so a receiver under the chess board does not see through it. The
+beyond, so a receiver under the car does not see through it. The
 raster is folded into order-1 spherical harmonics, from which each pixel
 takes the irradiance for its own normal. One bounce. With bounce on, the
 sky's ground term is left out: the real ground is in the cloud.
 
 Light reach applies here too. A changed light relights only the surfels in
 its reach, and throws away only the receivers within its reach plus the
-reach of the brightest change in bounce light. Turning a table lamp up to
+reach of the brightest change in bounce light. Turning a light up to
 2,000,000 lm does not gather the mountains' bounce light again. In the
 window, gathering gets 30 ms a frame, nearest the camera first, and catches
 up over the following frames; a still render waits for all of it. `I` turns
 bounce off.
 
-![The café at night, lit by one 30,000 lm lamp above the awning, without and with bounce light: the shadowed shopfront under the awning picks up light from the lit pavement](docs/bounce.png)
+![Bounce light on the earlier set (a café, 20/10/2026), lit by one 30,000 lm lamp above the awning, without and with bounce: the shadowed shopfront picks up light from the lit pavement](docs/bounce.png)
 
 ### Light reach
 
@@ -101,24 +105,21 @@ At the opening sky and exposure (cut 0.094 lux):
 
 | light | lumens | reach |
 |---|---|---|
-| table fill | 120 | 10 m |
-| table lamp | 400 | 18 m |
-| festoon bulb | 200 | 13 m |
-| street lamp | 12,000 | 101 m |
+| fill | 40,000 | 184 m |
+| rim | 200,000 | 411 m |
+| key | 1,000,000 | 920 m |
 | brightest allowed | 2,000,000 | 1.3 km |
+| a 400 lm table lamp, for scale | 400 | 18 m |
 
-So the table lamps stop short of the café 40 m away, the café's bulbs stop
-short of the table, the street lamp lights both, and no light can reach the
-mountains, however strong it is made. The tests check each of these
-statements, and that rendering the whole set with and without light reach
+So the three lights cover the ground plane and the near valley, and no
+light can reach the mountains, however strong it is made. The tests check
+that, and that rendering the whole set with and without light reach
 differs by at most one 8-bit step on any pixel.
 
-![Lights evaluated per pixel](docs/light_count.png)
+![Lights evaluated per cluster](docs/light_count.png)
 
-Light count view (`H`), left: the lights as the set opens; dark grey is
-none, then blue 1, green 2, yellow 3, red 4, white 5 or more. Right: one
-light at the table set to 2,000,000 lm. It reaches the square, the café and
-the nearby valley, and still not the mountains.
+Light count view (`--debug-view light-count`): yellow, all three lights,
+on the plane and the models; none on the mountains.
 
 The same bound limits each shadow map to the geometry in its light's reach,
 and is meant to limit bounce light when it comes.
@@ -147,45 +148,51 @@ From those it chooses:
 |---|---|
 | render resolution | a pixel budget: a whole frame shaded in 150 ms at 3 points per pixel; the window or screen renders at the scale that fits it, from 6.25% to 100%, scaled up with nearest pixels |
 | `--png` size without `--size` | about 2 s of shading, up to 1280 x 720 |
-| chess set | at least 600 MB available, and its triangles' memory traffic per frame (100 bytes each) under 250 ms |
+| high-resolution T-rex | at least 3,200 MB available (peak 2,523 MB measured), and its 10.8 M triangles' memory traffic per frame (100 bytes each) under 250 ms; otherwise the 28 K-triangle T-rex |
 | shadow maps | 512, 256 or 128 texels per face by speed, halved until 17 lights fit in a tenth of free memory; off below 64 |
 | bounce light | on at an eighth of the reference machine's speed or more, with a gather budget of 10 to 30 ms per window frame |
 | bucket size | depth and ids of a bucket in half the L2 cache, 16 to 64 pixels |
 
 It prints what it found and each choice with its reason. `--hardware`
 prints them and exits. Any option on the command line overrides the plan
-(`--size`, `--scale`, `--shadow-res`, `--[no-]chess`, `--[no-]shadows`,
+(`--size`, `--scale`, `--shadow-res`, `--[no-]highres`, `--[no-]shadows`,
 `--[no-]bounce`); `--no-auto` skips detection and uses fixed defaults.
 In the window `Z` and `Shift+Z` change the render scale.
 
-On the machine this was written on (20/10/2026):
+On the machine this was written on (21/10/2026):
 
     CPU: Intel(R) Xeon(R) Processor @ 2.10GHz (x86_64), 2 cores, up to 2100 MHz
     features: sse2 sse4.1 avx avx2 fma avx512f
     caches (per core or shared): L1 data 48 KB, L1 instruction 32 KB, L2 unified 2048 KB, L3 unified 266240 KB
-    memory: 7.84 GB total, 7.27 GB available
-    measured: memory read 10.14 GB/s on one core, 18.75 GB/s on all; shading benchmark 16.79 M points/s on all cores (637 ms to measure)
-      frames of about 434 K pixels (62% of a 1280 x 720 window): about 8.68 M shading points/s in a frame, 150 ms per frame at 3 points per pixel
+    memory: 7.84 GB total, 7.28 GB available
+    measured: memory read 10.35 GB/s on one core, 18.85 GB/s on all; shading benchmark 16.33 M points/s on all cores (749 ms to measure)
+      frames of about 408 K pixels (62% of a 1280 x 720 window): about 8.16 M shading points/s in a frame, 150 ms per frame at 3 points per pixel
       --png without --size renders 1280x720 (about 2 s of shading)
-      chess set loaded: 7446 MB available, its triangles take 8 ms of memory traffic per frame
+      high-resolution T-rex: 7452 MB available, its triangles take 57 ms of memory traffic per frame
       shadow maps 512 x 512 per face (107.0 MB for 17 lights)
-      bounce light on, gathered 30 ms per window frame
+      bounce light on, gathered 29 ms per window frame
       buckets 64 x 64 (32 KB of depth and ids, L2 2048 KB)
+      texture tile cache up to 931 MB
 
 On a Raspberry Pi 1 Model B Rev 1 (59 MB available, about 80 K shading
 points per second measured in a frame on 20/10/2026) the rules give, as the
-tests check: no chess set, no bounce light, 128 x 128 shadow maps, frames
+tests check: the low-resolution T-rex, no bounce light, 128 x 128 shadow maps, frames
 of about 4 K pixels (its 1080 x 1920 screen renders at the 6.25% floor,
 68 x 120) and stills of about 304 x 171. Not yet run on the Pi.
 
 ## Models and texture tiles
 
-Models come in through `tools/fkj-import`, which reads glTF (.glb, .gltf)
-and binary FBX and writes `.fkj`:
+Models come in through `tools/fkj-import`, which reads glTF (.glb, .gltf),
+binary FBX and OBJ, and writes `.fkj`:
 
     cd tools/fkj-import && cargo build --release && cd ../..
     tools/fkj-import/target/release/fkj-import trex.glb -o assets/models/trex.fkj --length 12.3
     tools/fkj-import/target/release/fkj-import car.fbx -o assets/models/car.fkj --length 4.79 --textures path/to/textures
+    tools/fkj-import/target/release/fkj-import trex_highres.obj -o assets/models/trex_highres.fkj --length 12.3 --texture trex_basecolor.png
+
+An OBJ's materials are not read: `--texture` gives its base colour
+texture. The high-resolution T-rex is a ZBrush export with the same UVs as
+the glTF one, so it takes the glTF's base colour texture.
 
 It sets the model on the ground, centred, Y up, in metres (`--length`:
 longest horizontal side; `--height`; `--rotate-x`, `--rotate-y` in
@@ -196,15 +203,19 @@ shading point reads its colour with no UVs and no filtering at render time
 (`src/texture.rs`, `docs/format.md`). Levels 1 to 5 are stored, each
 filtered from the source's mip chain at its own spacing; a triangle's
 finest level stops where its points would be finer than the source's
-texels or closer than `--texel` (2 mm).
+texels or closer than `--texel` (2 mm). A triangle covering two texels or
+fewer gets no tiles: its three vertex colours hold them.
 
 At load the tiles stay in the file. When a cluster is shaded at level L,
 its tiles at that level are read with one positioned read and kept in a
 cache capped by the machine's plan (an eighth of available memory). Only
 visible triangles' textures, at the size they are seen at, reach memory.
 
-The built-in set places `trex.fkj` and `car.fkj` on the square. They are
-in the repository, in `assets/models/` (credits in `assets/README.md`).
+The built-in set places the T-rex (`trex_highres.fkj`, or `trex.fkj` when
+the plan says so or the high-resolution file is missing) and `car.fkj` on
+the ground plane. They are in the repository, in `assets/models/`, stored
+with Git LFS (credits in `assets/README.md`); clone with Git LFS
+installed.
 Models are looked for in `$FKJENSEN_ASSETS`, then `assets/models/` and
 `assets/local/` in the current folder, in the source tree the program was
 built from, and beside the program. `assets/local/` is ignored by git, for
@@ -216,6 +227,11 @@ Measured on 21/10/2026 (2 cores of a Xeon at 2.1 GHz):
 |---|---|---|---|---|---|
 | T-rex | glTF, one 4096 x 4096 texture | 28,152 | 770 | 53.4 MB | 2.1 s |
 | car | FBX, 17 textures up to 1024 x 1024 | 17,243 | 575 | 37.6 MB | 1.0 s |
+| T-rex, high resolution | OBJ (639 MB, 5.4 M quads), the glTF's texture | 10,810,368 | 268,130 | 116.4 MB | 16.3 s |
+
+The high-resolution file is 304 MB: 188 MB of geometry and 116 MB of tiles.
+About half its clusters need no tiles, since most of its triangles cover
+under two texels.
 
 Decoded at full size, without mips, those textures alone are 71 MB of RGB.
 A 1280 x 720 frame of the wide view read 4.1 MB of tiles; one filling the
@@ -302,9 +318,9 @@ Headless, for tests and screenshots (no window, no display needed):
 
     cargo run --release -- --png out.png --size 1920x1080
     cargo run --release -- --png out.png --close
-    cargo run --release -- --png out.png --view lights --light -0.2,1.1,0.22,2000000
+    cargo run --release -- --png out.png --view lights --light -10,8,10,2000000
     cargo run --release -- --png out.png --sky 0 --exposure 0.02
-    cargo run --release -- --png out.png --sky 0 --exposure 0.01 --look -6,1.6,-25,0,2.2,-40 --light 1,6,-35,30000
+    cargo run --release -- --png out.png --look 3,4.5,9,0,4,0
 
 - `--light x,y,z[,lumens]` replaces the scene's lights (800 lm when no
   lumens are given); repeatable. Positions in metres.
@@ -316,12 +332,15 @@ Headless, for tests and screenshots (no window, no display needed):
 - `--no-bounce` turns bounce light off.
 - `--close` starts on the close framing.
 - `--look ex,ey,ez,tx,ty,tz` puts the camera at e looking at t, in metres.
-- `--no-chess` leaves the chess set out of the built-in set (about 90 K
-  triangles instead of 1.5 M), for machines with little memory.
+- `--no-highres` uses the 28 K-triangle T-rex instead of the 10.8 M one,
+  for machines with little memory.
 - `--shadow-res N` sets the shadow map texels per cube face edge (512).
 - After `--png`, the peak memory of the run is printed (Linux).
 
-Peak memory of a 320 x 180 `--png` render on x86-64, 20/10/2026:
+Peak memory of a 320 x 180 `--png` render on x86-64, 20/10/2026, with the
+earlier set (chess table and café; `--no-chess` left the chess set out).
+With the T-rex and the car, 1280 x 720, everything on: 2,523 MB
+(21/10/2026).
 
 | | peak memory |
 |---|---|
@@ -378,7 +397,7 @@ where it lands. A disc goes dim when it is behind geometry. Clicking a disc
 selects the light and starts dragging it; clicking anywhere else orbits. A
 rig holds 64 lights at most.
 
-![Dragging the table lamp from left to right: the shadows follow](docs/light_drag.png)
+![Dragging a lamp on the earlier set (20/10/2026): the shadows follow](docs/light_drag.png)
 
 ## How a frame is made
 
@@ -414,15 +433,34 @@ rig holds 64 lights at most.
    frame are resolved again; the rest of the picture is kept.
 
 `src/scene.rs` holds the scene and builds clusters. `src/fkj.rs` reads
-and writes `.fkj`. `src/world.rs` makes the table, square, café, valley and
-mountains. `src/lights.rs` is the light rig and the picking and dragging
+and writes `.fkj`. `src/world.rs` makes the ground plane, valley and mountains,
+and the set's lights. `src/lights.rs` is the light rig and the picking and dragging
 maths. `src/shadow.rs` and `src/bounce.rs` are the shadow maps and the
 bounce light. `src/texture.rs` is the texture tiles and their cache;
 `tools/fkj-import` is the model converter, a separate crate.
 
 ## Measured
 
-On the machine this was written on (2 cores of an Intel Xeon at 2.1 GHz,
+With the T-rex and the car (10,925,731 triangles, 271,903 clusters, 3
+lights, 561,573 surfels), 1280 x 720, 2 cores of an Intel Xeon at 2.1 GHz,
+21/10/2026, one run:
+
+| | first frame, wide view | dragging the key light, steps 1 to 5 |
+|---|---|---|
+| shadow maps | 2,135 ms (3 maps, 32.6 M triangles) | 679 to 831 ms (1 map, 10.9 M triangles) |
+| lighting the surfels | 665 ms | 87 to 107 ms (498 K surfels) |
+| bounce gather | 7.50 s (20,433 receivers) | 47 to 51 ms (32 receivers; 20,306 waiting) |
+| visibility | 2.01 s | kept |
+| shading | 1,379 ms (3.7 M points) | 892 to 960 ms (2.7 M points in 20,338 clusters) |
+| resolve | 106 ms | 58 to 67 ms |
+| total | 13.8 s | 1.77 to 1.95 s |
+
+A drag frame is now dominated by the key light's shadow map holding all
+10.9 M triangles of the T-rex, and by re-shading what its 920 m reach
+covers, which is everything but the mountains.
+
+The tables below are the earlier set (chess table and café), kept for
+comparison. On the machine this was written on (2 cores of an Intel Xeon at 2.1 GHz,
 shared, no SIMD, 20/10/2026), the built-in set (1,521,804 triangles, 26,456
 clusters, 17 lights with shadow maps, 153,753 surfels), 1280 x 720, two runs
 each. These tables are without the T-rex and the car; with the
@@ -468,7 +506,7 @@ Light reach, first frame of the wide view without bounce, on and off:
 | light evaluations | 3,991,073 | 37,537,156 |
 | shading | 338 ms | 2,047 ms |
 
-Where a drag frame goes: re-drawing the lamp's shadow map, which holds the
+Where a drag frame went: re-drawing the lamp's shadow map, which held the
 whole chess set, and re-shading every point in the lamp's reach with all
 the lights that reach it, not just the one that moved.
 
@@ -489,29 +527,27 @@ Not measured yet: a Raspberry Pi.
 - The sky is not occluded.
 - A moved light re-shades its points with every light in reach; keeping
   each light's share apart would let it redo only its own.
-- Shadow maps are drawn at full detail: a lamp over the chess set draws
-  all 1.4 M of its triangles every time it moves.
+- Shadow maps are drawn at full detail: the key light draws all 10.9 M
+  triangles of the T-rex every time it moves.
 - Adaptive refinement (sparse samples where the picture is smooth) and
   front-to-back early stopping: not started.
 - SIMD: the inner loops are scalar.
 - Vertex splatting and cluster level of detail.
 - Texture tiles: base colour only (no normal or roughness maps); bounce
-  light on a textured surface is coloured by its vertex colours; no tiles
-  for the chess set yet; the importer does not read USD or ASCII FBX, and
+  light on a textured surface is coloured by its vertex colours; the importer does not read USD or ASCII FBX, and
   reads FBX transforms without pivots or offsets.
 - Points, curves and volumes in `.fkj` (tags reserved).
 - Materials: albedo only, per vertex or from texture tiles.
 - Light reach is per cluster and per point, not per pixel.
 - The shading cache holds 142 to 178 MB for the views above and is not
-  capped or evicted yet. With the chess set the program needs at least
-  341 MB: geometry is decoded to f32 at load and every visible triangle
+  capped or evicted yet. With the high-resolution T-rex the program needs
+  about 2.5 GB, and with the low-resolution one it still does not fit: geometry is decoded to f32 at load and every visible triangle
   gets a setup record each frame, so it does not fit a 256 MB Raspberry
   Pi 1. Quantised geometry in memory, cluster level of detail and
   per-bucket setup are what it needs.
 - Shading points are not shared between neighbouring triangles above
   level 0, so edges are shaded twice.
-- The converter that baked the chess set from USD is not in the
-  repository, and `tools/fkj-import` does not read USD (`docs/format.md`).
+- `tools/fkj-import` does not read USD (`docs/format.md`).
 - Light rigs and the sky setting are not saved.
 - Text overlay: the numbers are in the window title.
 - Framebuffer output: no vsync and no double buffering, so a frame can
@@ -522,5 +558,5 @@ Not measured yet: a Raspberry Pi.
 - The plan's rules are calibrated on one machine; the Raspberry Pi figures
   come from one run.
 
-Credit: FkJensen was created by Simon Legrand. The chess set is CC BY 4.0;
-see `assets/README.md`.
+Credit: FkJensen was created by Simon Legrand. Model credits are in
+`assets/README.md`.

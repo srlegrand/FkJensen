@@ -2,8 +2,8 @@
 //! rasterised on the cores and copied to the window through shared memory.
 //!
 //! Usage:
-//!   fkjensen                           open the built-in set: chess table,
-//!                                      shopfront, mountains
+//!   fkjensen                           open the built-in set: the T-rex and
+//!                                      the car on a ground plane, mountains
 //!   fkjensen scene.fkj                 open an .fkj scene
 //!   fkjensen --png out.png             render one frame to a file, no window
 //!   fkjensen --size 1920x1080 --png out.png
@@ -20,8 +20,8 @@
 //!   fkjensen --fb                      draw to /dev/fb0 even when a display server is running (Linux)
 //!   fkjensen --no-auto                 do not measure the machine; use the fixed defaults
 //!   fkjensen --scale F                 render the window at F of its size (0.0625 to 1)
-//!   fkjensen --chess / --shadows / --bounce   force on what the machine's plan left off
-//!   fkjensen --no-chess                the built-in set without the chess set
+//!   fkjensen --highres / --shadows / --bounce   force on what the machine's plan left off
+//!   fkjensen --no-highres              the low-resolution T-rex (28 K triangles, not 10.8 M)
 //!   fkjensen --shadow-res N            shadow map texels per cube face edge (512)
 //!   fkjensen --png out.png --bench-drag  then move the first light five times, timing each frame
 //!
@@ -66,9 +66,6 @@ use scene::{PointLight, Scene};
 /// to show.
 const DEFAULT_SKY_LUX: f32 = 30.0;
 
-/// The chess set, baked into the binary. See docs/format.md and
-/// assets/README.md.
-const CHESS_SET: &[u8] = include_bytes!("../assets/chess_set.fkj");
 
 const CONTROLS: &str = "\
 Controls
@@ -603,14 +600,14 @@ fn default_rig(scene: &Scene) -> Vec<PointLight> {
 }
 
 /// Frame the subject from the front. Close: from above, filling the view.
-/// Wide: from nine times its radius away, at eye level, so what is behind
-/// the subject is in the picture (for the built-in set, the shop and the
-/// mountains behind the chess table).
+/// Wide: from about three times its radius away, at eye level, so what is
+/// behind the subject is in the picture (for the built-in set, the
+/// mountains behind the T-rex and the car).
 fn frame_camera(cam: &mut OrbitCamera, scene: &Scene, wide: bool) {
     cam.frame(scene.focus_centre(), scene.focus_radius());
     cam.yaw = 0.0;
     if wide {
-        cam.distance = scene.focus_radius() * 9.0;
+        cam.distance = scene.focus_radius() * 2.2;
         cam.pitch = 0.07;
     } else {
         cam.pitch = 0.45;
@@ -621,38 +618,21 @@ fn format_metres(m: f32) -> String {
     if m >= 1000.0 { format!("{:.1} km", m / 1000.0) } else if m >= 10.0 { format!("{m:.0} m") } else { format!("{m:.2} m") }
 }
 
-/// The built-in set: the chess set from `assets/chess_set.fkj` on the
-/// table, in the procedural square with the shop and the mountains.
+/// The built-in set as the tests use it: the ground, the mountains and the
+/// set's lights, with the models only if present.
 #[cfg(test)]
 fn built_in() -> Result<Scene, String> {
-    built_in_with(true)
+    built_in_with(false)
 }
 
-/// The built-in set, with or without the chess set (1.4 M triangles; the
-/// set without it is about 90 K, for machines with little memory).
-fn built_in_with(with_chess: bool) -> Result<Scene, String> {
-    if !with_chess {
-        let mut scene = world::build();
-        let shop_lights = std::mem::take(&mut scene.lights);
-        scene.lights = world::table_lights();
-        scene.lights.extend(shop_lights);
-        add_models(&mut scene);
-        eprintln!("built-in set without the chess set: {} triangles, {} clusters, {} lights", scene.triangle_count(), scene.clusters.len(), scene.lights.len());
-        return Ok(scene);
-    }
-    let mut chess = load_bytes(CHESS_SET, "built-in chess set")?;
-    // Board centred on the table, resting on its top.
-    let c = chess.centre();
-    chess.translate(Vec3::new(-c.x, world::TABLE_TOP - chess.bounds_min.y, -c.z));
-    let (chess_lo, chess_hi) = (chess.bounds_min, chess.bounds_max);
+/// The built-in set: the ground plane and the mountains, the T-rex
+/// (high-resolution when `highres`) and the car, and their lights.
+fn built_in_with(highres: bool) -> Result<Scene, String> {
     let mut scene = world::build();
-    let shop_lights = std::mem::take(&mut scene.lights);
-    scene.append(chess);
-    add_models(&mut scene);
-    scene.lights = world::table_lights();
-    scene.lights.extend(shop_lights);
-    // The subject is the board and its pieces, with a margin.
-    scene.focus = Some((Vec3::new(chess_lo.x - 0.05, world::TABLE_TOP - 0.05, chess_lo.z - 0.05), Vec3::new(chess_hi.x + 0.05, chess_hi.y, chess_hi.z + 0.05)));
+    if let Some((lo, hi)) = add_models(&mut scene, highres) {
+        scene.focus = Some((lo, hi));
+    }
+    scene.lights = world::set_lights();
     eprintln!(
         "built-in set: {} triangles, {} clusters, {} lights, {:.1} km across",
         scene.triangle_count(),
@@ -718,23 +698,6 @@ impl ApplicationHandler for App {
     }
 }
 
-fn load_bytes(bytes: &[u8], name: &str) -> Result<Scene, String> {
-    let t = Instant::now();
-    let (scene, report) = fkj::read(bytes).map_err(|e| format!("{name}: {e}"))?;
-    eprintln!(
-        "{name}: read in {:.2} s: {} triangles, {} vertices, {} clusters, {} lights",
-        t.elapsed().as_secs_f64(),
-        scene.triangle_count(),
-        scene.positions.len(),
-        scene.clusters.len(),
-        scene.lights.len()
-    );
-    for tag in &report.skipped {
-        eprintln!("  skipped a {tag} section: not read by this build yet");
-    }
-    Ok(scene)
-}
-
 /// Read an .fkj file. Its texture tiles stay in the file and are streamed.
 fn load_file(path: &Path) -> Result<Scene, String> {
     let t = Instant::now();
@@ -756,11 +719,14 @@ fn load_file(path: &Path) -> Result<Scene, String> {
     Ok(scene)
 }
 
-/// Models placed in the built-in set when their .fkj files are found in
-/// the assets folder: file, position on the square (metres), turn about the
-/// vertical (degrees). They are made with tools/fkj-import and kept out of
-/// the repository.
-const SET_MODELS: [(&str, Vec3, f32); 2] = [("trex.fkj", Vec3::new(-8.0, 0.0, -21.0), 30.0), ("car.fkj", Vec3::new(4.5, 0.0, -9.0), -35.0)];
+/// Models placed in the built-in set: files (the high-resolution one first,
+/// used when the machine's plan allows), position on the ground (metres),
+/// turn about the vertical (degrees). Made with tools/fkj-import, in
+/// assets/models.
+const SET_MODELS: [(&str, Option<&str>, Vec3, f32); 2] = [
+    ("trex.fkj", Some("trex_highres.fkj"), world::TREX_AT, world::TREX_YAW),
+    ("car.fkj", None, world::CAR_AT, world::CAR_YAW),
+];
 
 /// Where models are looked for: $FKJENSEN_ASSETS; then assets/models (in
 /// the repository) and assets/local (kept out of it), each in the current
@@ -782,19 +748,32 @@ fn assets_dirs() -> Vec<PathBuf> {
     d
 }
 
-/// Add the set's models that are present.
-fn add_models(scene: &mut Scene) {
+/// Add the set's models that are present, and return their bounds.
+fn add_models(scene: &mut Scene, highres: bool) -> Option<(Vec3, Vec3)> {
     let dirs = assets_dirs();
-    for (file, at, yaw) in SET_MODELS {
-        let Some(path) = dirs.iter().map(|d| d.join(file)).find(|p| p.exists()) else { continue };
+    let find = |f: &str| dirs.iter().map(|d| d.join(f)).find(|p| p.exists());
+    let mut bounds: Option<(Vec3, Vec3)> = None;
+    for (file, high, at, yaw) in SET_MODELS {
+        let path = high.filter(|_| highres).and_then(find).or_else(|| find(file));
+        let Some(path) = path else {
+            eprintln!("{file} not found in {}", dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", "));
+            continue;
+        };
         match load_file(&path) {
             Ok(mut m) => {
                 m.place(yaw.to_radians(), 1.0, at);
+                let (lo, hi) = (m.bounds_min, m.bounds_max);
+                bounds = Some(match bounds {
+                    Some((a, b)) => (a.min(lo), b.max(hi)),
+                    None => (lo, hi),
+                });
+                eprintln!("{}: {} triangles", path.display(), m.triangle_count());
                 scene.append(m);
             }
             Err(e) => eprintln!("{e}"),
         }
     }
+    bounds
 }
 
 fn save_png(frame: &Frame, path: &str) -> Result<(), String> {
@@ -847,7 +826,7 @@ fn main() {
     let mut bench_drag = false;
     let mut use_fb = false;
     let mut look: Option<(Vec3, Vec3)> = None;
-    let mut chess: Option<bool> = None;
+    let mut highres: Option<bool> = None;
     let mut shadow_res: Option<usize> = None;
     let mut visual_debug = false;
     let mut debug_view: Option<String> = None;
@@ -917,8 +896,8 @@ fn main() {
                 i += 1;
                 select = args.get(i).and_then(|v| v.parse::<usize>().ok()).map(|n| n.saturating_sub(1));
             }
-            "--no-chess" => chess = Some(false),
-            "--chess" => chess = Some(true),
+            "--no-highres" => highres = Some(false),
+            "--highres" => highres = Some(true),
             "--shadow-res" => {
                 shadow_res = args.get(i + 1).and_then(|s| s.parse().ok());
                 if shadow_res.is_none() {
@@ -940,7 +919,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]chess] [--shadow-res N] [--scale F] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -964,7 +943,7 @@ fn main() {
     } else {
         None
     };
-    let with_chess = chess.or(plan.as_ref().map(|p| p.with_chess)).unwrap_or(true);
+    let highres = highres.or(plan.as_ref().map(|p| p.highres)).unwrap_or(true);
 
     let (mut scene, name) = match &path {
         Some(p) => match load_file(p) {
@@ -974,8 +953,8 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        None => match built_in_with(with_chess) {
-            Ok(s) => (s, "chess table, shop, mountains".into()),
+        None => match built_in_with(highres) {
+            Ok(s) => (s, "T-rex, car, mountains".into()),
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(1);
@@ -1258,18 +1237,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn built_in_chess_set_decodes() {
-        let (scene, report) = fkj::read(CHESS_SET).unwrap();
-        assert!(report.skipped.is_empty());
-        assert!(scene.triangle_count() > 500_000, "{}", scene.triangle_count());
-        assert!(scene.lights.is_empty(), "the chess file holds geometry only");
-        assert!(scene.radius() > 0.1 && scene.radius() < 1.0, "the set is about half a metre across");
-        for c in &scene.clusters {
-            assert!(c.vertex_count as usize <= scene::CLUSTER_VERTS && c.tri_count as usize <= scene::CLUSTER_TRIS);
-        }
-    }
-
-    #[test]
     fn light_argument_parses() {
         assert_eq!(parse_light("1,2,3").unwrap().position, Vec3::new(1.0, 2.0, 3.0));
         assert_eq!(parse_light("1, 2, 3, 500").unwrap().lumens, 500.0);
@@ -1279,16 +1246,14 @@ mod tests {
     }
 
     #[test]
-    fn chess_set_stands_on_the_table() {
+    fn the_set_has_its_lights_and_ground() {
         let scene = built_in().unwrap();
-        let (lo, hi) = scene.focus_bounds();
-        assert!(hi.y > world::TABLE_TOP + 0.05, "pieces above the table top");
-        assert!(lo.y < world::TABLE_TOP && lo.y > world::TABLE_TOP - 0.1);
-        assert_eq!(scene.lights.len(), 2 + 15);
+        assert_eq!(scene.lights.len(), 3);
+        assert!(scene.triangle_count() > 10_000);
     }
 
-    /// The point of light reach: whatever the lights at the table and the
-    /// shop do, up to the brightest light allowed, none of them is ever
+    /// The point of light reach: whatever the set's lights do, up to the
+    /// brightest light allowed, none of them is ever
     /// evaluated on the mountains, at the default sky and exposure.
     #[test]
     fn no_light_reaches_the_mountains() {
@@ -1309,28 +1274,6 @@ mod tests {
             }
         }
         assert!(mountain_clusters > 200, "{mountain_clusters}");
-    }
-
-    /// The table lamps at their default strength do not reach the shop,
-    /// and the shop's lights do not reach the table, while the street lamp
-    /// (12,000 lm) reaches both.
-    #[test]
-    fn table_and_shop_lights_stay_where_they_are() {
-        let scene = built_in().unwrap();
-        let sky = Sky { lux: DEFAULT_SKY_LUX, on: true };
-        let cut = raster::cut_lux(&sky, raster::default_exposure(sky.lux));
-        let table = Vec3::new(0.0, world::TABLE_TOP, 0.0);
-        let shop = Vec3::new(0.0, 2.0, world::SHOP_FRONT_Z);
-        for (i, l) in scene.lights.iter().enumerate() {
-            let r = raster::light_reach(l, cut);
-            if i < 2 {
-                assert!(l.position.distance(shop) > r, "table light {i} reaches the shop: {r} m");
-            } else if l.lumens < 1000.0 {
-                assert!(l.position.distance(table) > r, "shop light {i} reaches the table: {r} m");
-            } else {
-                assert!(l.position.distance(table) < r && l.position.distance(shop) < r);
-            }
-        }
     }
 
     /// Rendering the whole set with and without light reach: the picture
@@ -1354,13 +1297,12 @@ mod tests {
             }
         }
         assert!(worst <= 1, "worst channel difference {worst}");
-        // The shop is lit by its own fifteen lights, so its pixels still
-        // evaluate most of them; the table, square, valley and mountains do not.
-        assert!(a.stats.light_evals * 2 < b.stats.light_evals, "{} vs {}", a.stats.light_evals, b.stats.light_evals);
+        // The valley and the mountains evaluate none of the lights.
+        assert!(a.stats.light_evals < b.stats.light_evals, "{} vs {}", a.stats.light_evals, b.stats.light_evals);
     }
 
-    /// A table lamp turned up to the brightest light allowed changes the
-    /// bounce light on the table and the square, and not on the mountains:
+    /// A light turned up to the brightest allowed changes the bounce light
+    /// on the ground near it, and not on the mountains:
     /// their bounce light is not gathered again.
     #[test]
     fn bounce_changes_stay_local() {
@@ -1396,7 +1338,7 @@ mod tests {
     #[test]
     fn framebuffer_loop_draws_and_drags() {
         let mut scene = world::build();
-        scene.lights = world::table_lights();
+        scene.lights = world::small_lights();
         let mut app = App::new(scene, "test".into());
         app.settings = RenderSettings { shadows: false, bounce: false, ..RenderSettings::new(Sky { lux: DEFAULT_SKY_LUX, on: true }) };
         let (w, h) = (192usize, 108usize);

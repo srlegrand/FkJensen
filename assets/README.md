@@ -9,6 +9,13 @@ stated in the glTF file's metadata. Changes made here: converted to `.fkj`
 with `tools/fkj-import`, scaled to 12.3 m long, base colour baked to
 per-triangle texture tiles, other maps dropped.
 
+## models/trex_highres.fkj
+
+The same Tyrannosaurus rex as `trex.fkj`, as a ZBrush 2022 sculpt exported
+to OBJ (5.4 M quads, 10.8 M triangles), supplied by Simon Legrand, with the
+glTF model's base colour texture. Converted with `tools/fkj-import`, scaled
+to 12.3 m long.
+
 ## models/car.fkj
 
 A Ford Explorer in "Jurassic Park" (1993) livery, from an FBX with its
@@ -18,6 +25,9 @@ Changes made here: converted to `.fkj` with `tools/fkj-import`, scaled to
 dropped.
 
 ## chess_set.fkj
+
+No longer in the built-in set (21/10/2026); open it with
+`fkjensen assets/chess_set.fkj`.
 
 The Open Chess Set, converted to FkJensen's `.fkj` format (see
 `docs/format.md` for what the conversion kept and dropped).

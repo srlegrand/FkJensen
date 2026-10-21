@@ -153,8 +153,16 @@ The sky is not stored in the file; it is a viewer setting.
 
 ## The built-in scene
 
-`assets/chess_set.fkj` is compiled into the program and opens when no file
-is given. It was baked on 19/10/2026, and again on 20/10/2026, from the USD Working Group's
+The built-in set (21/10/2026) is the procedural ground plane, valley and
+mountains of `src/world.rs`, made directly into clusters, with
+`assets/models/trex_highres.fkj` (or `trex.fkj`) and `car.fkj` placed on
+it. The models are made with `tools/fkj-import` (below).
+
+## The chess set
+
+`assets/chess_set.fkj` was the subject of the built-in set until
+21/10/2026; it stays in the repository and opens with
+`fkjensen assets/chess_set.fkj`. It was baked on 19/10/2026, and again on 20/10/2026, from the USD Working Group's
 Open Chess Set (`full_assets/OpenChessSet/chess_set.usda` at
 https://github.com/usd-wg/assets), by a converter that is not part of this
 repository:
@@ -175,19 +183,19 @@ repository:
 
 Stored: 799,384 triangles, 815,974 vertices, 14,252 clusters, 14.7 MB.
 Loaded, with the pawn instances: 1,430,784 triangles, 1,355,968 vertices,
-23,520 clusters. At start-up it is placed on the table of the procedural
-set in `src/world.rs` (shopfront, square, valley, mountains), which is made
-directly into clusters and is not stored as a file.
+23,520 clusters.
 
 ## Converting models
 
-`tools/fkj-import` converts glTF (.glb, .gltf) and binary FBX models to
+`tools/fkj-import` converts glTF (.glb, .gltf), binary FBX and OBJ models to
 `.fkj`, with their base colour textures baked to tiles. A triangle's finest
 level is the coarser of as many points as the source texture has texels
 over it, and points no closer than `--texel` metres (2 mm by default); a
 cluster stores the finest level any of its triangles needs. Each level is
-filtered from the source's mip chain at its own point spacing. Normal,
-roughness and other maps are not read.
+filtered from the source's mip chain at its own point spacing. A triangle
+over two texels or fewer needs no tiles: its vertex colours hold them.
+Normal, roughness and other maps are not read. An OBJ's materials are not
+read; `--texture` gives its base colour.
 
 ## Not done yet
 

@@ -4,7 +4,7 @@
 //! cores, SIMD features, cache sizes, memory) and measures what it does not
 //! report: memory read bandwidth, and how many shading points per second the
 //! cores actually manage. From those it chooses its own resolution, whether
-//! to load the chess set, shadow map size, bounce light and bucket size.
+//! whether to load the high-resolution T-rex, shadow map size, bounce light and bucket size.
 //! Every choice can be overridden from the command line.
 //!
 //! The rates are measured, not guessed from the model name: a Raspberry Pi 1
@@ -58,7 +58,7 @@ pub struct Plan {
     pub pixel_budget: f64,
     /// Size of a `--png` render when `--size` is not given.
     pub png_size: (usize, usize),
-    pub with_chess: bool,
+    pub highres: bool,
     pub shadows: bool,
     pub shadow_res: usize,
     pub bounce: bool,
@@ -91,15 +91,17 @@ const INTERACTIVE_S: f64 = 0.15;
 const STILL_S: f64 = 2.0;
 /// Largest automatic `--png` size.
 const PNG_MAX: (usize, usize) = (1280, 720);
-/// Memory the built-in set needs with the chess set, all features on, at
-/// 1280 x 720 (measured peak 473 MB on x86-64, 20/10/2026), with margin.
-const CHESS_MEMORY: u64 = 600 << 20;
+/// Memory the built-in set needs with the high-resolution T-rex, all
+/// features on, at 1280 x 720 (measured peak 2,523 MB on x86-64,
+/// 21/10/2026), with margin.
+const HIGHRES_MEMORY: u64 = 3200 << 20;
 /// Bytes read and written per triangle each time visibility runs: vertex
-/// positions and the setup record. The chess set has 1.43 M triangles.
-const CHESS_TRIANGLES: f64 = 1.43e6;
+/// positions and the setup record. The high-resolution T-rex has 10.8 M
+/// triangles.
+const HIGHRES_TRIANGLES: f64 = 10.8e6;
 const BYTES_PER_TRIANGLE: f64 = 100.0;
-/// Longest the chess set's per-frame memory traffic may take.
-const CHESS_TRAFFIC_S: f64 = 0.25;
+/// Longest the high-resolution T-rex's per-frame memory traffic may take.
+const HIGHRES_TRAFFIC_S: f64 = 0.25;
 /// Benchmark rate below which bounce light is left off: an eighth of the
 /// reference machine, where the first gather of the built-in set takes
 /// 1.6 s (so about 13 s here).
@@ -293,18 +295,18 @@ impl Hardware {
         let png_size = (w, w * 9 / 16);
         reasons.push(format!("--png without --size renders {}x{} (about {} s of shading)", png_size.0, png_size.1, STILL_S as u32));
 
-        // The chess set: memory, and memory traffic per frame.
-        let traffic_s = CHESS_TRIANGLES * BYTES_PER_TRIANGLE / (self.bandwidth_all.max(0.01) * 1e9);
-        let mem_ok = self.mem_available.is_none_or(|m| m >= CHESS_MEMORY);
-        let with_chess = mem_ok && traffic_s <= CHESS_TRAFFIC_S;
-        reasons.push(match (mem_ok, traffic_s <= CHESS_TRAFFIC_S) {
+        // The high-resolution T-rex: memory, and memory traffic per frame.
+        let traffic_s = HIGHRES_TRIANGLES * BYTES_PER_TRIANGLE / (self.bandwidth_all.max(0.01) * 1e9);
+        let mem_ok = self.mem_available.is_none_or(|m| m >= HIGHRES_MEMORY);
+        let highres = mem_ok && traffic_s <= HIGHRES_TRAFFIC_S;
+        reasons.push(match (mem_ok, traffic_s <= HIGHRES_TRAFFIC_S) {
             (true, true) => format!(
-                "chess set loaded: {} available, its triangles take {:.0} ms of memory traffic per frame",
+                "high-resolution T-rex: {} available, its triangles take {:.0} ms of memory traffic per frame",
                 self.mem_available.map(|m| format!("{} MB", m >> 20)).unwrap_or("memory size unknown, assumed".into()),
                 traffic_s * 1000.0
             ),
-            (false, _) => format!("chess set left out: {} MB available, it needs about {} MB", self.mem_available.unwrap_or(0) >> 20, CHESS_MEMORY >> 20),
-            (true, false) => format!("chess set left out: its triangles would take {:.0} ms of memory traffic per frame at {:.2} GB/s", traffic_s * 1000.0, self.bandwidth_all),
+            (false, _) => format!("low-resolution T-rex: {} MB available, the high-resolution one needs about {} MB", self.mem_available.unwrap_or(0) >> 20, HIGHRES_MEMORY >> 20),
+            (true, false) => format!("low-resolution T-rex: the high-resolution one would take {:.0} ms of memory traffic per frame at {:.2} GB/s", traffic_s * 1000.0, self.bandwidth_all),
         });
 
         // Shadow maps: as fine as the speed allows, within a share of memory.
@@ -348,7 +350,7 @@ impl Hardware {
         let texture_cache = (self.mem_available.unwrap_or(2 << 30) / 8).clamp(8 << 20, 1 << 30) as usize;
         reasons.push(format!("texture tile cache up to {} MB", texture_cache >> 20));
 
-        Plan { texture_cache, render_scale, pixel_budget, png_size, with_chess, shadows, shadow_res, bounce, bounce_budget_ms, tile, reasons }
+        Plan { texture_cache, render_scale, pixel_budget, png_size, highres, shadows, shadow_res, bounce, bounce_budget_ms, tile, reasons }
     }
 
     pub fn report(&self) -> String {
@@ -427,7 +429,7 @@ mod tests {
     #[test]
     fn a_pi_one_gets_a_small_light_plan() {
         let p = machine(160e3, 59, 0.3, 128).plan();
-        assert!(!p.with_chess);
+        assert!(!p.highres);
         assert!(!p.bounce);
         assert_eq!(p.render_scale, 0.125);
         assert!(p.png_size.0 <= 320, "{:?}", p.png_size);
@@ -438,7 +440,7 @@ mod tests {
     #[test]
     fn a_desktop_gets_everything() {
         let p = machine(17e6, 8000, 8.0, 1024).plan();
-        assert!(p.with_chess && p.bounce && p.shadows);
+        assert!(p.highres && p.bounce && p.shadows);
         assert_eq!(p.shadow_res, 512);
         assert_eq!(p.png_size, PNG_MAX);
         assert!(p.render_scale >= 0.5);

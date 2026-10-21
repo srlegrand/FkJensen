@@ -1,9 +1,10 @@
-//! fkj-import: turn a glTF (.glb, .gltf) or binary FBX model into an .fkj
+//! fkj-import: turn a glTF (.glb, .gltf), binary FBX or OBJ model into an .fkj
 //! scene for FkJensen, with its textures baked into per-triangle tiles.
 //!
 //! Usage:
 //!   fkj-import model.glb -o model.fkj --length 12.3
 //!   fkj-import car.fbx -o car.fkj --length 4.8 --textures path/to/textures
+//!   fkj-import sculpt.obj -o sculpt.fkj --length 12.3 --texture colour.png
 //!
 //! The model is set on the ground (lowest point at y = 0), centred on x and
 //! z, Y up, in metres: `--length` scales its longest horizontal side to that
@@ -27,6 +28,7 @@ mod texture;
 
 mod fbx;
 mod gltf_in;
+mod obj;
 mod model;
 
 use std::path::PathBuf;
@@ -61,15 +63,20 @@ fn texel_area(m: &Model, t: usize) -> Option<(f32, &model::Texture)> {
     Some((((b - a).perp_dot(c - a)).abs() * 0.5, tex))
 }
 
-/// The finest tile level a source triangle needs (0: untextured).
+/// The finest tile level a source triangle needs (0: vertex colours are
+/// enough, or untextured).
 fn wanted_level(m: &Model, t: usize, o: &Options) -> u8 {
     let Some((area, _)) = texel_area(m, t) else { return 0 };
+    // Two texels or fewer: the three vertex colours hold them.
+    if area <= 2.0 {
+        return 0;
+    }
     // Points at level L are about (2^L)^2 / 2: as many as the texels.
-    let l_src = (2.0 * area.max(0.5)).sqrt().log2().ceil();
+    let l_src = (2.0 * area).sqrt().log2().ceil();
     let [a, b, c] = m.tris[t].map(|i| m.positions[i as usize]);
     let edge = (a - b).length().max((b - c).length()).max((c - a).length());
     let l_world = (edge / o.texel).max(1.0).log2().floor();
-    (l_src.min(l_world).max(1.0) as u8).min(o.max_level)
+    (l_src.min(l_world).max(0.0) as u8).min(o.max_level)
 }
 
 /// Linear colour of source triangle `t` at barycentric (b1, b2), filtered
@@ -186,6 +193,7 @@ fn main() {
     let mut rotate_x = 0.0;
     let mut rotate_y = 0.0;
     let mut tex_dirs = Vec::new();
+    let mut texture: Option<PathBuf> = None;
     let mut opts = Options { texel: 0.002, max_level: MAX_LEVEL };
     let mut i = 0;
     let num = |a: Option<&String>, what: &str| -> f32 {
@@ -224,6 +232,10 @@ fn main() {
                 opts.max_level = (num(args.get(i + 1), "--max-level") as u8).clamp(1, MAX_LEVEL);
                 i += 1;
             }
+            "--texture" => {
+                texture = args.get(i + 1).map(PathBuf::from);
+                i += 1;
+            }
             "--textures" => {
                 if let Some(d) = args.get(i + 1) {
                     tex_dirs.push(PathBuf::from(d));
@@ -231,7 +243,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkj-import model.(glb|gltf|fbx) -o out.fkj [--length M | --height M] [--rotate-x DEG] [--rotate-y DEG] [--texel M] [--max-level N] [--textures DIR]");
+                eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fkj [--length M | --height M] [--rotate-x DEG] [--rotate-y DEG] [--texel M] [--max-level N] [--textures DIR] [--texture FILE (OBJ)]");
                 return;
             }
             a => input = Some(PathBuf::from(a)),
@@ -239,7 +251,7 @@ fn main() {
         i += 1;
     }
     let Some(input) = input else {
-        eprintln!("usage: fkj-import model.(glb|gltf|fbx) -o out.fkj [--length M | --height M] ...");
+        eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fkj [--length M | --height M] ...");
         std::process::exit(2);
     };
     let out = out.unwrap_or_else(|| input.with_extension("fkj"));
@@ -248,7 +260,8 @@ fn main() {
     let model = match ext.as_str() {
         "glb" | "gltf" => gltf_in::load(&input),
         "fbx" => fbx::load(&input, &tex_dirs),
-        _ => Err(format!("{}: only .glb, .gltf and .fbx are read", input.display())),
+        "obj" => obj::load(&input, texture.as_deref()),
+        _ => Err(format!("{}: only .glb, .gltf, .fbx and .obj are read", input.display())),
     };
     let mut model = model.unwrap_or_else(|e| {
         eprintln!("{e}");
