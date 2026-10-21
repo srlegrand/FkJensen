@@ -16,6 +16,10 @@
 //!   fkjensen --look ex,ey,ez,tx,ty,tz  camera at e looking at t, in metres
 //!   fkjensen --no-shadows              point lights without shadow maps
 //!   fkjensen --no-bounce               no bounce light
+//!   fkjensen --hardware                print what this machine is and what FkJensen chooses for it
+//!   fkjensen --no-auto                 do not measure the machine; use the fixed defaults
+//!   fkjensen --scale F                 render the window at F of its size (0.0625 to 1)
+//!   fkjensen --chess / --shadows / --bounce   force on what the machine's plan left off
 //!   fkjensen --no-chess                the built-in set without the chess set
 //!   fkjensen --shadow-res N            shadow map texels per cube face edge (512)
 //!   fkjensen --png out.png --bench-drag  then move the first light five times, timing each frame
@@ -25,6 +29,7 @@
 mod bounce;
 mod camera;
 mod fkj;
+mod hardware;
 mod lights;
 mod raster;
 mod reyes;
@@ -38,6 +43,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use glam::Vec3;
+use rayon::prelude::*;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -76,6 +82,7 @@ Controls
   X                      light reach off / on (to compare cost and picture)
   M                      shadow maps on / off
   I                      bounce light on / off
+  Z / Shift+Z            render resolution finer / coarser (x1.25)
 
   Camera
   left drag              orbit                 middle drag / shift+left   pan
@@ -108,6 +115,9 @@ struct App {
     cam: OrbitCamera,
     rig: LightRig,
     settings: RenderSettings,
+    /// The frame is rendered at this fraction of the window's size and
+    /// scaled up when presented.
+    render_scale: f32,
     drag: Option<Drag>,
     /// Shading, visibility and shadow maps kept between frames.
     renderer: reyes::Renderer,
@@ -115,6 +125,8 @@ struct App {
     wide: bool,
     // input state
     mouse: (f32, f32),
+    /// The cursor in window pixels, for drag deltas.
+    raw_mouse: (f32, f32),
     last_mouse: (f32, f32),
     buttons: [bool; 3],
     shift: bool,
@@ -147,7 +159,9 @@ impl App {
             renderer: reyes::Renderer::new(),
             wide: true,
             mouse: (0.0, 0.0),
+            raw_mouse: (0.0, 0.0),
             last_mouse: (0.0, 0.0),
+            render_scale: 1.0,
             buttons: [false; 3],
             shift: false,
             ctrl: false,
@@ -181,6 +195,7 @@ impl App {
         let cam = self.render_camera();
         self.renderer.render(&self.scene, &cam, &self.rig.lights, &self.settings, &mut self.frame);
         if self.rig.show {
+            let k = self.render_scale.max(0.25);
             let floor = self.floor();
             for (i, l) in self.rig.lights.iter().enumerate() {
                 let sel = i == self.rig.selected;
@@ -190,22 +205,38 @@ impl App {
                     let foot = Vec3::new(l.position.x, floor, l.position.z);
                     let gold = Vec3::new(1.0, 0.9, 0.2) * 0.7;
                     raster::draw_line(&mut self.frame, &cam, l.position, foot, gold, true);
-                    raster::draw_disc(&mut self.frame, &cam, foot, 2.5, gold, false);
+                    raster::draw_disc(&mut self.frame, &cam, foot, 2.5 * k, gold, false);
                 }
                 let disc = (l.color / l.color.max_element()).min(Vec3::ONE);
-                raster::draw_disc(&mut self.frame, &cam, l.position, if sel { 7.0 } else { 4.0 }, disc, false);
+                raster::draw_disc(&mut self.frame, &cam, l.position, if sel { 7.0 } else { 4.0 } * k, disc, false);
                 if sel {
-                    raster::draw_disc(&mut self.frame, &cam, l.position, 11.0, Vec3::new(1.0, 0.9, 0.2), true);
+                    raster::draw_disc(&mut self.frame, &cam, l.position, 11.0 * k, Vec3::new(1.0, 0.9, 0.2), true);
                 }
             }
         }
     }
 
     fn present(&mut self) {
+        let Some(w) = &self.window else { return };
+        let size = w.inner_size();
+        let (ww, wh) = (size.width.max(1) as usize, size.height.max(1) as usize);
         let Some(surface) = self.surface.as_mut() else { return };
         let Ok(mut buf) = surface.buffer_mut() else { return };
-        let n = buf.len().min(self.frame.color.len());
-        buf[..n].copy_from_slice(&self.frame.color[..n]);
+        let (fw, fh) = (self.frame.width, self.frame.height);
+        if fw == ww && fh == wh {
+            let n = buf.len().min(self.frame.color.len());
+            buf[..n].copy_from_slice(&self.frame.color[..n]);
+        } else if buf.len() >= ww * wh {
+            // Scale the frame up to the window, nearest pixel.
+            let xs: Vec<usize> = (0..ww).map(|x| (x * fw / ww).min(fw - 1)).collect();
+            let src = &self.frame.color;
+            buf[..ww * wh].par_chunks_mut(ww).enumerate().for_each(|(y, row)| {
+                let sy = (y * fh / wh).min(fh - 1) * fw;
+                for (x, d) in row.iter_mut().enumerate() {
+                    *d = src[sy + xs[x]];
+                }
+            });
+        }
         let _ = buf.present();
     }
 
@@ -215,12 +246,14 @@ impl App {
         let Some(w) = &self.window else { return };
         let size = w.inner_size();
         let (pw, ph) = (size.width.max(1), size.height.max(1));
-        if pw as usize != self.frame.width || ph as usize != self.frame.height || !self.surface_sized {
+        let fw = ((pw as f32 * self.render_scale).round() as usize).max(1);
+        let fh = ((ph as f32 * self.render_scale).round() as usize).max(1);
+        if fw != self.frame.width || fh != self.frame.height || !self.surface_sized {
             if let Some(s) = self.surface.as_mut() {
                 let _ = s.resize(NonZeroU32::new(pw).unwrap(), NonZeroU32::new(ph).unwrap());
                 self.surface_sized = true;
             }
-            self.frame.resize(pw as usize, ph as usize);
+            self.frame.resize(fw, fh);
         }
     }
 
@@ -293,9 +326,12 @@ impl App {
         };
         let sky = if self.settings.sky.on { format!("sky {:.0} lux", self.settings.sky.lux) } else { "sky off".into() };
         w.set_title(&format!(
-            "FkJensen  {}  {:.0} fps  {light}  {sky}  {}  shaded {} of {} points  shadows {} ({:.0} ms)  bounce {}  setup {:.0} raster {:.0} shade {:.0} resolve {:.0} ms  CPU only",
+            "FkJensen  {}  {:.0} fps  {}x{} ({:.0}% of the window)  {light}  {sky}  {}  shaded {} of {} points  shadows {} ({:.0} ms)  bounce {}  setup {:.0} raster {:.0} shade {:.0} resolve {:.0} ms  CPU only",
             self.scene_name,
             self.title_fps,
+            self.frame.width,
+            self.frame.height,
+            self.render_scale * 100.0,
             if s.visibility_kept { "visibility kept" } else { "visibility new" },
             s.points_shaded,
             s.points_used,
@@ -407,6 +443,12 @@ impl App {
             KeyCode::KeyX => self.settings.light_reach = !self.settings.light_reach,
             KeyCode::KeyM => self.settings.shadows = !self.settings.shadows,
             KeyCode::KeyI => self.settings.bounce = !self.settings.bounce,
+            KeyCode::KeyZ => {
+                // Z: render at a finer resolution, Shift+Z: coarser.
+                let s = if self.shift { self.render_scale / 1.25 } else { self.render_scale * 1.25 };
+                self.render_scale = s.clamp(0.0625, 1.0);
+                self.surface_sized = false;
+            }
             KeyCode::KeyC => self.rig.cycle_colour(),
             KeyCode::KeyP => match save_png(&self.frame, "frame.png") {
                 Ok(()) => eprintln!("saved frame.png"),
@@ -513,11 +555,13 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.mouse = (position.x as f32, position.y as f32);
-                let dx = self.mouse.0 - self.last_mouse.0;
-                let dy = self.mouse.1 - self.last_mouse.1;
-                self.last_mouse = self.mouse;
-                let h = self.frame.height as f32;
+                self.raw_mouse = (position.x as f32, position.y as f32);
+                // Picking and dragging work in frame pixels.
+                self.mouse = (self.raw_mouse.0 * self.render_scale, self.raw_mouse.1 * self.render_scale);
+                let dx = self.raw_mouse.0 - self.last_mouse.0;
+                let dy = self.raw_mouse.1 - self.last_mouse.1;
+                self.last_mouse = self.raw_mouse;
+                let h = self.frame.height as f32 / self.render_scale;
                 if self.drag.is_some() {
                     self.update_drag();
                 } else if self.buttons[0] && !self.shift {
@@ -549,7 +593,7 @@ impl ApplicationHandler for App {
                         self.buttons[0] = false;
                     } else if self.rig.show {
                         let cam = self.render_camera();
-                        if let Some(i) = self.rig.pick(&cam, self.frame.width, self.frame.height, self.mouse.0, self.mouse.1) {
+                        if let Some(i) = self.rig.pick(&cam, self.frame.width, self.frame.height, self.mouse.0, self.mouse.1, self.render_scale) {
                             self.rig.selected = i;
                             self.drag = Some(Drag { light: i, anchor: self.rig.lights[i].position, plane: self.drag_plane() });
                         }
@@ -639,18 +683,21 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut path: Option<PathBuf> = None;
     let mut png_out: Option<String> = None;
-    let mut size = (1280usize, 720usize);
+    let mut size: Option<(usize, usize)> = None;
     let mut cli_lights: Vec<PointLight> = Vec::new();
     let mut sky_lux: Option<f32> = None;
     let mut exposure: Option<f32> = None;
     let mut view = View::Shaded;
     let mut reach = true;
     let mut close = false;
-    let mut shadows = true;
-    let mut bounce = true;
+    let mut shadows: Option<bool> = None;
+    let mut bounce: Option<bool> = None;
+    let mut auto = true;
+    let mut hardware_only = false;
+    let mut scale: Option<f32> = None;
     let mut bench_drag = false;
     let mut look: Option<(Vec3, Vec3)> = None;
-    let mut no_chess = false;
+    let mut chess: Option<bool> = None;
     let mut shadow_res: Option<usize> = None;
     let mut i = 0;
     while i < args.len() {
@@ -661,7 +708,7 @@ fn main() {
             }
             "--size" => {
                 if let Some((w, h)) = args.get(i + 1).and_then(|s| s.split_once('x')) {
-                    size = (w.parse().unwrap_or(1280), h.parse().unwrap_or(720));
+                    size = Some((w.parse().unwrap_or(1280), h.parse().unwrap_or(720)));
                 }
                 i += 1;
             }
@@ -691,10 +738,23 @@ fn main() {
             }
             "--no-reach" => reach = false,
             "--close" => close = true,
-            "--no-shadows" => shadows = false,
-            "--no-bounce" => bounce = false,
+            "--no-shadows" => shadows = Some(false),
+            "--shadows" => shadows = Some(true),
+            "--no-bounce" => bounce = Some(false),
+            "--bounce" => bounce = Some(true),
+            "--no-auto" => auto = false,
+            "--hardware" => hardware_only = true,
+            "--scale" => {
+                scale = args.get(i + 1).and_then(|s| s.parse().ok());
+                if scale.is_none() {
+                    eprintln!("--scale takes a fraction of the window size, e.g. 0.5");
+                    std::process::exit(2);
+                }
+                i += 1;
+            }
             "--bench-drag" => bench_drag = true,
-            "--no-chess" => no_chess = true,
+            "--no-chess" => chess = Some(false),
+            "--chess" => chess = Some(true),
             "--shadow-res" => {
                 shadow_res = args.get(i + 1).and_then(|s| s.parse().ok());
                 if shadow_res.is_none() {
@@ -716,13 +776,31 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-shadows] [--no-bounce] [--no-chess] [--shadow-res N] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]chess] [--shadow-res N] [--scale F] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
         }
         i += 1;
     }
+
+    // What this machine is, and what to do on it. Command-line options
+    // override the plan.
+    let plan = if auto {
+        let hw = hardware::Hardware::detect();
+        let plan = hw.plan();
+        eprintln!("{}", hw.report());
+        for r in &plan.reasons {
+            eprintln!("  {r}");
+        }
+        if hardware_only {
+            return;
+        }
+        Some(plan)
+    } else {
+        None
+    };
+    let with_chess = chess.or(plan.as_ref().map(|p| p.with_chess)).unwrap_or(true);
 
     let (mut scene, name) = match &path {
         Some(p) => match load_file(p) {
@@ -732,7 +810,7 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        None => match built_in_with(!no_chess) {
+        None => match built_in_with(with_chess) {
             Ok(s) => (s, "chess table, shop, mountains".into()),
             Err(e) => {
                 eprintln!("{e}");
@@ -761,11 +839,27 @@ fn main() {
         app.cam.look_from(eye, target);
     }
     app.settings.light_reach = reach;
-    app.settings.shadows = shadows;
+    if let Some(p) = &plan {
+        app.settings.shadows = p.shadows;
+        app.settings.shadow_res = p.shadow_res;
+        app.settings.bounce = p.bounce;
+        app.settings.bounce_budget_ms = Some(p.bounce_budget_ms);
+        app.settings.tile = p.tile;
+        app.render_scale = p.render_scale;
+    }
+    if let Some(v) = shadows {
+        app.settings.shadows = v;
+    }
     if let Some(r) = shadow_res {
         app.settings.shadow_res = r.clamp(16, 4096);
     }
-    app.settings.bounce = bounce;
+    if let Some(v) = bounce {
+        app.settings.bounce = v;
+    }
+    if let Some(v) = scale {
+        app.render_scale = v.clamp(0.0625, 1.0);
+    }
+    let size = size.or(plan.as_ref().map(|p| p.png_size)).unwrap_or((1280, 720));
 
     if let Some(out) = png_out {
         // A still frame waits for all the bounce light.

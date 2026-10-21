@@ -60,13 +60,15 @@ impl LightRig {
     }
 
     /// The light whose disc is under pixel (x, y), nearest the camera when
-    /// discs overlap.
-    pub fn pick(&self, cam: &Camera, width: usize, height: usize, x: f32, y: f32) -> Option<usize> {
+    /// discs overlap. `px` is the size of a screen pixel in frame pixels
+    /// (below 1 when the frame is rendered smaller than the window).
+    pub fn pick(&self, cam: &Camera, width: usize, height: usize, x: f32, y: f32, px: f32) -> Option<usize> {
+        let radius = PICK_RADIUS_PX * px;
         let mut best: Option<(usize, f32)> = None;
         for (i, l) in self.lights.iter().enumerate() {
             let Some((sx, sy, iw)) = raster::project(cam, width, height, l.position) else { continue };
             let d2 = (sx - x) * (sx - x) + (sy - y) * (sy - y);
-            if d2 <= PICK_RADIUS_PX * PICK_RADIUS_PX && best.is_none_or(|(_, biw)| iw > biw) {
+            if d2 <= radius * radius && best.is_none_or(|(_, biw)| iw > biw) {
                 best = Some((i, iw));
             }
         }
@@ -158,12 +160,12 @@ mod tests {
         rig.add(Vec3::new(0.5, 0.5, 0.0), 1.0);
         rig.add(Vec3::new(-0.5, 0.2, 0.3), 1.0);
         let (x, y, _) = raster::project(&cam, w, h, rig.lights[1].position).unwrap();
-        assert_eq!(rig.pick(&cam, w, h, x + 5.0, y - 5.0), Some(1));
-        assert_eq!(rig.pick(&cam, w, h, x + 40.0, y), None);
+        assert_eq!(rig.pick(&cam, w, h, x + 5.0, y - 5.0, 1.0), Some(1));
+        assert_eq!(rig.pick(&cam, w, h, x + 40.0, y, 1.0), None);
         // A second light on the same pixel ray, further away: the nearer one wins.
         let far = cam.eye + (rig.lights[1].position - cam.eye) * 2.0;
         rig.add(far, 1.0);
-        assert_eq!(rig.pick(&cam, w, h, x, y), Some(1));
+        assert_eq!(rig.pick(&cam, w, h, x, y, 1.0), Some(1));
     }
 
     #[test]

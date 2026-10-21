@@ -83,6 +83,7 @@ fn grid_index(n: usize, i: usize, j: usize) -> usize {
 
 #[derive(PartialEq, Clone, Copy)]
 struct VisKey {
+    tile: usize,
     view: Mat4,
     proj: Mat4,
     size: (usize, usize),
@@ -279,7 +280,7 @@ impl Renderer {
         frame.stats.bounce_ms = tb.elapsed().as_secs_f32() * 1000.0;
 
         // Visibility, unless the camera and the frame are as they were.
-        let vk = VisKey { view: cam.view, proj: cam.proj, size: (frame.width, frame.height), cull: settings.cull_backfaces, wireframe: settings.wireframe };
+        let vk = VisKey { tile: settings.tile, view: cam.view, proj: cam.proj, size: (frame.width, frame.height), cull: settings.cull_backfaces, wireframe: settings.wireframe };
         if self.vis_key == Some(vk) && frame.vis_stamp == self.vis_stamp && self.vis_stamp != 0 {
             frame.stats.visibility_kept = true;
             frame.stats.clusters_in = scene.clusters.len();
@@ -288,7 +289,7 @@ impl Renderer {
             frame.stats.tris_drawn = frame.setups.len();
         } else {
             full_resolve = true;
-            self.levels = raster::visibility(scene, cam, settings.cull_backfaces, settings.wireframe, frame);
+            self.levels = raster::visibility(scene, cam, settings.cull_backfaces, settings.wireframe, settings.tile, frame);
             self.vis_key = Some(vk);
             self.vis_stamp = NEXT_STAMP.fetch_add(1, Ordering::Relaxed);
             frame.vis_stamp = self.vis_stamp;
@@ -630,6 +631,45 @@ fn shade_point(
         spec += e * (n.dot(h).max(0.0).powf(48.0) * SPECULAR * inv_pi);
     }
     (diffuse, spec, evals)
+}
+
+/// Shading points per second on this machine, all cores, measured for
+/// about `seconds`: the real `shade_point` on synthetic points, the sky and
+/// two lights in reach (about what a point of the built-in set evaluates),
+/// no shadow maps.
+pub fn shading_rate(seconds: f64) -> f64 {
+    let lights = [
+        PointLight { position: Vec3::new(1.0, 2.0, 1.0), color: Vec3::ONE, lumens: 800.0 },
+        PointLight { position: Vec3::new(-2.0, 1.0, 0.5), color: Vec3::new(1.0, 0.8, 0.6), lumens: 400.0 },
+    ];
+    let in_reach = [0usize, 1];
+    let reach = [f32::INFINITY; 2];
+    let shadows: [Option<&CubeShadow>; 2] = [None, None];
+    let sky = Sky { lux: 30.0, on: true };
+    let eye = Vec3::new(0.0, 1.0, 5.0);
+    let run = |n: usize| -> f64 {
+        let t = std::time::Instant::now();
+        let s: f32 = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let a = i as f32 * 0.618;
+                let n = Vec3::new(a.sin(), (a * 1.7).cos(), (a * 0.3).sin()).normalize_or(Vec3::Y);
+                let p = n * 0.5 + Vec3::new(0.0, 0.5, 0.0);
+                let (d, sp, _) = shade_point(p, n, Vec3::splat(0.5), eye, sky, true, &lights, &in_reach, &reach, &shadows);
+                d.x + sp.y
+            })
+            .sum();
+        std::hint::black_box(s);
+        t.elapsed().as_secs_f64()
+    };
+    let mut n = 2000;
+    loop {
+        let dt = run(n);
+        if dt >= seconds || n >= 1 << 26 {
+            return n as f64 / dt.max(1e-9);
+        }
+        n *= 2;
+    }
 }
 
 /// One frame from nothing: a fresh renderer.

@@ -123,6 +123,60 @@ the nearby valley, and still not the mountains.
 The same bound limits each shadow map to the geometry in its light's reach,
 and is meant to limit bounce light when it comes.
 
+## Fitting the machine
+
+At start FkJensen works out what it is running on (`src/hardware.rs`) and
+chooses its own settings. It reads:
+
+- CPU model, architecture, cores and top clock (`/proc/cpuinfo`, sysfs);
+- SIMD and floating-point features (`is_x86_feature_detected!` on x86-64,
+  the `Features` line on ARM);
+- cache sizes per level (`/sys/devices/system/cpu/cpu0/cache`);
+- total and available memory (`/proc/meminfo`).
+
+And it measures, in 0.1 to 0.7 s:
+
+- memory read bandwidth, on one core and on all, over a buffer twice the
+  last cache (within an eighth of free memory and 512 MB);
+- shading points per second on all cores, running the renderer's own
+  `shade_point` on synthetic points with the sky and two lights.
+
+From those it chooses:
+
+| choice | rule |
+|---|---|
+| window render scale | shade a whole frame in 150 ms at 3 points per pixel, from 12.5% to 100% of the window, scaled up with nearest pixels |
+| `--png` size without `--size` | about 2 s of shading, up to 1280 x 720 |
+| chess set | at least 600 MB available, and its triangles' memory traffic per frame (100 bytes each) under 250 ms |
+| shadow maps | 512, 256 or 128 texels per face by speed, halved until 17 lights fit in a tenth of free memory; off below 64 |
+| bounce light | on at an eighth of the reference machine's speed or more, with a gather budget of 10 to 30 ms per window frame |
+| bucket size | depth and ids of a bucket in half the L2 cache, 16 to 64 pixels |
+
+It prints what it found and each choice with its reason. `--hardware`
+prints them and exits. Any option on the command line overrides the plan
+(`--size`, `--scale`, `--shadow-res`, `--[no-]chess`, `--[no-]shadows`,
+`--[no-]bounce`); `--no-auto` skips detection and uses fixed defaults.
+In the window `Z` and `Shift+Z` change the render scale.
+
+On the machine this was written on (20/10/2026):
+
+    CPU: Intel(R) Xeon(R) Processor @ 2.10GHz (x86_64), 2 cores, up to 2100 MHz
+    features: sse2 sse4.1 avx avx2 fma avx512f
+    caches (per core or shared): L1 data 48 KB, L1 instruction 32 KB, L2 unified 2048 KB, L3 unified 266240 KB
+    memory: 7.84 GB total, 7.27 GB available
+    measured: memory read 10.14 GB/s on one core, 18.75 GB/s on all; shading benchmark 16.79 M points/s on all cores (637 ms to measure)
+      window renders at 62% of its size: about 8.39 M shading points/s in a frame, 150 ms per frame at 3 points per pixel
+      --png without --size renders 1280x720 (about 2 s of shading)
+      chess set loaded: 7446 MB available, its triangles take 8 ms of memory traffic per frame
+      shadow maps 512 x 512 per face (107.0 MB for 17 lights)
+      bounce light on, gathered 30 ms per window frame
+      buckets 64 x 64 (32 KB of depth and ids, L2 2048 KB)
+
+On a Raspberry Pi 1 Model B Rev 1 (59 MB available, about 80 K shading
+points per second measured in a frame on 20/10/2026) the rules give, as the
+tests check: no chess set, no bounce light, 128 x 128 shadow maps, a window
+at 12.5% of its size and stills of about 304 x 171. Not yet run on the Pi.
+
 ## Build
 
 Rust 1.85 or later (edition 2024). No system libraries are needed to build.
@@ -197,6 +251,7 @@ of each pass in milliseconds.
     X                      light reach off / on (to compare cost and picture)
     M                      shadow maps on / off
     I                      bounce light on / off
+    Z / Shift+Z            render resolution finer / coarser (x1.25)
 
     Camera
     left drag              orbit                 middle drag / shift+left   pan
@@ -342,6 +397,11 @@ Not measured yet: a Raspberry Pi.
   it (`docs/format.md`).
 - Light rigs and the sky setting are not saved.
 - Text overlay: the numbers are in the window title.
+- Hardware detection reads Linux's `/proc` and `/sys`. On macOS and
+  Windows it gets cores, SIMD features and the two measurements, but not
+  cache or memory sizes, and assumes enough memory.
+- The plan's rules are calibrated on one machine; the Raspberry Pi figures
+  come from one run.
 
 Credit: FkJensen was created by Simon Legrand. The chess set is CC BY 4.0;
 see `assets/README.md`.

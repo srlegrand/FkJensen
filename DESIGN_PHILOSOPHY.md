@@ -9,12 +9,14 @@ Read `LLM_instructions.md` too: the checks to run first and how changes are deli
 ## A world where GPUs never existed
 
 - FkJensen follows the path 3D graphics would have taken on CPUs alone: scanline renderers, 3D Studio, REYES and PRMan, and on from there with today's cores and memory. It does not copy a GPU pipeline in software.
+- Prior art on CPUs: RenderMan, Arnold, Entropy, 3Delight and Clarisse, the last with an interactive viewport over very large scenes.
 - No ray tracing. Film renderers that stayed on CPUs trade speed for ray-traced quality and lean on render farms; FkJensen cheats instead, the way CPU renderers did before ray tracing took over, and keeps the cheats fast enough to be interactive.
 - The CPU's strengths are the design: branching per decision, recursion, irregular data structures, large caches and memory, and remembering work from one frame to the next. Many identical lanes doing the same thing is a GPU's strength, not ours.
 
 ## The CPU and its memory are the machine
 
 - No GPU API is linked, ever. Not for the viewport, not for a fallback, not for the window. The frame is pixels in RAM, copied to the screen through shared memory. On a machine with a GPU, the GPU stays idle, and that is the point: the same binary runs on a Raspberry Pi, a Ryzen, a Threadripper, an Apple M, an Intel or a Snapdragon without a driver.
+- The machine decides. At start FkJensen reads what the system reports (CPU, cores, SIMD features, caches, memory) and measures what it does not (memory bandwidth, shading points per second), then sets its own resolution, what it loads, shadow map size, bounce light and bucket size. Every choice can be overridden; nothing assumes a fast machine.
 - The language is Rust, stable, with rayon for threads. SIMD goes through a portable layer with runtime dispatch (fearless_simd or the equivalent), never bare intrinsics in the renderer, so one source serves AVX2, AVX-512 and NEON.
 - The operating system is not the bottleneck and is not fought. Threads are pinned and pages are locked only where a measurement shows a gain. A direct DRM/KMS target for Linux is allowed later; a kernel of its own is not.
 - Memory bandwidth, not arithmetic, is the budget: about 3.75 GB/s per core on a 16-core Zen 5. Data is laid out for it: structure of arrays, 8-wide packets, nothing allocated in the frame.
@@ -64,6 +66,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 20/10/2026: the machine decides: hardware detection and measurement at start, and a plan (render scale, still size, chess set, shadow map size, bounce, bucket size) from it. Clarisse added to the prior art.
 - 20/10/2026: bounce light as point-based colour bleeding: surfels lit directly, a tree of them, receivers that gather into a small cube raster filled nearest first and folded into spherical harmonics; one bounce; gathered within a time budget per frame, invalidated by light reach. The chess set re-baked with USD's left-handed winding honoured.
 - 19/10/2026: first REYES build. Triangles diced into micropolygons in world space by screen size, shaded and kept per cluster; a light change re-shades only the clusters in its old and new reach; visibility kept while the camera is still; cube shadow maps per point light holding only the geometry in reach. The visibility pass still uses a depth buffer of triangle ids to hide surfaces, and resolves pixels from the kept micropolygons. Reflections, bounce light and adaptive refinement not started.
 - 19/10/2026: no ray tracing. FkJensen follows a world where GPUs never existed: REYES micropolygons shaded in world space and kept between frames replace the visibility buffer; shadows from shadow maps, reflections from environment and per-object cube maps, bounce from point-based colour bleeding. "Rays are the oracle that fills caches" removed. The current code still rasterises with a visibility buffer and does not follow this yet.

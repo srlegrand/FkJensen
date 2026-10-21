@@ -24,6 +24,7 @@ use rayon::prelude::*;
 
 use crate::scene::{Cluster, PointLight, Scene};
 
+/// Default bucket edge in pixels; `RenderSettings::tile` sets it per machine.
 pub const TILE: usize = 64;
 pub const NO_TRI: u32 = u32::MAX;
 
@@ -181,6 +182,8 @@ pub struct RenderSettings {
     pub shadows: bool,
     /// Texels per cube face edge of each shadow map.
     pub shadow_res: usize,
+    /// Bucket edge in pixels.
+    pub tile: usize,
     /// Bounce light (point-based colour bleeding).
     pub bounce: bool,
     /// Time per frame for gathering bounce light, in ms; None: all of it.
@@ -190,7 +193,7 @@ pub struct RenderSettings {
 
 impl RenderSettings {
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, bounce: true, bounce_budget_ms: None, view: View::Shaded }
+        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded }
     }
 }
 
@@ -401,7 +404,8 @@ pub fn dice_level(edge_px: f32) -> u8 {
 /// Work out what each pixel sees. Fills `frame.depth`, `frame.tri_id` and
 /// `frame.setups`, and returns each cluster's dicing level (`NOT_VISIBLE`
 /// for clusters culled whole).
-pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, frame: &mut Frame) -> Vec<u8> {
+pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile: usize, frame: &mut Frame) -> Vec<u8> {
+    let tile = tile.max(8);
     let width = frame.width;
     let height = frame.height;
     let vp = cam.proj * cam.view;
@@ -491,8 +495,8 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, fram
 
     // Pass 2: bin into buckets. Each chunk of records writes its own per-
     // bucket lists; the lists are then joined per bucket.
-    let tiles_x = width.div_ceil(TILE);
-    let tiles_y = height.div_ceil(TILE);
+    let tiles_x = width.div_ceil(tile);
+    let tiles_y = height.div_ceil(tile);
     let n_tiles = tiles_x * tiles_y;
     let chunk_lists: Vec<Vec<Vec<u32>>> = setups
         .par_chunks(8192)
@@ -502,10 +506,10 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, fram
             let base = (ci * 8192) as u32;
             for (k, s) in chunk.iter().enumerate() {
                 let id = base + k as u32;
-                let tx0 = s.min_x as usize / TILE;
-                let tx1 = s.max_x as usize / TILE;
-                let ty0 = s.min_y as usize / TILE;
-                let ty1 = s.max_y as usize / TILE;
+                let tx0 = s.min_x as usize / tile;
+                let tx1 = s.max_x as usize / tile;
+                let ty0 = s.min_y as usize / tile;
+                let ty1 = s.max_y as usize / tile;
                 for ty in ty0..=ty1 {
                     for tx in tx0..=tx1 {
                         lists[ty * tiles_x + tx].push(id);
@@ -534,10 +538,10 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, fram
         .map(|t| {
             let tx = t % tiles_x;
             let ty = t / tiles_x;
-            let x0 = tx * TILE;
-            let y0 = ty * TILE;
-            let x1 = (x0 + TILE).min(width);
-            let y1 = (y0 + TILE).min(height);
+            let x0 = tx * tile;
+            let y0 = ty * tile;
+            let x1 = (x0 + tile).min(width);
+            let y1 = (y0 + tile).min(height);
             let tw = x1 - x0;
             let th = y1 - y0;
             let mut depth = vec![0f32; tw * th];
@@ -552,10 +556,10 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, fram
     for (t, (depth, id)) in tile_results.iter().enumerate() {
         let tx = t % tiles_x;
         let ty = t / tiles_x;
-        let x0 = tx * TILE;
-        let y0 = ty * TILE;
-        let x1 = (x0 + TILE).min(width);
-        let y1 = (y0 + TILE).min(height);
+        let x0 = tx * tile;
+        let y0 = ty * tile;
+        let x1 = (x0 + tile).min(width);
+        let y1 = (y0 + tile).min(height);
         let tw = x1 - x0;
         for (row, y) in (y0..y1).enumerate() {
             let dst = y * width + x0;
