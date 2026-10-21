@@ -178,6 +178,47 @@ tests check: no chess set, no bounce light, 128 x 128 shadow maps, frames
 of about 4 K pixels (its 1080 x 1920 screen renders at the 6.25% floor,
 68 x 120) and stills of about 304 x 171. Not yet run on the Pi.
 
+## Models and texture tiles
+
+Models come in through `tools/fkj-import`, which reads glTF (.glb, .gltf)
+and binary FBX and writes `.fkj`:
+
+    cd tools/fkj-import && cargo build --release && cd ../..
+    tools/fkj-import/target/release/fkj-import trex.glb -o assets/local/trex.fkj --length 12.3
+    tools/fkj-import/target/release/fkj-import car.fbx -o assets/local/car.fkj --length 4.79 --textures path/to/textures
+
+It sets the model on the ground, centred, Y up, in metres (`--length`:
+longest horizontal side; `--height`; `--rotate-x`, `--rotate-y` in
+degrees), cuts it into clusters, and bakes its base colour textures to
+per-triangle tiles, in the manner of Ptex: a triangle's tile at level L is
+its colour at exactly the points the REYES dicer shades at level L, so a
+shading point reads its colour with no UVs and no filtering at render time
+(`src/texture.rs`, `docs/format.md`). Levels 1 to 5 are stored, each
+filtered from the source's mip chain at its own spacing; a triangle's
+finest level stops where its points would be finer than the source's
+texels or closer than `--texel` (2 mm).
+
+At load the tiles stay in the file. When a cluster is shaded at level L,
+its tiles at that level are read with one positioned read and kept in a
+cache capped by the machine's plan (an eighth of available memory). Only
+visible triangles' textures, at the size they are seen at, reach memory.
+
+The built-in set places `trex.fkj` and `car.fkj` on the square when they
+are found in `$FKJENSEN_ASSETS`, `assets/local/` or `assets/local/` beside
+the program. `assets/local/` is not in the repository: models stay with
+whoever has the rights to them.
+
+Measured on 21/10/2026 (2 cores of a Xeon at 2.1 GHz):
+
+| model | source | triangles | clusters | tiles | import |
+|---|---|---|---|---|---|
+| T-rex | glTF, one 4096 x 4096 texture | 28,152 | 770 | 53.4 MB | 2.1 s |
+| car | FBX, 17 textures up to 1024 x 1024 | 17,243 | 575 | 37.6 MB | 1.0 s |
+
+Decoded at full size, without mips, those textures alone are 71 MB of RGB.
+A 1280 x 720 frame of the wide view read 4.1 MB of tiles; one filling the
+frame with the T-rex read 3.4 MB.
+
 ## Without a display server
 
 When neither X nor Wayland is running, as on a Raspberry Pi at its text
@@ -330,14 +371,17 @@ rig holds 64 lights at most.
 and writes `.fkj`. `src/world.rs` makes the table, square, café, valley and
 mountains. `src/lights.rs` is the light rig and the picking and dragging
 maths. `src/shadow.rs` and `src/bounce.rs` are the shadow maps and the
-bounce light.
+bounce light. `src/texture.rs` is the texture tiles and their cache;
+`tools/fkj-import` is the model converter, a separate crate.
 
 ## Measured
 
 On the machine this was written on (2 cores of an Intel Xeon at 2.1 GHz,
 shared, no SIMD, 20/10/2026), the built-in set (1,521,804 triangles, 26,456
 clusters, 17 lights with shadow maps, 153,753 surfels), 1280 x 720, two runs
-each.
+each. These tables are without the models in `assets/local/`; with the
+T-rex and the car (45,395 more triangles, 21/10/2026) the first frame of
+the wide view took about 4.0 s, 2.7 s of it bounce gather.
 
 First frame, nothing kept, everything gathered:
 
@@ -402,8 +446,12 @@ Not measured yet: a Raspberry Pi.
   front-to-back early stopping: not started.
 - SIMD: the inner loops are scalar.
 - Vertex splatting and cluster level of detail.
+- Texture tiles: base colour only (no normal or roughness maps); bounce
+  light on a textured surface is coloured by its vertex colours; no tiles
+  for the chess set yet; the importer does not read USD or ASCII FBX, and
+  reads FBX transforms without pivots or offsets.
 - Points, curves and volumes in `.fkj` (tags reserved).
-- Materials and textures: albedo per vertex only.
+- Materials: albedo only, per vertex or from texture tiles.
 - Light reach is per cluster and per point, not per pixel.
 - The shading cache holds 142 to 178 MB for the views above and is not
   capped or evicted yet. With the chess set the program needs at least
@@ -413,8 +461,8 @@ Not measured yet: a Raspberry Pi.
   per-bucket setup are what it needs.
 - Shading points are not shared between neighbouring triangles above
   level 0, so edges are shaded twice.
-- No converter in the repository: the chess set was baked from USD outside
-  it (`docs/format.md`).
+- The converter that baked the chess set from USD is not in the
+  repository, and `tools/fkj-import` does not read USD (`docs/format.md`).
 - Light rigs and the sky setting are not saved.
 - Text overlay: the numbers are in the window title.
 - Framebuffer output: no vsync and no double buffering, so a frame can

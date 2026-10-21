@@ -387,7 +387,7 @@ fn cluster_hidden(c: &Cluster, planes: &[Vec4; 5], eye: Vec3, cull_backfaces: bo
 /// Shading points per micropolygon edge target, in pixels.
 pub const SHADING_RATE_PX: f32 = 2.0;
 /// Finest dicing level: a triangle is cut into 2^level parts per edge.
-pub const MAX_DICE_LEVEL: u8 = 5;
+pub const MAX_DICE_LEVEL: u8 = crate::texture::MAX_LEVEL;
 /// Dicing level of a cluster that is not on screen.
 pub const NOT_VISIBLE: u8 = u8::MAX;
 

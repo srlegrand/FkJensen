@@ -349,6 +349,10 @@ impl Renderer {
                 // Lights that reach this cluster.
                 let in_reach: Vec<usize> = (0..lights.len()).filter(|&i| lights[i].position.distance(c.centre) <= c.radius + reach[i]).collect();
                 let per = if level == 0 { 1 } else { grid_points(level) };
+                // Texture tiles at this level, read from the file if not in
+                // the cache. Level 0 shades the vertices, whose colours hold
+                // the tiles' corners already.
+                let tiles = if level > 0 { scene.textures.block(ci, c.tri_count as usize, level) } else { None };
                 let mut bits = todo;
                 let (mut n_shaded, mut n_evals) = (0u64, 0u64);
                 while bits != 0 {
@@ -400,7 +404,11 @@ impl Renderer {
                                 let b0 = 1.0 - b1 - b2;
                                 let p = scene.positions[i0] * b0 + scene.positions[i1] * b1 + scene.positions[i2] * b2;
                                 let nn = (scene.normals[i0] * b0 + scene.normals[i1] * b1 + scene.normals[i2] * b2).normalize_or(Vec3::Y) * side;
-                                let a = scene.colors[i0] * b0 + scene.colors[i1] * b1 + scene.colors[i2] * b2;
+                                let a = match &tiles {
+                                    Some(b) if b.level == level => b.point(u, i, j),
+                                    Some(b) => b.sample(u, b1, b2),
+                                    None => scene.colors[i0] * b0 + scene.colors[i1] * b1 + scene.colors[i2] * b2,
+                                };
                                 let (d, s, ev) = shade_point(p, nn, a, eye, sky, ground, lights, &in_reach, &reach, &shadows);
                                 if diffuse_too {
                                     e.diffuse[off + k] = d;
@@ -797,5 +805,30 @@ mod tests {
         assert!(darker > 50, "{darker} pixels darker with shadows");
         let brighter = a.color.iter().zip(&b.color).filter(|(x, y)| (**x & 0xff) > (**y & 0xff)).count();
         assert_eq!(brighter, 0);
+    }
+
+    /// A textured quad is shaded from its tiles, not its vertex colours.
+    #[test]
+    fn shading_reads_texture_tiles() {
+        use crate::texture::{level_offset, Source, TexEntry};
+        use std::sync::Arc;
+        let mut scene = Scene::new();
+        let quad = [Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 0.0), Vec3::new(-1.0, 1.0, 0.0)];
+        scene.push_mesh(&quad, &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
+        let c = scene.clusters[0];
+        // Pure red tiles at levels 1 to 5.
+        let len = level_offset(c.tri_count as usize, 6) as usize;
+        let pool: Vec<u8> = (0..len / 3).flat_map(|_| [255u8, 0, 0]).collect();
+        scene.textures.entries = vec![TexEntry { level: 5, source: 0, offset: 0 }];
+        scene.textures.sources = vec![Arc::new(Source::Memory(Arc::new(pool)))];
+        let (w, h) = (160, 120);
+        let cam = cam_at(0.0, w, h, Vec3::ZERO, 3.0, 0.0);
+        let settings = RenderSettings { shadows: false, bounce: false, ..RenderSettings::new(Sky { lux: 100.0, on: true }) };
+        let mut f = Frame::new(w, h);
+        render(&scene, &cam, &[], &settings, &mut f);
+        let px = f.color[h / 2 * w + w / 2];
+        let (r, g, b) = ((px >> 16) & 255, (px >> 8) & 255, px & 255);
+        assert!(r > 40 && g < 5 && b < 5, "red from the tiles, got {r} {g} {b}");
+        assert!(scene.textures.stats().reads >= 1);
     }
 }

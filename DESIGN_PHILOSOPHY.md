@@ -26,6 +26,12 @@ Read `LLM_instructions.md` too: the checks to run first and how changes are deli
 - FkJensen does not read USD or any interchange format at run time. A scene is an `.fkj` file (`docs/format.md`), laid out for this renderer: clusters with their bounds and normal cones, quantised attributes, tagged sections a reader can skip. Loading is a decode, not a conversion.
 - Photoreal CG needs four kinds of primitive: polygon meshes, points (particles), curves (fur, hair) and volumes. The format reserves a section for each; meshes come first.
 
+## Textures are tiles per triangle, streamed
+
+- No UV atlas at render time. Each triangle carries its own tiles (the Ptex idea, Burley and Lacewell 2008), and a tile at level L holds the colour at the points the dicer shades at level L. Shading reads a colour; it does not filter.
+- Tiles stay on disk and are read per cluster and level when seen, into a capped cache. What is not visible, or not seen closely, costs nothing.
+- Textures are baked at import, filtered once per level from the source's mips. Import bakes geometry and surface data; still nothing about light.
+
 ## Light is physical: point lights and the sky
 
 - Two kinds of light. Point lights, in lumens, with no falloff radius: the inverse square law alone. And the sky, in lux, which reaches every surface the same way whatever its distance. Nothing else.
@@ -66,6 +72,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 21/10/2026: per-triangle texture tiles at the dicer's grid points, levels 1 to 5, baked at import (tools/fkj-import, glTF and FBX) and streamed per cluster and level from the file into a capped cache. Third-party models live in assets/local, outside the repository.
 - 21/10/2026: without X or Wayland, frames go straight to the Linux framebuffer (/dev/fb0) and input comes from /dev/input; the render resolution follows the screen through the machine's pixel budget.
 - 20/10/2026: the machine decides: hardware detection and measurement at start, and a plan (render scale, still size, chess set, shadow map size, bounce, bucket size) from it. Clarisse added to the prior art.
 - 20/10/2026: bounce light as point-based colour bleeding: surfels lit directly, a tree of them, receivers that gather into a small cube raster filled nearest first and folded into spherical harmonics; one bounce; gathered within a time budget per frame, invalidated by light reach. The chess set re-baked with USD's left-handed winding honoured.

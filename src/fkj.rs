@@ -11,7 +11,9 @@
 //! ```
 //!
 //! Tags: `MESH` clustered triangles, `INST` copies of a run of clusters at
-//! other transforms, `LITE` point lights in lumens. Reserved for the primitives still
+//! other transforms, `LITE` point lights in lumens, `TEXR` per-triangle
+//! texture tiles (`texture.rs`), streamed from the file and never read
+//! whole. Reserved for the primitives still
 //! to come: `PNTS` (points, particles), `CURV` (curves, fur and hair),
 //! `VOLM` (volumes).
 
@@ -21,13 +23,17 @@
 
 use glam::{Mat4, Vec3, Vec4};
 
+use std::sync::Arc;
+
 use crate::scene::{Cluster, PointLight, Scene};
+use crate::texture::{level_offset, Source, TexEntry};
 
 pub const MAGIC: [u8; 4] = *b"FKJ\0";
 pub const VERSION: u32 = 1;
 pub const TAG_MESH: [u8; 4] = *b"MESH";
 pub const TAG_LITE: [u8; 4] = *b"LITE";
 pub const TAG_INST: [u8; 4] = *b"INST";
+pub const TAG_TEXR: [u8; 4] = *b"TEXR";
 
 /// Extra copies of clusters `first_cluster..first_cluster + cluster_count`
 /// of the `MESH` section, each at `transform` applied to the stored
@@ -112,7 +118,8 @@ pub fn write(scene: &Scene, instances: &[InstanceGroup]) -> Vec<u8> {
     let mut out = W(Vec::new());
     out.0.extend_from_slice(&MAGIC);
     out.u32(VERSION);
-    out.u32(if instances.is_empty() { 2 } else { 3 });
+    let textured = !scene.textures.is_empty();
+    out.u32(2 + !instances.is_empty() as u32 + textured as u32);
     out.u32(0);
 
     // MESH
@@ -216,6 +223,45 @@ pub fn write(scene: &Scene, instances: &[InstanceGroup]) -> Vec<u8> {
         l.f32(0.0);
     }
     section(&mut out, TAG_LITE, 2, &l.0);
+
+    // TEXR: u32 cluster count, u32 0, u64 bytes from the payload's start to
+    // the pool; per cluster u8 finest level (0: none), 7 bytes 0, u64
+    // offset of its tiles in the pool; then the pool. A cluster's tiles are
+    // level 1 to its finest, each level triangle by triangle, sRGB8 RGB.
+    if textured {
+        let n = scene.clusters.len();
+        let table_end = (16 + n * 16) as u64;
+        let mut t = W(Vec::new());
+        t.u32(n as u32);
+        t.u32(0);
+        t.u64(table_end);
+        let mut pool: Vec<u8> = Vec::new();
+        for (ci, c) in scene.clusters.iter().enumerate() {
+            let e = scene.textures.entry(ci);
+            let data = if e.level > 0 {
+                scene.textures.sources.get(e.source as usize).and_then(|src| src.read(e.offset, level_offset(c.tri_count as usize, e.level + 1) as usize).ok())
+            } else {
+                None
+            };
+            match data {
+                Some(d) => {
+                    t.u8(e.level);
+                    for _ in 0..7 {
+                        t.u8(0);
+                    }
+                    t.u64(pool.len() as u64);
+                    pool.extend_from_slice(&d);
+                }
+                None => {
+                    for _ in 0..16 {
+                        t.u8(0);
+                    }
+                }
+            }
+        }
+        t.0.extend_from_slice(&pool);
+        section(&mut out, TAG_TEXR, 1, &t.0);
+    }
     out.0
 }
 
@@ -268,37 +314,131 @@ pub struct ReadReport {
     pub skipped: Vec<String>,
 }
 
+/// Read a whole `.fkj` held in memory. Texture tiles, if any, are kept in
+/// memory too.
 pub fn read(bytes: &[u8]) -> Result<(Scene, ReadReport), String> {
     let mut r = R { b: bytes, at: 0 };
-    if r.take(4)? != MAGIC {
-        return Err("not an .fkj file".into());
-    }
-    let version = r.u32()?;
-    if version != VERSION {
-        return Err(format!(".fkj version {version}, this build reads version {VERSION}"));
-    }
-    let sections = r.u32()?;
-    r.u32()?;
-    let mut scene = Scene::new();
-    let mut report = ReadReport::default();
-    let mut inst_payloads: Vec<&[u8]> = Vec::new();
+    let sections = header(r.take(16)?)?;
+    let mut list: Vec<([u8; 4], u32, Vec<u8>)> = Vec::new();
+    let mut tex: Option<(Vec<u8>, Source)> = None;
     for _ in 0..sections {
         let tag: [u8; 4] = r.take(4)?.try_into().unwrap();
         let section_version = r.u32()?;
         let len = r.u64()? as usize;
         let payload = r.take(len)?;
         r.at = r.at.div_ceil(8) * 8;
-        match tag {
+        if tag == TAG_TEXR {
+            let table_end = texr_table_end(payload)?;
+            tex = Some((payload[..table_end].to_vec(), Source::Memory(Arc::new(payload[table_end..].to_vec()))));
+        } else {
+            list.push((tag, section_version, payload.to_vec()));
+        }
+    }
+    assemble(list, tex)
+}
+
+/// Read a `.fkj` file. Everything but the texture tiles is read; the tiles
+/// stay in the file and are read when a cluster needs them.
+pub fn read_file(path: &std::path::Path) -> Result<(Scene, ReadReport), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let name = path.display();
+    let mut f = std::fs::File::open(path).map_err(|e| format!("cannot read {name}: {e}"))?;
+    let mut buf = [0u8; 16];
+    f.read_exact(&mut buf).map_err(|_| "file is truncated".to_string())?;
+    let sections = header(&buf)?;
+    let mut list = Vec::new();
+    let mut tex_table: Option<(Vec<u8>, u64)> = None;
+    let mut at = 16u64;
+    for _ in 0..sections {
+        f.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
+        f.read_exact(&mut buf).map_err(|_| "file is truncated".to_string())?;
+        let tag: [u8; 4] = buf[0..4].try_into().unwrap();
+        let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let len = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let start = at + 16;
+        if tag == TAG_TEXR {
+            let mut head = [0u8; 16];
+            f.read_exact(&mut head).map_err(|_| "file is truncated".to_string())?;
+            let table_end = texr_table_end(&head)?;
+            let mut table = vec![0u8; table_end];
+            table[..16].copy_from_slice(&head);
+            f.read_exact(&mut table[16..]).map_err(|_| "file is truncated".to_string())?;
+            tex_table = Some((table, start + table_end as u64));
+        } else {
+            let mut payload = vec![0u8; len as usize];
+            f.read_exact(&mut payload).map_err(|_| "file is truncated".to_string())?;
+            list.push((tag, version, payload));
+        }
+        at = (start + len).div_ceil(8) * 8;
+    }
+    let tex = match tex_table {
+        Some((table, pool)) => {
+            let file = std::fs::File::open(path).map_err(|e| format!("cannot read {name}: {e}"))?;
+            Some((table, Source::File { file, pool }))
+        }
+        None => None,
+    };
+    assemble(list, tex)
+}
+
+fn header(b: &[u8]) -> Result<u32, String> {
+    if b.len() < 16 || b[0..4] != MAGIC {
+        return Err("not an .fkj file".into());
+    }
+    let version = u32::from_le_bytes(b[4..8].try_into().unwrap());
+    if version != VERSION {
+        return Err(format!(".fkj version {version}, this build reads version {VERSION}"));
+    }
+    Ok(u32::from_le_bytes(b[8..12].try_into().unwrap()))
+}
+
+fn texr_table_end(payload: &[u8]) -> Result<usize, String> {
+    if payload.len() < 16 {
+        return Err("TEXR section is truncated".into());
+    }
+    let n = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let end = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+    if end != 16 + n * 16 {
+        return Err("TEXR table size does not match its cluster count".into());
+    }
+    Ok(end)
+}
+
+fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) -> Result<(Scene, ReadReport), String> {
+    let mut scene = Scene::new();
+    let mut report = ReadReport::default();
+    let mut inst_payloads: Vec<&[u8]> = Vec::new();
+    for (tag, section_version, payload) in &list {
+        match *tag {
             TAG_MESH => read_mesh(payload, &mut scene)?,
-            TAG_LITE if section_version == 2 => read_lights(payload, &mut scene)?,
+            TAG_LITE if *section_version == 2 => read_lights(payload, &mut scene)?,
             TAG_LITE => report.skipped.push(format!("LITE version {section_version} (relative units, not lumens)")),
             TAG_INST => inst_payloads.push(payload),
             other => report.skipped.push(String::from_utf8_lossy(&other).into_owned()),
         }
     }
+    let stored_clusters = scene.clusters.len();
+    if let Some((table, source)) = tex {
+        let mut r = R { b: &table, at: 16 };
+        let n = u32::from_le_bytes(table[0..4].try_into().unwrap()) as usize;
+        if n != stored_clusters {
+            return Err(format!("TEXR has {n} clusters, MESH has {stored_clusters}"));
+        }
+        let mut entries = Vec::with_capacity(n);
+        for _ in 0..n {
+            let level = r.u8()?;
+            r.take(7)?;
+            let offset = r.u64()?;
+            if level > crate::texture::MAX_LEVEL {
+                return Err("TEXR level beyond the finest dicing level".into());
+            }
+            entries.push(TexEntry { level, source: 0, offset });
+        }
+        scene.textures.entries = entries;
+        scene.textures.sources = vec![Arc::new(source)];
+    }
     // Instances refer to the clusters as stored, so they are expanded after
     // every MESH section has been read.
-    let stored_clusters = scene.clusters.len();
     for p in inst_payloads {
         expand_instances(p, &mut scene, stored_clusters)?;
     }
@@ -440,6 +580,14 @@ fn expand_instances(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Resu
                     for tri in scene.indices[start..].chunks_exact_mut(3) {
                         tri.swap(1, 2);
                     }
+                }
+                if !scene.textures.entries.is_empty() {
+                    let e = scene.textures.entry(ci);
+                    let at = scene.clusters.len();
+                    scene.textures.entries.resize(at, TexEntry::default());
+                    // A mirrored copy swaps two corners, which would turn its
+                    // tiles over: it keeps vertex colours only.
+                    scene.textures.entries.push(if m.determinant() < 0.0 { TexEntry::default() } else { e });
                 }
                 let axis = nm.transform_vector3(c.cone_axis).normalize_or(Vec3::Y);
                 scene.clusters.push(Cluster {
@@ -592,5 +740,31 @@ mod tests {
         assert!(b.lights.is_empty());
         assert_eq!(rep.skipped.len(), 1);
         assert!(rep.skipped[0].starts_with("LITE version 1"));
+    }
+
+    #[test]
+    fn texture_tiles_round_trip_and_follow_instances() {
+        use crate::texture::{level_offset, tile_points};
+        let mut a = sample();
+        // Level-2 tiles for every cluster: the byte value is the cluster.
+        let mut pool = Vec::new();
+        let mut entries = Vec::new();
+        for (ci, c) in a.clusters.iter().enumerate() {
+            entries.push(TexEntry { level: 2, source: 0, offset: pool.len() as u64 });
+            let len = level_offset(c.tri_count as usize, 3) as usize;
+            pool.extend(std::iter::repeat_n(ci as u8, len));
+        }
+        a.textures.entries = entries;
+        a.textures.sources = vec![Arc::new(Source::Memory(Arc::new(pool)))];
+        let n = a.clusters.len() as u32;
+        let bytes = write(&a, &[InstanceGroup { first_cluster: 0, cluster_count: n, transforms: vec![Mat4::from_translation(Vec3::X * 4.0)] }]);
+        let (b, _) = read(&bytes).unwrap();
+        assert_eq!(b.clusters.len(), a.clusters.len() * 2);
+        for ci in 0..b.clusters.len() {
+            let src = ci % a.clusters.len();
+            let blk = b.textures.block(ci, b.clusters[ci].tri_count as usize, 2).unwrap();
+            assert_eq!(blk.data.len(), b.clusters[ci].tri_count as usize * tile_points(2) * 3);
+            assert!(blk.data.iter().all(|v| *v == src as u8), "cluster {ci} reads its own tiles");
+        }
     }
 }

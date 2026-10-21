@@ -88,6 +88,9 @@ pub struct Scene {
     pub focus: Option<(Vec3, Vec3)>,
     /// The lights stored with the scene; `R` in the viewer resets to these.
     pub lights: Vec<PointLight>,
+    /// Per-triangle texture tiles, streamed (`texture.rs`); empty when the
+    /// scene has only vertex colours.
+    pub textures: crate::texture::Textures,
 }
 
 impl Scene {
@@ -144,8 +147,42 @@ impl Scene {
         }
     }
 
-    /// Append another scene's geometry and lights.
+    /// Rotate about the vertical axis by `yaw` radians, scale by `scale`,
+    /// then move by `d`: how a model is placed in a set. Rotation and
+    /// uniform scale keep each triangle's corner order, so its texture tile
+    /// stays valid.
+    pub fn place(&mut self, yaw: f32, scale: f32, d: Vec3) {
+        let q = glam::Quat::from_rotation_y(yaw);
+        for p in &mut self.positions {
+            *p = q * (*p * scale) + d;
+        }
+        for n in &mut self.normals {
+            *n = q * *n;
+        }
+        for c in &mut self.clusters {
+            c.centre = q * (c.centre * scale) + d;
+            c.radius *= scale;
+            c.cone_axis = q * c.cone_axis;
+        }
+        for l in &mut self.lights {
+            l.position = q * (l.position * scale) + d;
+        }
+        let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        for p in &self.positions {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        self.bounds_min = lo;
+        self.bounds_max = hi;
+    }
+
+    /// Append another scene's geometry, lights and texture tiles.
     pub fn append(&mut self, other: Scene) {
+        let cbase = self.clusters.len();
+        let other_clusters = other.clusters.len();
+        if !other.textures.is_empty() || !self.textures.is_empty() {
+            self.textures.append(&other.textures, cbase, other_clusters);
+        }
         let vbase = self.positions.len() as u32;
         let tbase = self.triangle_count() as u32;
         self.positions.extend(other.positions);
@@ -162,6 +199,14 @@ impl Scene {
     /// `normals` may be empty (smooth normals are computed from the faces);
     /// `colors` may hold one value for the whole mesh or be empty (0.7 grey).
     pub fn push_mesh(&mut self, positions: &[Vec3], normals: &[Vec3], colors: &[Vec3], tri_indices: &[u32]) {
+        self.push_mesh_mapped(positions, normals, colors, tri_indices);
+    }
+
+    /// `push_mesh`, returning for each triangle added (in the scene's
+    /// order) the index of the source triangle it came from. Corner order is
+    /// kept, so per-triangle data (texture tiles) can follow.
+    pub fn push_mesh_mapped(&mut self, positions: &[Vec3], normals: &[Vec3], colors: &[Vec3], tri_indices: &[u32]) -> Vec<u32> {
+        let mut source = Vec::with_capacity(tri_indices.len() / 3);
         let n = positions.len();
         let normals: Vec<Vec3> = if normals.len() == n {
             normals.to_vec()
@@ -193,6 +238,7 @@ impl Scene {
             for t in &c.local_tris {
                 self.indices.extend(t.iter().map(|&l| first_vertex + l as u32));
             }
+            source.extend_from_slice(&c.source_tris);
             let mut cl = Cluster {
                 first_vertex,
                 vertex_count: c.vertices.len() as u32,
@@ -203,6 +249,7 @@ impl Scene {
             self.finish_cluster(&mut cl);
             self.clusters.push(cl);
         }
+        source
     }
 
     /// Fill a cluster's sphere and cone from its vertices and triangles, and
@@ -251,6 +298,8 @@ impl Scene {
 /// One cluster as the builder makes it: source vertex ids, and triangles in
 /// local indices.
 pub struct BuiltCluster {
+    /// Source triangle of each local triangle.
+    pub source_tris: Vec<u32>,
     pub vertices: Vec<u32>,
     pub local_tris: Vec<[u8; 3]>,
 }
@@ -296,7 +345,7 @@ pub fn build_clusters(positions: &[Vec3], tri_indices: &[u32]) -> Vec<BuiltClust
     let max_diag = typical * 16.0;
 
     let mut out = Vec::new();
-    let mut cur = BuiltCluster { vertices: Vec::new(), local_tris: Vec::new() };
+    let mut cur = BuiltCluster { vertices: Vec::new(), local_tris: Vec::new(), source_tris: Vec::new() };
     let (mut blo, mut bhi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
     // Source vertex -> local index in the current cluster.
     let mut local: std::collections::HashMap<u32, u8> = std::collections::HashMap::new();
@@ -311,7 +360,7 @@ pub fn build_clusters(positions: &[Vec3], tri_indices: &[u32]) -> Vec<BuiltClust
         }
         let too_big = !cur.local_tris.is_empty() && (thi - tlo).length() > max_diag;
         if too_big || cur.local_tris.len() + 1 > CLUSTER_TRIS || cur.vertices.len() + new_verts > CLUSTER_VERTS {
-            out.push(std::mem::replace(&mut cur, BuiltCluster { vertices: Vec::new(), local_tris: Vec::new() }));
+            out.push(std::mem::replace(&mut cur, BuiltCluster { vertices: Vec::new(), local_tris: Vec::new(), source_tris: Vec::new() }));
             local.clear();
             (tlo, thi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
             for v in tri {
@@ -328,6 +377,7 @@ pub fn build_clusters(positions: &[Vec3], tri_indices: &[u32]) -> Vec<BuiltClust
             });
         }
         cur.local_tris.push(lt);
+        cur.source_tris.push(t);
     }
     if !cur.local_tris.is_empty() {
         out.push(cur);

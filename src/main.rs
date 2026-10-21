@@ -38,6 +38,7 @@ mod raster;
 mod reyes;
 mod scene;
 mod shadow;
+mod texture;
 mod world;
 
 use std::num::NonZeroU32;
@@ -344,7 +345,7 @@ impl App {
         };
         let sky = if self.settings.sky.on { format!("sky {:.0} lux", self.settings.sky.lux) } else { "sky off".into() };
         format!(
-            "FkJensen  {}  {:.0} fps  {}x{} ({:.0}% of the window)  {light}  {sky}  {}  shaded {} of {} points  shadows {} ({:.0} ms)  bounce {}  setup {:.0} raster {:.0} shade {:.0} resolve {:.0} ms  CPU only",
+            "FkJensen  {}  {:.0} fps  {}x{} ({:.0}% of the window)  {light}  {sky}  {}  shaded {} of {} points  shadows {} ({:.0} ms)  bounce {}  {}  setup {:.0} raster {:.0} shade {:.0} resolve {:.0} ms  CPU only",
             self.scene_name,
             self.title_fps,
             self.frame.width,
@@ -356,6 +357,10 @@ impl App {
             if self.settings.shadows { "on" } else { "off" },
             s.shadow_ms,
             if !self.settings.bounce { "off".to_string() } else if s.receivers_pending > 0 { format!("{} receivers to go", s.receivers_pending) } else { "done".to_string() },
+            {
+                let t = self.scene.textures.stats();
+                if self.scene.textures.is_empty() { "no textures".to_string() } else { format!("textures {:.1} MB held, {:.1} MB read", t.resident as f64 / 1e6, t.bytes_read as f64 / 1e6) }
+            },
             s.setup_ms + s.bin_ms,
             s.raster_ms,
             s.shade_ms,
@@ -595,6 +600,7 @@ fn built_in_with(with_chess: bool) -> Result<Scene, String> {
         let shop_lights = std::mem::take(&mut scene.lights);
         scene.lights = world::table_lights();
         scene.lights.extend(shop_lights);
+        add_models(&mut scene);
         eprintln!("built-in set without the chess set: {} triangles, {} clusters, {} lights", scene.triangle_count(), scene.clusters.len(), scene.lights.len());
         return Ok(scene);
     }
@@ -606,6 +612,7 @@ fn built_in_with(with_chess: bool) -> Result<Scene, String> {
     let mut scene = world::build();
     let shop_lights = std::mem::take(&mut scene.lights);
     scene.append(chess);
+    add_models(&mut scene);
     scene.lights = world::table_lights();
     scene.lights.extend(shop_lights);
     // The subject is the board and its pieces, with a margin.
@@ -692,9 +699,60 @@ fn load_bytes(bytes: &[u8], name: &str) -> Result<Scene, String> {
     Ok(scene)
 }
 
+/// Read an .fkj file. Its texture tiles stay in the file and are streamed.
 fn load_file(path: &Path) -> Result<Scene, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    load_bytes(&bytes, &path.display().to_string())
+    let t = Instant::now();
+    let name = path.display().to_string();
+    let (scene, report) = fkj::read_file(path).map_err(|e| format!("{name}: {e}"))?;
+    let tiled = scene.textures.entries.iter().filter(|e| e.level > 0).count();
+    eprintln!(
+        "{name}: read in {:.2} s: {} triangles, {} vertices, {} clusters ({} with texture tiles, left in the file), {} lights",
+        t.elapsed().as_secs_f64(),
+        scene.triangle_count(),
+        scene.positions.len(),
+        scene.clusters.len(),
+        tiled,
+        scene.lights.len()
+    );
+    for tag in &report.skipped {
+        eprintln!("  skipped a {tag} section: not read by this build yet");
+    }
+    Ok(scene)
+}
+
+/// Models placed in the built-in set when their .fkj files are found in
+/// the assets folder: file, position on the square (metres), turn about the
+/// vertical (degrees). They are made with tools/fkj-import and kept out of
+/// the repository.
+const SET_MODELS: [(&str, Vec3, f32); 2] = [("trex.fkj", Vec3::new(-8.0, 0.0, -21.0), 30.0), ("car.fkj", Vec3::new(4.5, 0.0, -9.0), -35.0)];
+
+/// Where models are looked for: $FKJENSEN_ASSETS, then assets/local in the
+/// current folder, then beside the program.
+fn assets_dirs() -> Vec<PathBuf> {
+    let mut d = Vec::new();
+    if let Some(p) = std::env::var_os("FKJENSEN_ASSETS") {
+        d.push(PathBuf::from(p));
+    }
+    d.push(PathBuf::from("assets/local"));
+    if let Some(exe) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+        d.push(exe.join("assets/local"));
+    }
+    d
+}
+
+/// Add the set's models that are present.
+fn add_models(scene: &mut Scene) {
+    let dirs = assets_dirs();
+    for (file, at, yaw) in SET_MODELS {
+        let Some(path) = dirs.iter().map(|d| d.join(file)).find(|p| p.exists()) else { continue };
+        match load_file(&path) {
+            Ok(mut m) => {
+                m.place(yaw.to_radians(), 1.0, at);
+                scene.append(m);
+            }
+            Err(e) => eprintln!("{e}"),
+        }
+    }
 }
 
 fn save_png(frame: &Frame, path: &str) -> Result<(), String> {
@@ -898,6 +956,7 @@ fn main() {
         app.settings.tile = p.tile;
         app.render_scale = p.render_scale;
         app.pixel_budget = Some(p.pixel_budget);
+        app.scene.textures.set_budget(p.texture_cache);
     }
     if let Some(v) = shadows {
         app.settings.shadows = v;
@@ -922,11 +981,14 @@ fn main() {
         app.render();
         let s = app.frame.stats;
         eprintln!(
-            "rendered {}x{} in {:.1} ms on {} threads: shadows {:.1} ms ({} maps, {} triangles), bounce: {} surfels lit in {:.1} ms, {} receivers gathered in {:.1} ms; setup {:.1}, bin {:.1}, raster {:.1}, shade {:.1}, resolve {:.1} ms; {} of {} clusters, {} of {} triangles; {} shading points, {} light evaluations of {} without reach; cache {:.0} MB",
+            "rendered {}x{} in {:.1} ms on {} threads: texture tiles {} reads, {:.1} MB read, {:.1} MB held; shadows {:.1} ms ({} maps, {} triangles), bounce: {} surfels lit in {:.1} ms, {} receivers gathered in {:.1} ms; setup {:.1}, bin {:.1}, raster {:.1}, shade {:.1}, resolve {:.1} ms; {} of {} clusters, {} of {} triangles; {} shading points, {} light evaluations of {} without reach; cache {:.0} MB",
             size.0,
             size.1,
             t.elapsed().as_secs_f32() * 1000.0,
             rayon::current_num_threads(),
+            app.scene.textures.stats().reads,
+            app.scene.textures.stats().bytes_read as f64 / 1e6,
+            app.scene.textures.stats().resident as f64 / 1e6,
             s.shadow_ms,
             s.shadow_maps_built,
             s.shadow_tris,

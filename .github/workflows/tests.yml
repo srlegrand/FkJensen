@@ -8,6 +8,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release
+      - run: cargo test --release
+        working-directory: tools/fkj-import
       - run: cargo build --release
       - name: Render the built-in scene headless
         run: |

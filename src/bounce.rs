@@ -38,6 +38,9 @@ use crate::scene::Scene;
 /// A cluster smaller than this (bounding radius, metres) gives a few
 /// surfels binned by facing instead of one per triangle.
 const SMALL_CLUSTER: f32 = 0.15;
+/// Mean triangle area (m²) from which a cluster's receivers are its
+/// vertices.
+const LARGE_TRIANGLE: f32 = 0.01;
 /// Leaf size of the tree.
 const LEAF: usize = 4;
 /// A node is taken whole when its radius over its distance is below this.
@@ -246,7 +249,17 @@ impl Bounce {
         let mut vertex_receiver = vec![u32::MAX; scene.positions.len()];
         for (bins, c) in acc.iter().zip(&scene.clusters) {
             first_receiver.push(receivers.len() as u32);
-            let big = c.radius > SMALL_CLUSTER;
+            // Large triangles (a floor, a wall, a table top) get a receiver
+            // per vertex; a cluster of small ones (a model) gets one.
+            let area: f32 = (c.first_tri..c.first_tri + c.tri_count)
+                .map(|t| {
+                    let i = t as usize * 3;
+                    let (a, b, cc) = (scene.positions[scene.indices[i] as usize], scene.positions[scene.indices[i + 1] as usize], scene.positions[scene.indices[i + 2] as usize]);
+                    (b - a).cross(cc - a).length() * 0.5
+                })
+                .sum::<f32>()
+                / c.tri_count.max(1) as f32;
+            let big = c.radius > SMALL_CLUSTER && area >= LARGE_TRIANGLE;
             per_vertex.push(big);
             if big {
                 // Vertices that share a position and normal (the corners of

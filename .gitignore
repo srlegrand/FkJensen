@@ -1,2 +1,4 @@
 target/
 frame.png
+# Models converted with tools/fkj-import: kept out of the repository.
+assets/local/

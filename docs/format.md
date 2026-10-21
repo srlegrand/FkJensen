@@ -33,6 +33,7 @@ A reader skips any section whose tag it does not know, using the length.
 | `MESH` | clustered triangle mesh | yes |
 | `INST` | extra copies of mesh clusters at other transforms | yes |
 | `LITE` | point lights, lumens (section version 2) | yes; version 1 skipped |
+| `TEXR` | per-triangle texture tiles | yes, streamed from the file |
 | `PNTS` | points, particles | reserved |
 | `CURV` | curves, fur and hair | reserved |
 | `VOLM` | volumes | reserved |
@@ -98,6 +99,39 @@ expands instances into plain clusters at load: they cost memory like any
 other geometry, and only save file size. The chess set uses it for the
 pawns: one pawn per side is stored, seven copies each come from `INST`.
 
+## TEXR
+
+Texture tiles, one set per triangle, in the manner of Ptex (Burley and
+Lacewell 2008): no UV atlas at render time. A triangle's tile at level L
+holds its colour at the (2^L + 1)(2^L + 2) / 2 points where the REYES dicer
+shades it at level L (the triangle cut into 2^L parts per edge), so a
+shading point reads its colour directly. Level 0 is the three corners: the
+vertex colours of `MESH`.
+
+    u32       cluster count (the MESH section's)
+    u32       0
+    u64       bytes from the start of this payload to the pool
+    per cluster, 16 bytes
+      u8        finest level stored, 0 for none (vertex colours only)
+      u8 x 7    0
+      u64       offset of its tiles in the pool
+    pool
+
+A cluster's tiles are its levels 1 to its finest, one after the other;
+each level holds its triangles' tiles in the cluster's triangle order, each
+tile its points in dicer order (i towards the triangle's second corner, j
+towards its third), 3 bytes of sRGB each. The finest level is at most 5
+(561 points a triangle).
+
+The reader keeps the table and leaves the pool in the file. When a cluster
+is shaded at level L, the block of its tiles at min(L, finest) is read with
+one positioned read and kept in a memory-capped cache, least recently used
+dropped first. Only the tiles of visible triangles, at the level they are
+seen at, are read.
+
+An `INST` copy of a cluster uses the same tiles; a mirrored copy keeps
+vertex colours only, since mirroring turns its tiles over.
+
 ## LITE
 
 Section version 2.
@@ -145,17 +179,31 @@ Loaded, with the pawn instances: 1,430,784 triangles, 1,355,968 vertices,
 set in `src/world.rs` (shopfront, square, valley, mountains), which is made
 directly into clusters and is not stored as a file.
 
+## Converting models
+
+`tools/fkj-import` converts glTF (.glb, .gltf) and binary FBX models to
+`.fkj`, with their base colour textures baked to tiles. A triangle's finest
+level is the coarser of as many points as the source texture has texels
+over it, and points no closer than `--texel` metres (2 mm by default); a
+cluster stores the finest level any of its triangles needs. Each level is
+filtered from the source's mip chain at its own point spacing. Normal,
+roughness and other maps are not read.
+
 ## Not done yet
 
 - Points, curves and volumes: tags reserved, nothing written or read.
 - Instances are expanded at load rather than drawn from one copy.
-- Materials: albedo per vertex only. No roughness, metalness, normal maps,
-  transmission. Detail finer than the vertex spacing is lost, which shows on
-  the board's squares (soft edges).
+- Materials: albedo only, per vertex or from texture tiles. No roughness,
+  metalness, normal maps, transmission.
+- The chess set has no tiles yet: it was baked from USD with colours per
+  vertex, so detail finer than the vertex spacing is lost (the board's
+  squares have soft edges). `tools/fkj-import` does not read USD.
 - Positions, normals and colours are decoded to f32 at load; the renderer
   does not yet read the quantised data directly, which would cut memory
   traffic per frame.
 - Level of detail: clusters have no coarser levels yet.
-- No compression beyond quantisation.
-- The converter that baked the chess set is not in the repository, so the
-  file cannot be regenerated from here.
+- No compression beyond quantisation; tiles are raw sRGB8.
+- Tiles are one level per cluster: a cluster's largest triangle sets it for
+  all of them.
+- The converter that baked the chess set from USD is not in the
+  repository, so that file cannot be regenerated from here.

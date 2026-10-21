@@ -66,6 +66,8 @@ pub struct Plan {
     pub bounce_budget_ms: f32,
     /// Bucket edge in pixels.
     pub tile: usize,
+    /// Memory the texture tile cache may hold, bytes.
+    pub texture_cache: usize,
     /// Why, one line per choice.
     pub reasons: Vec<String>,
 }
@@ -342,7 +344,11 @@ impl Hardware {
         }
         reasons.push(format!("buckets {tile} x {tile} ({} KB of depth and ids, L2 {} KB)", tile * tile * 8 / 1024, l2 >> 10));
 
-        Plan { render_scale, pixel_budget, png_size, with_chess, shadows, shadow_res, bounce, bounce_budget_ms, tile, reasons }
+        // Texture tiles: an eighth of available memory, 8 MB to 1 GB.
+        let texture_cache = (self.mem_available.unwrap_or(2 << 30) / 8).clamp(8 << 20, 1 << 30) as usize;
+        reasons.push(format!("texture tile cache up to {} MB", texture_cache >> 20));
+
+        Plan { texture_cache, render_scale, pixel_budget, png_size, with_chess, shadows, shadow_res, bounce, bounce_budget_ms, tile, reasons }
     }
 
     pub fn report(&self) -> String {
