@@ -17,6 +17,7 @@
 //!   fkjensen --no-shadows              point lights without shadow maps
 //!   fkjensen --no-bounce               no bounce light
 //!   fkjensen --hardware                print what this machine is and what FkJensen chooses for it
+//!   fkjensen --fb                      draw to /dev/fb0 even when a display server is running (Linux)
 //!   fkjensen --no-auto                 do not measure the machine; use the fixed defaults
 //!   fkjensen --scale F                 render the window at F of its size (0.0625 to 1)
 //!   fkjensen --chess / --shadows / --bounce   force on what the machine's plan left off
@@ -28,6 +29,8 @@
 
 mod bounce;
 mod camera;
+#[cfg(target_os = "linux")]
+mod fbdev;
 mod fkj;
 mod hardware;
 mod lights;
@@ -119,6 +122,13 @@ struct App {
     /// scaled up when presented.
     render_scale: f32,
     drag: Option<Drag>,
+    /// Set by Esc.
+    quit: bool,
+    /// Size of what the frame is shown on (window or framebuffer).
+    output: (usize, usize),
+    /// When set, the render scale follows the output size so that a frame
+    /// holds about this many pixels (from the machine's plan).
+    pixel_budget: Option<f64>,
     /// Shading, visibility and shadow maps kept between frames.
     renderer: reyes::Renderer,
     /// Which framing `F` last chose.
@@ -156,6 +166,9 @@ impl App {
             cam,
             rig,
             drag: None,
+            quit: false,
+            output: (0, 0),
+            pixel_budget: None,
             renderer: reyes::Renderer::new(),
             wide: true,
             mouse: (0.0, 0.0),
@@ -246,14 +259,13 @@ impl App {
         let Some(w) = &self.window else { return };
         let size = w.inner_size();
         let (pw, ph) = (size.width.max(1), size.height.max(1));
-        let fw = ((pw as f32 * self.render_scale).round() as usize).max(1);
-        let fh = ((ph as f32 * self.render_scale).round() as usize).max(1);
-        if fw != self.frame.width || fh != self.frame.height || !self.surface_sized {
+        if !self.surface_sized || self.output != (pw as usize, ph as usize) {
             if let Some(s) = self.surface.as_mut() {
                 let _ = s.resize(NonZeroU32::new(pw).unwrap(), NonZeroU32::new(ph).unwrap());
                 self.surface_sized = true;
             }
-            self.frame.resize(fw, fh);
+            self.output = (pw as usize, ph as usize);
+            self.fit_frame(pw as usize, ph as usize);
         }
     }
 
@@ -308,7 +320,13 @@ impl App {
     }
 
     fn update_title(&self) {
-        let Some(w) = &self.window else { return };
+        if let Some(w) = &self.window {
+            w.set_title(&self.status_line());
+        }
+    }
+
+    /// What the window title shows.
+    fn status_line(&self) -> String {
         let s = self.frame.stats;
         let cut = raster::cut_lux(&self.settings.sky, self.settings.exposure);
         let light = match self.rig.selected() {
@@ -325,7 +343,7 @@ impl App {
             None => "no lights".into(),
         };
         let sky = if self.settings.sky.on { format!("sky {:.0} lux", self.settings.sky.lux) } else { "sky off".into() };
-        w.set_title(&format!(
+        format!(
             "FkJensen  {}  {:.0} fps  {}x{} ({:.0}% of the window)  {light}  {sky}  {}  shaded {} of {} points  shadows {} ({:.0} ms)  bounce {}  setup {:.0} raster {:.0} shade {:.0} resolve {:.0} ms  CPU only",
             self.scene_name,
             self.title_fps,
@@ -342,7 +360,7 @@ impl App {
             s.raster_ms,
             s.shade_ms,
             s.resolve_ms
-        ));
+        )
     }
 
     /// Height of the ground under the scene: 0 for the built-in set.
@@ -397,7 +415,74 @@ impl App {
         }
     }
 
-    fn key(&mut self, code: KeyCode, pressed: bool, event_loop: &ActiveEventLoop) {
+    /// The cursor moved to (x, y) in output pixels.
+    fn on_cursor(&mut self, x: f32, y: f32) {
+        self.raw_mouse = (x, y);
+        // Picking and dragging work in frame pixels.
+        self.mouse = (x * self.render_scale, y * self.render_scale);
+        let dx = self.raw_mouse.0 - self.last_mouse.0;
+        let dy = self.raw_mouse.1 - self.last_mouse.1;
+        self.last_mouse = self.raw_mouse;
+        let h = self.frame.height as f32 / self.render_scale;
+        if self.drag.is_some() {
+            self.update_drag();
+        } else if self.buttons[0] && !self.shift {
+            self.cam.orbit(dx, dy);
+        } else if self.buttons[1] || (self.buttons[0] && self.shift) {
+            self.cam.pan(dx, dy, h);
+        } else if self.buttons[2] {
+            self.cam.look(dx, dy);
+        }
+    }
+
+    /// Mouse button 0 (left), 1 (middle) or 2 (right) went down or up.
+    fn on_button(&mut self, idx: usize, pressed: bool) {
+        self.buttons[idx] = pressed;
+        if idx == 0 && !pressed {
+            self.drag = None;
+        }
+        if pressed && idx == 0 {
+            if self.keys.contains(&KeyCode::Digit1) {
+                self.place_light(false);
+                self.buttons[0] = false;
+            } else if self.keys.contains(&KeyCode::Digit2) {
+                self.place_light(true);
+                self.buttons[0] = false;
+            } else if self.rig.show {
+                let cam = self.render_camera();
+                if let Some(i) = self.rig.pick(&cam, self.frame.width, self.frame.height, self.mouse.0, self.mouse.1, self.render_scale) {
+                    self.rig.selected = i;
+                    self.drag = Some(Drag { light: i, anchor: self.rig.lights[i].position, plane: self.drag_plane() });
+                }
+            }
+        }
+    }
+
+    fn on_wheel(&mut self, steps: f32) {
+        if let Some(d) = &self.drag {
+            let eye = self.cam.eye();
+            if let Some(l) = self.rig.lights.get_mut(d.light) {
+                l.position = lights::push_pull(eye, l.position, -steps);
+            }
+            self.reanchor_drag();
+        } else {
+            self.cam.dolly(steps);
+        }
+    }
+
+    /// Size the frame for an output of `ow` x `oh` pixels: the render scale
+    /// follows the pixel budget unless it was set by hand.
+    fn fit_frame(&mut self, ow: usize, oh: usize) {
+        if let Some(b) = self.pixel_budget {
+            self.render_scale = ((b / (ow * oh).max(1) as f64).sqrt() as f32).clamp(0.0625, 1.0);
+        }
+        let fw = ((ow as f32 * self.render_scale).round() as usize).max(1);
+        let fh = ((oh as f32 * self.render_scale).round() as usize).max(1);
+        self.frame.resize(fw, fh);
+    }
+
+    /// A key went down or up. Esc sets `quit`.
+    fn key(&mut self, code: KeyCode, pressed: bool) {
         if pressed {
             self.keys.insert(code);
         } else {
@@ -415,7 +500,7 @@ impl App {
             return;
         }
         match code {
-            KeyCode::Escape => event_loop.exit(),
+            KeyCode::Escape => self.quit = true,
             KeyCode::KeyF => {
                 self.wide = !self.wide;
                 frame_camera(&mut self.cam, &self.scene, self.wide);
@@ -447,7 +532,12 @@ impl App {
                 // Z: render at a finer resolution, Shift+Z: coarser.
                 let s = if self.shift { self.render_scale / 1.25 } else { self.render_scale * 1.25 };
                 self.render_scale = s.clamp(0.0625, 1.0);
+                self.pixel_budget = None;
                 self.surface_sized = false;
+                let (ow, oh) = self.output;
+                if ow > 0 {
+                    self.fit_frame(ow, oh);
+                }
             }
             KeyCode::KeyC => self.rig.cycle_colour(),
             KeyCode::KeyP => match save_png(&self.frame, "frame.png") {
@@ -554,70 +644,29 @@ impl ApplicationHandler for App {
                     w.request_redraw();
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.raw_mouse = (position.x as f32, position.y as f32);
-                // Picking and dragging work in frame pixels.
-                self.mouse = (self.raw_mouse.0 * self.render_scale, self.raw_mouse.1 * self.render_scale);
-                let dx = self.raw_mouse.0 - self.last_mouse.0;
-                let dy = self.raw_mouse.1 - self.last_mouse.1;
-                self.last_mouse = self.raw_mouse;
-                let h = self.frame.height as f32 / self.render_scale;
-                if self.drag.is_some() {
-                    self.update_drag();
-                } else if self.buttons[0] && !self.shift {
-                    self.cam.orbit(dx, dy);
-                } else if self.buttons[1] || (self.buttons[0] && self.shift) {
-                    self.cam.pan(dx, dy, h);
-                } else if self.buttons[2] {
-                    self.cam.look(dx, dy);
-                }
-            }
+            WindowEvent::CursorMoved { position, .. } => self.on_cursor(position.x as f32, position.y as f32),
             WindowEvent::MouseInput { state, button, .. } => {
-                let pressed = state == ElementState::Pressed;
                 let idx = match button {
                     MouseButton::Left => 0,
                     MouseButton::Middle => 1,
                     MouseButton::Right => 2,
                     _ => return,
                 };
-                self.buttons[idx] = pressed;
-                if idx == 0 && !pressed {
-                    self.drag = None;
-                }
-                if pressed && idx == 0 {
-                    if self.keys.contains(&KeyCode::Digit1) {
-                        self.place_light(false);
-                        self.buttons[0] = false;
-                    } else if self.keys.contains(&KeyCode::Digit2) {
-                        self.place_light(true);
-                        self.buttons[0] = false;
-                    } else if self.rig.show {
-                        let cam = self.render_camera();
-                        if let Some(i) = self.rig.pick(&cam, self.frame.width, self.frame.height, self.mouse.0, self.mouse.1, self.render_scale) {
-                            self.rig.selected = i;
-                            self.drag = Some(Drag { light: i, anchor: self.rig.lights[i].position, plane: self.drag_plane() });
-                        }
-                    }
-                }
+                self.on_button(idx, state == ElementState::Pressed);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let steps = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                 };
-                if let Some(d) = &self.drag {
-                    let eye = self.cam.eye();
-                    if let Some(l) = self.rig.lights.get_mut(d.light) {
-                        l.position = lights::push_pull(eye, l.position, -steps);
-                    }
-                    self.reanchor_drag();
-                } else {
-                    self.cam.dolly(steps);
-                }
+                self.on_wheel(steps);
             }
             WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(code), state, repeat, .. }, .. } => {
                 if !repeat {
-                    self.key(code, state == ElementState::Pressed, event_loop);
+                    self.key(code, state == ElementState::Pressed);
+                    if self.quit {
+                        event_loop.exit();
+                    }
                 }
             }
             WindowEvent::DroppedFile(path) => self.open(path),
@@ -696,6 +745,7 @@ fn main() {
     let mut hardware_only = false;
     let mut scale: Option<f32> = None;
     let mut bench_drag = false;
+    let mut use_fb = false;
     let mut look: Option<(Vec3, Vec3)> = None;
     let mut chess: Option<bool> = None;
     let mut shadow_res: Option<usize> = None;
@@ -753,6 +803,7 @@ fn main() {
                 i += 1;
             }
             "--bench-drag" => bench_drag = true,
+            "--fb" => use_fb = true,
             "--no-chess" => chess = Some(false),
             "--chess" => chess = Some(true),
             "--shadow-res" => {
@@ -776,7 +827,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]chess] [--shadow-res N] [--scale F] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]chess] [--shadow-res N] [--scale F] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--fb]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -846,6 +897,7 @@ fn main() {
         app.settings.bounce_budget_ms = Some(p.bounce_budget_ms);
         app.settings.tile = p.tile;
         app.render_scale = p.render_scale;
+        app.pixel_budget = Some(p.pixel_budget);
     }
     if let Some(v) = shadows {
         app.settings.shadows = v;
@@ -858,6 +910,7 @@ fn main() {
     }
     if let Some(v) = scale {
         app.render_scale = v.clamp(0.0625, 1.0);
+        app.pixel_budget = None;
     }
     let size = size.or(plan.as_ref().map(|p| p.png_size)).unwrap_or((1280, 720));
 
@@ -942,9 +995,96 @@ fn main() {
     }
 
     eprintln!("{CONTROLS}");
-    let event_loop = EventLoop::new().expect("event loop");
+
+    // No X or Wayland (a Raspberry Pi on its text console): draw straight
+    // to the framebuffer instead of opening a window.
+    #[cfg(target_os = "linux")]
+    if use_fb || fbdev::no_display_server() {
+        if let Err(e) = run_framebuffer(&mut app) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = use_fb;
+
+    let event_loop = match EventLoop::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("cannot open a window: {e}");
+            std::process::exit(1);
+        }
+    };
     event_loop.set_control_flow(ControlFlow::Poll);
     event_loop.run_app(&mut app).expect("run");
+}
+
+/// Render to /dev/fb0, reading keys and mouse from /dev/input, until Esc.
+#[cfg(target_os = "linux")]
+fn run_framebuffer(app: &mut App) -> Result<(), String> {
+    let mut fb = fbdev::Framebuffer::open("/dev/fb0")?;
+    let mut input = fbdev::Input::open();
+    let g = fb.geometry;
+    app.output = (g.width, g.height);
+    app.fit_frame(g.width, g.height);
+    eprintln!(
+        "no display server: drawing to /dev/fb0, {}x{} at {} bits per pixel, rendering {}x{}; {} input devices{}",
+        g.width,
+        g.height,
+        g.format.bits,
+        app.frame.width,
+        app.frame.height,
+        input.device_count(),
+        if input.device_count() == 0 { " (add the user to the input group for keyboard and mouse)" } else { "" }
+    );
+    // Over ssh the status goes to the ssh terminal; on the console itself
+    // it would be drawn over the picture, so it is left out there.
+    let over_ssh = std::env::var_os("SSH_CONNECTION").is_some();
+    let console = fbdev::Console::take();
+    let r = fb_loop(app, &mut fb, || input.poll(), over_ssh, None);
+    drop(console);
+    r
+}
+
+/// The framebuffer main loop: input, a frame, show it. Stops on Esc or
+/// after `max_frames`.
+#[cfg(target_os = "linux")]
+fn fb_loop(app: &mut App, fb: &mut fbdev::Framebuffer, mut poll: impl FnMut() -> fbdev::Events, status: bool, max_frames: Option<usize>) -> Result<(), String> {
+    let g = fb.geometry;
+    let mut cursor = (g.width as f32 / 2.0, g.height as f32 / 2.0);
+    let mut last_status = Instant::now();
+    let mut frames = 0;
+    app.last_frame = Instant::now();
+    while !app.quit && max_frames.is_none_or(|m| frames < m) {
+        frames += 1;
+        let ev = poll();
+        for (k, down) in ev.keys {
+            app.key(k, down);
+            let (ow, oh) = app.output;
+            if (app.frame.width, app.frame.height) != (((ow as f32 * app.render_scale).round() as usize).max(1), ((oh as f32 * app.render_scale).round() as usize).max(1)) {
+                app.fit_frame(ow, oh);
+            }
+        }
+        if ev.motion != (0, 0) {
+            cursor.0 = (cursor.0 + ev.motion.0 as f32).clamp(0.0, g.width as f32 - 1.0);
+            cursor.1 = (cursor.1 + ev.motion.1 as f32).clamp(0.0, g.height as f32 - 1.0);
+            app.on_cursor(cursor.0, cursor.1);
+        }
+        for (b, down) in ev.buttons {
+            app.on_button(b, down);
+        }
+        if ev.wheel != 0 {
+            app.on_wheel(ev.wheel as f32);
+        }
+        app.tick();
+        fb.show(&app.frame.color, app.frame.width, app.frame.height, Some((cursor.0 as usize, cursor.1 as usize))).map_err(|e| format!("/dev/fb0: {e}"))?;
+        if status && last_status.elapsed().as_secs_f32() >= 2.0 {
+            eprintln!("{}", app.status_line());
+            last_status = Instant::now();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1082,5 +1222,50 @@ mod tests {
             }
         }
         assert!(mountains > 20, "{mountains} mountain clusters in view");
+    }
+
+    /// The framebuffer loop on a file standing in for /dev/fb0: frames
+    /// arrive, and a mouse drag from a light's disc moves that light.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn framebuffer_loop_draws_and_drags() {
+        let mut scene = world::build();
+        scene.lights = world::table_lights();
+        let mut app = App::new(scene, "test".into());
+        app.settings = RenderSettings { shadows: false, bounce: false, ..RenderSettings::new(Sky { lux: DEFAULT_SKY_LUX, on: true }) };
+        let (w, h) = (192usize, 108usize);
+        let dir = std::env::temp_dir().join(format!("fkjensen-fbloop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fb");
+        let g = fbdev::Geometry { width: w, height: h, stride: w * 4, offset: 0, format: fbdev::Format { bits: 32, red: (16, 8), green: (8, 8), blue: (0, 8) } };
+        std::fs::write(&path, vec![0u8; g.stride * h]).unwrap();
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut fb = fbdev::Framebuffer::with_geometry(f, g);
+        app.output = (w, h);
+        app.fit_frame(w, h);
+        // One frame, to find where the first light is on screen.
+        fb_loop(&mut app, &mut fb, fbdev::Events::default, false, Some(1)).unwrap();
+        let cam = app.render_camera();
+        let (lx, ly, _) = raster::project(&cam, app.frame.width, app.frame.height, app.rig.lights[0].position).unwrap();
+        let before = app.rig.lights[0].position;
+        // Scripted input: move the cursor from the centre onto the light,
+        // press, move 20 pixels right, release.
+        let mut script = vec![
+            fbdev::Events { motion: ((lx - w as f32 / 2.0) as i32, (ly - h as f32 / 2.0) as i32), ..Default::default() },
+            fbdev::Events { buttons: vec![(0, true)], ..Default::default() },
+            fbdev::Events { motion: (20, 0), ..Default::default() },
+            fbdev::Events { buttons: vec![(0, false)], ..Default::default() },
+        ]
+        .into_iter();
+        fb_loop(&mut app, &mut fb, || script.next().unwrap_or_default(), false, Some(4)).unwrap();
+        let after = app.rig.lights[0].position;
+        assert!(after.distance(before) > 0.01, "the light moved: {before} -> {after}");
+        let out = std::fs::read(&path).unwrap();
+        assert!(out.iter().any(|b| *b != 0), "a frame reached the framebuffer");
+        // Esc stops the loop.
+        let mut esc = vec![fbdev::Events { keys: vec![(KeyCode::Escape, true)], ..Default::default() }].into_iter();
+        fb_loop(&mut app, &mut fb, || esc.next().unwrap_or_default(), false, Some(100)).unwrap();
+        assert!(app.quit);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

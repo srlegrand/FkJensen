@@ -51,8 +51,11 @@ pub struct Hardware {
 /// What FkJensen chooses for this machine.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
-    /// The window renders at this fraction of its size and is scaled up.
+    /// The window renders at this fraction of its size and is scaled up
+    /// (for a 1280 x 720 window; any other output follows `pixel_budget`).
     pub render_scale: f32,
+    /// Pixels a frame can have to re-shade in the interactive time.
+    pub pixel_budget: f64,
     /// Size of a `--png` render when `--size` is not given.
     pub png_size: (usize, usize),
     pub with_chess: bool,
@@ -271,10 +274,12 @@ impl Hardware {
         // Window: shade a whole frame in INTERACTIVE_S. The scale applies
         // to each side of a 1280 x 720 window.
         let px = rate * INTERACTIVE_S / POINTS_PER_PIXEL;
+        let pixel_budget = px;
         let render_scale = ((px / (1280.0 * 720.0)).sqrt() as f32).clamp(0.125, 1.0);
         let render_scale = (render_scale * 8.0).round().max(1.0) / 8.0;
         reasons.push(format!(
-            "window renders at {:.0}% of its size: about {:.2} M shading points/s in a frame, {} ms per frame at {POINTS_PER_PIXEL} points per pixel",
+            "frames of about {:.0} K pixels ({:.0}% of a 1280 x 720 window): about {:.2} M shading points/s in a frame, {} ms per frame at {POINTS_PER_PIXEL} points per pixel",
+            pixel_budget / 1e3,
             render_scale * 100.0,
             rate / 1e6,
             (INTERACTIVE_S * 1000.0) as u32
@@ -337,7 +342,7 @@ impl Hardware {
         }
         reasons.push(format!("buckets {tile} x {tile} ({} KB of depth and ids, L2 {} KB)", tile * tile * 8 / 1024, l2 >> 10));
 
-        Plan { render_scale, png_size, with_chess, shadows, shadow_res, bounce, bounce_budget_ms, tile, reasons }
+        Plan { render_scale, pixel_budget, png_size, with_chess, shadows, shadow_res, bounce, bounce_budget_ms, tile, reasons }
     }
 
     pub fn report(&self) -> String {

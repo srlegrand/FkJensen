@@ -145,7 +145,7 @@ From those it chooses:
 
 | choice | rule |
 |---|---|
-| window render scale | shade a whole frame in 150 ms at 3 points per pixel, from 12.5% to 100% of the window, scaled up with nearest pixels |
+| render resolution | a pixel budget: a whole frame shaded in 150 ms at 3 points per pixel; the window or screen renders at the scale that fits it, from 6.25% to 100%, scaled up with nearest pixels |
 | `--png` size without `--size` | about 2 s of shading, up to 1280 x 720 |
 | chess set | at least 600 MB available, and its triangles' memory traffic per frame (100 bytes each) under 250 ms |
 | shadow maps | 512, 256 or 128 texels per face by speed, halved until 17 lights fit in a tenth of free memory; off below 64 |
@@ -165,7 +165,7 @@ On the machine this was written on (20/10/2026):
     caches (per core or shared): L1 data 48 KB, L1 instruction 32 KB, L2 unified 2048 KB, L3 unified 266240 KB
     memory: 7.84 GB total, 7.27 GB available
     measured: memory read 10.14 GB/s on one core, 18.75 GB/s on all; shading benchmark 16.79 M points/s on all cores (637 ms to measure)
-      window renders at 62% of its size: about 8.39 M shading points/s in a frame, 150 ms per frame at 3 points per pixel
+      frames of about 434 K pixels (62% of a 1280 x 720 window): about 8.68 M shading points/s in a frame, 150 ms per frame at 3 points per pixel
       --png without --size renders 1280x720 (about 2 s of shading)
       chess set loaded: 7446 MB available, its triangles take 8 ms of memory traffic per frame
       shadow maps 512 x 512 per face (107.0 MB for 17 lights)
@@ -174,8 +174,28 @@ On the machine this was written on (20/10/2026):
 
 On a Raspberry Pi 1 Model B Rev 1 (59 MB available, about 80 K shading
 points per second measured in a frame on 20/10/2026) the rules give, as the
-tests check: no chess set, no bounce light, 128 x 128 shadow maps, a window
-at 12.5% of its size and stills of about 304 x 171. Not yet run on the Pi.
+tests check: no chess set, no bounce light, 128 x 128 shadow maps, frames
+of about 4 K pixels (its 1080 x 1920 screen renders at the 6.25% floor,
+68 x 120) and stills of about 304 x 171. Not yet run on the Pi.
+
+## Without a display server
+
+When neither X nor Wayland is running, as on a Raspberry Pi at its text
+console, FkJensen draws straight to the Linux framebuffer (`src/fbdev.rs`)
+instead of opening a window: each frame is scaled up to the screen and
+converted to the framebuffer's pixel format (16, 24 or 32 bits, read with
+the `FBIOGET_VSCREENINFO` and `FBIOGET_FSCREENINFO` ioctls), and the
+keyboard and mouse are read from `/dev/input/event*`. The controls are the
+same; a small cross shows the mouse. Esc quits and gives the console back.
+`--fb` uses the framebuffer even when a display server is running.
+
+The user needs to be in the `video` group (framebuffer) and the `input`
+group (keyboard, mouse). Over ssh, the status line that the window title
+would show is printed to the ssh terminal every 2 s; on the console itself
+it is left out, since it would be drawn over the picture.
+
+The render resolution follows the screen: a frame holds the machine's pixel
+budget (`--hardware` prints it), scaled up to fill the screen.
 
 ## Build
 
@@ -397,6 +417,8 @@ Not measured yet: a Raspberry Pi.
   it (`docs/format.md`).
 - Light rigs and the sky setting are not saved.
 - Text overlay: the numbers are in the window title.
+- Framebuffer output: no vsync and no double buffering, so a frame can
+  tear while it is written; dropping a file to open it needs a window.
 - Hardware detection reads Linux's `/proc` and `/sys`. On macOS and
   Windows it gets cores, SIMD features and the two measurements, but not
   cache or memory sizes, and assumes enough memory.

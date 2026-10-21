@@ -66,6 +66,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 21/10/2026: without X or Wayland, frames go straight to the Linux framebuffer (/dev/fb0) and input comes from /dev/input; the render resolution follows the screen through the machine's pixel budget.
 - 20/10/2026: the machine decides: hardware detection and measurement at start, and a plan (render scale, still size, chess set, shadow map size, bounce, bucket size) from it. Clarisse added to the prior art.
 - 20/10/2026: bounce light as point-based colour bleeding: surfels lit directly, a tree of them, receivers that gather into a small cube raster filled nearest first and folded into spherical harmonics; one bounce; gathered within a time budget per frame, invalidated by light reach. The chess set re-baked with USD's left-handed winding honoured.
 - 19/10/2026: first REYES build. Triangles diced into micropolygons in world space by screen size, shaded and kept per cluster; a light change re-shades only the clusters in its old and new reach; visibility kept while the camera is still; cube shadow maps per point light holding only the geometry in reach. The visibility pass still uses a depth buffer of triangle ids to hide surfaces, and resolves pixels from the kept micropolygons. Reflections, bounce light and adaptive refinement not started.
