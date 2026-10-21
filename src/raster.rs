@@ -112,23 +112,35 @@ pub struct TriSetup {
 
 /// The sky: light from every direction above, with nothing between it and
 /// any surface, so a mountain 10 km away and a pawn are lit by it alike.
+/// This is the sky as light; how it looks behind the scene is `Backdrop`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sky {
     /// Illuminance on an upward-facing surface, in lux.
     pub lux: f32,
     pub on: bool,
+    /// Colour of its light on an upward-facing surface, luminance about 1.
+    pub tint: Vec3,
+    /// Lighting contrast, 0 to 1: at 0 every facing gets the same light
+    /// (overcast, flat) and twice as much of it; at 0.5 the light falls off
+    /// evenly from up to down; at 1 it comes from overhead only, half as
+    /// strong. Changes shading, never the backdrop.
+    pub contrast: f32,
 }
 
 /// Sky colour seen straight up and at the horizon, luminance about 1.
-const SKY_ZENITH: Vec3 = Vec3::new(0.55, 0.78, 1.45);
-const SKY_HORIZON: Vec3 = Vec3::new(1.15, 1.0, 0.85);
+pub const SKY_ZENITH: Vec3 = Vec3::new(0.55, 0.78, 1.45);
+pub const SKY_HORIZON: Vec3 = Vec3::new(1.15, 1.0, 0.85);
 /// Light coming back up from the ground, as a share of the sky's.
 const GROUND_BOUNCE: f32 = 0.2;
 const GROUND_TINT: Vec3 = Vec3::new(1.0, 1.0, 0.9);
 /// Colour of the sky's light on an upward-facing surface (luminance 1).
-const SKY_IRRADIANCE_TINT: Vec3 = Vec3::new(0.82, 0.95, 1.25);
+pub const SKY_IRRADIANCE_TINT: Vec3 = Vec3::new(0.82, 0.95, 1.25);
 
 impl Sky {
+    pub fn new(lux: f32, on: bool) -> Sky {
+        Sky { lux, on, tint: SKY_IRRADIANCE_TINT, contrast: 0.5 }
+    }
+
     /// Illuminance in lux, per colour channel, on a surface facing `n`.
     #[allow(dead_code)]
     pub fn irradiance(&self, n: Vec3) -> Vec3 {
@@ -143,23 +155,102 @@ impl Sky {
             return Vec3::ZERO;
         }
         let up = n.y * 0.5 + 0.5;
+        let c = self.contrast.clamp(0.0, 1.0);
+        // How much of the sky a facing gets, and how strong the sky's
+        // light is, by contrast.
+        let f = if c <= 0.5 { 1.0 + (up - 1.0) * (2.0 * c) } else { up.powf(1.0 + 6.0 * (c - 0.5)) };
+        let fill = (1.0 - 2.0 * c).exp2();
         let g = if ground { GROUND_TINT * GROUND_BOUNCE * (1.0 - up) } else { Vec3::ZERO };
-        self.lux * (SKY_IRRADIANCE_TINT * up + g)
+        self.lux * fill * (self.tint * f + g)
+    }
+}
+
+/// How the sky looks behind the scene: never lights anything, so changing
+/// it re-shades nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Backdrop {
+    pub zenith: Vec3,
+    pub horizon: Vec3,
+    /// Visible sky contrast, 0 to 1: 0 is one flat colour, 0.5 the gradient
+    /// as given, 1 twice as strong; it also sets the sun's glow.
+    pub contrast: f32,
+}
+
+impl Default for Backdrop {
+    fn default() -> Self {
+        Backdrop { zenith: SKY_ZENITH, horizon: SKY_HORIZON, contrast: 0.5 }
+    }
+}
+
+/// The sun: infinitely far, parallel light and parallel shadows, the same
+/// on everything in the scene. Its brightness is 0 to 1000: 0 is none, 1000
+/// lights a white surface facing it to full white at the current exposure.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sun {
+    /// Unit direction towards the sun.
+    pub dir: Vec3,
+    pub color: Vec3,
+    pub brightness: f32,
+}
+
+pub const SUN_MAX: f32 = 1000.0;
+
+impl Default for Sun {
+    fn default() -> Self {
+        Sun { dir: Vec3::new(0.3, 0.7, 0.6).normalize(), color: Vec3::ONE, brightness: 0.0 }
+    }
+}
+
+impl Sun {
+    /// Whether it lights anything: some brightness, above the horizon.
+    pub fn up(&self) -> bool {
+        self.brightness > 0.0 && self.dir.y > 0.0
     }
 
-    /// Radiance in cd/m², per colour channel, seen looking along `dir`.
-    pub fn radiance(&self, dir: Vec3) -> Vec3 {
-        if !self.on {
+    /// Illuminance on a surface facing it, lux per channel, at `exposure`.
+    /// At 1000, a white surface facing it shows 4 before the tone curve,
+    /// which the curve takes to full white.
+    pub fn lux(&self, exposure: f32) -> Vec3 {
+        if !self.up() {
             return Vec3::ZERO;
         }
-        let l = self.lux / std::f32::consts::PI;
+        let at_white = 4.0 * std::f32::consts::PI / exposure.max(1e-12);
+        self.color * (self.brightness.clamp(0.0, SUN_MAX) / SUN_MAX * at_white)
+    }
+}
+
+/// Radiance (cd/m²) of the backdrop seen along `dir`, with the sun's disc
+/// and glow.
+pub fn backdrop_radiance(sky: &Sky, look: &Backdrop, sun: &Sun, exposure: f32, dir: Vec3) -> Vec3 {
+    let mut c = Vec3::ZERO;
+    if sky.on {
+        let l = sky.lux / std::f32::consts::PI;
         if dir.y >= 0.0 {
             let t = dir.y.sqrt();
-            l * SKY_HORIZON.lerp(SKY_ZENITH, t)
+            let k = look.contrast.clamp(0.0, 1.0);
+            let g = look.horizon.lerp(look.zenith, t);
+            let mean = (look.horizon + look.zenith) * 0.5;
+            // Below 0.5 the colours flatten towards one; above it the
+            // horizon also brightens and the zenith darkens.
+            let ramp = 1.0 + (3.2 * (k - 0.5)).max(0.0) * (0.5 - t);
+            c = l * ((mean + (g - mean) * (2.0 * k)) * ramp).max(Vec3::ZERO);
         } else {
-            l * GROUND_BOUNCE * GROUND_TINT
+            c = l * GROUND_BOUNCE * GROUND_TINT;
         }
     }
+    if sun.up() && dir.y > -0.02 {
+        let cos = dir.dot(sun.dir).clamp(-1.0, 1.0);
+        let ang = cos.acos();
+        let e = sun.lux(exposure);
+        // The disc, 0.27 degrees in radius, drawn at a radius of 0.6 so it
+        // reads at viewport sizes: full white.
+        if ang < 0.6f32.to_radians() {
+            return Vec3::splat(8.0 / exposure.max(1e-12));
+        }
+        // The glow round it, stronger with the visible sky's contrast.
+        c += e / std::f32::consts::PI * (0.12 * look.contrast.clamp(0.0, 1.0) * 2.0 * (-ang / 0.09).exp());
+    }
+    c
 }
 
 /// What the shade pass writes.
@@ -176,6 +267,9 @@ pub struct RenderSettings {
     /// Display value per cd/m², before the tone curve.
     pub exposure: f32,
     pub sky: Sky,
+    /// How the sky looks behind the scene.
+    pub backdrop: Backdrop,
+    pub sun: Sun,
     /// Skip lights at pixels beyond their reach. Off only to compare.
     pub light_reach: bool,
     /// Shadow maps for the point lights.
@@ -193,14 +287,20 @@ pub struct RenderSettings {
 
 impl RenderSettings {
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded }
+        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded }
     }
 }
 
 /// An exposure that keeps sky-lit surfaces in the lower half of the
 /// display, so lamps read against them.
 pub fn default_exposure(sky_lux: f32) -> f32 {
-    std::f32::consts::PI / (8.0 * sky_lux.max(1.0))
+    // Follows the sky three quarters of the way: noon reads brighter than
+    // dusk, and night darker, as the eye sees them. Equal to the old rule
+    // (a sky-lit white surface at 1/8 of the display) at 30 lux. It stops
+    // following at the end of civil twilight (3 lux): past it the night
+    // sky goes dark and the lamps carry the picture.
+    let lux = sky_lux.max(3.0);
+    std::f32::consts::PI / (8.0 * 30f32.powf(0.25) * lux.powf(0.75))
 }
 
 /// Largest radiance a surface sends per lux it receives: white diffuse
@@ -804,6 +904,36 @@ pub fn pack(c: Vec3) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sun_at_1000_is_full_white_and_0_is_nothing() {
+        for exposure in [0.0001, 0.01, 1.0] {
+            let sun = Sun { dir: Vec3::Y, color: Vec3::ONE, brightness: SUN_MAX };
+            // A white surface facing it.
+            let shown = tonemap(sun.lux(exposure) / std::f32::consts::PI * exposure);
+            assert!((shown - Vec3::ONE).abs().max_element() < 1e-4, "{shown}");
+            assert_eq!(Sun { brightness: 0.0, ..sun }.lux(exposure), Vec3::ZERO);
+            assert_eq!(Sun { dir: Vec3::NEG_Y, ..sun }.lux(exposure), Vec3::ZERO, "below the horizon");
+        }
+    }
+
+    #[test]
+    fn lighting_contrast_shapes_the_sky_light_only() {
+        let mut sky = Sky::new(100.0, true);
+        let at = |sky: &Sky, n: Vec3| sky.irradiance_from(n, false).y;
+        sky.contrast = 0.0;
+        assert!((at(&sky, Vec3::Y) - at(&sky, Vec3::NEG_Y)).abs() < 1e-3, "flat: every facing alike");
+        sky.contrast = 0.5;
+        assert!((at(&sky, Vec3::X) / at(&sky, Vec3::Y) - 0.5).abs() < 1e-3, "default: sideways gets half");
+        sky.contrast = 1.0;
+        assert!(at(&sky, Vec3::X) / at(&sky, Vec3::Y) < 0.1, "overhead: sideways gets little");
+        // The backdrop does not move with it.
+        let look = Backdrop::default();
+        let sun = Sun::default();
+        let a = backdrop_radiance(&Sky { contrast: 0.0, ..sky }, &look, &sun, 0.01, Vec3::new(0.0, 0.5, -1.0).normalize());
+        let b = backdrop_radiance(&Sky { contrast: 1.0, ..sky }, &look, &sun, 0.01, Vec3::new(0.0, 0.5, -1.0).normalize());
+        assert_eq!(a, b);
+    }
     use crate::reyes::render;
 
     fn quad_scene() -> Scene {
@@ -814,7 +944,7 @@ mod tests {
     }
 
     fn settings() -> RenderSettings {
-        RenderSettings { exposure: 0.05, ..RenderSettings::new(Sky { lux: 100.0, on: false }) }
+        RenderSettings { exposure: 0.05, ..RenderSettings::new(Sky::new(100.0, false)) }
     }
 
     fn camera(w: usize, h: usize) -> Camera {
@@ -920,7 +1050,7 @@ mod tests {
         scene.push_mesh(&card(Vec3::new(1500.0, 0.0, -5000.0), 900.0), &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
         let (w, h) = (200, 100);
         let mut frame = Frame::new(w, h);
-        let settings = RenderSettings::new(Sky { lux: 500.0, on: true });
+        let settings = RenderSettings::new(Sky::new(500.0, true));
         render(&scene, &camera(w, h), &[], &settings, &mut frame);
         let near = frame.color[h / 2 * w + w / 2 - 10];
         let far = frame.color[h / 2 * w + w / 2 + 30];
@@ -931,7 +1061,7 @@ mod tests {
 
     #[test]
     fn reach_is_where_illuminance_meets_the_cut() {
-        let sky = Sky { lux: 30.0, on: true };
+        let sky = Sky::new(30.0, true);
         let cut = cut_lux(&sky, default_exposure(sky.lux));
         for lm in [12.0, 400.0, 12_000.0, crate::scene::MAX_LUMENS] {
             let l = PointLight { position: Vec3::ZERO, color: Vec3::ONE, lumens: lm };
@@ -953,11 +1083,11 @@ mod tests {
         scene.push_mesh(&far, &[], &[], &idx);
         let lights = [PointLight { position: Vec3::new(0.0, 1.5, 1.5), color: Vec3::ONE, lumens: 400.0 }];
         let (w, h) = (200, 150);
-        let settings = RenderSettings::new(Sky { lux: 30.0, on: true });
+        let settings = RenderSettings::new(Sky::new(30.0, true));
         let mut culled = Frame::new(w, h);
         render(&scene, &camera(w, h), &lights, &settings, &mut culled);
         let mut full = Frame::new(w, h);
-        render(&scene, &camera(w, h), &lights, &RenderSettings { light_reach: false, ..RenderSettings::new(Sky { lux: 30.0, on: true }) }, &mut full);
+        render(&scene, &camera(w, h), &lights, &RenderSettings { light_reach: false, ..RenderSettings::new(Sky::new(30.0, true)) }, &mut full);
         assert!(culled.stats.light_evals < full.stats.light_evals, "{:?} vs {:?}", culled.stats, full.stats);
         assert_eq!(full.stats.light_evals, full.stats.light_evals_all);
         // The picture does not change by more than one 8-bit step anywhere.

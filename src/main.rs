@@ -8,6 +8,10 @@
 //!   fkjensen --png out.png             render one frame to a file, no window
 //!   fkjensen --size 1920x1080 --png out.png
 //!   fkjensen --light x,y,z[,lumens]    replace the scene's lights (repeatable)
+//!   fkjensen --time 12:00              time of day: sun, sky and exposure (opens at dusk)
+//!   fkjensen --sun B                   sun brightness, 0 to 1000 (1000: white at full)
+//!   fkjensen --light-contrast C        0 flat overcast, 0.5 default, 1 overhead only
+//!   fkjensen --sky-contrast C          the visible sky's gradient and sun glow, 0 to 1
 //!   fkjensen --sky LUX                 sky illuminance, 0 for no sky
 //!   fkjensen --exposure E              display value per cd/m²
 //!   fkjensen --view lights             show how many lights each pixel evaluates
@@ -40,6 +44,7 @@ mod raster;
 mod reyes;
 mod scene;
 mod shadow;
+mod sun;
 mod texture;
 mod world;
 
@@ -69,7 +74,7 @@ const DEFAULT_SKY_LUX: f32 = 30.0;
 
 const CONTROLS: &str = "\
 Controls
-  Lights: point lights in lumens, 1 lm to 2,000,000 lm, plus the sky
+  Lights: point lights in lumens, 1 lm to 2,000,000 lm, the sun and the sky
   left drag on a light   move it, facing the camera (stays at its depth)
     + Ctrl               move it level, over the set (keeps its height)
     + wheel              push it away / pull it closer
@@ -80,6 +85,10 @@ Controls
   Tab                    select next light     Delete   remove selected light
   + / -                  lumens x1.25          C        cycle colour
   L                      show / hide lights    R        reset to the scene's lights
+  T / Shift+T            time of day later / earlier (15 min): sun, sky, exposure
+  Y / Shift+Y            sun brighter / dimmer (0 to 1000, steps of 50)
+  J / Shift+J            lighting contrast up / down: flat overcast to overhead
+  U / Shift+U            visible sky contrast up / down (the backdrop only)
   K                      sky on / off          , / .    sky dimmer / brighter (x2)
   H                      light count view: how many lights each pixel evaluates
   X                      light reach off / on (to compare cost and picture)
@@ -153,6 +162,9 @@ struct App {
     last_frame: Instant,
     fps_accum: (f32, u32),
     title_fps: f32,
+    /// Time of day in hours: sets the sun's direction and colour, the sky
+    /// and the exposure (`daylight`).
+    hours: f32,
     /// `--visual-debug`: the view shown (Some(Final) for the picture).
     #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
     visual: VisualDebug,
@@ -171,7 +183,7 @@ impl App {
             frame: Frame::new(1, 1),
             // In the window, bounce light is gathered for 30 ms a frame and
             // catches up over the following frames.
-            settings: RenderSettings { bounce_budget_ms: Some(30.0), ..RenderSettings::new(Sky { lux: DEFAULT_SKY_LUX, on: true }) },
+            settings: RenderSettings { bounce_budget_ms: Some(30.0), ..RenderSettings::new(Sky::new(DEFAULT_SKY_LUX, true)) },
             scene,
             scene_name,
             cam,
@@ -194,6 +206,7 @@ impl App {
             fps_accum: (0.0, 0),
             title_fps: 0.0,
             visual: None,
+            hours: sun::hour_for_dusk_lux(DEFAULT_SKY_LUX),
         }
     }
 
@@ -209,6 +222,20 @@ impl App {
             }
             Err(e) => eprintln!("{e}"),
         }
+    }
+
+    /// Set the sun, the sky and the exposure from `hours`, keeping the
+    /// sun's brightness and both contrasts.
+    fn apply_daylight(&mut self) {
+        let d = sun::daylight(self.hours);
+        let s = &mut self.settings;
+        s.sun.dir = d.sun_dir;
+        s.sun.color = d.sun_color;
+        s.sky.lux = d.sky_lux;
+        s.sky.tint = d.sky_tint;
+        s.backdrop.zenith = d.zenith;
+        s.backdrop.horizon = d.horizon;
+        s.exposure = raster::default_exposure(d.sky_lux);
     }
 
     fn render_camera(&self) -> Camera {
@@ -368,7 +395,16 @@ impl App {
             ),
             None => "no lights".into(),
         };
-        let sky = if self.settings.sky.on { format!("sky {:.0} lux", self.settings.sky.lux) } else { "sky off".into() };
+        let sky = format!(
+            "{:02}:{:02}  sun {:.0}{}  sky {}  contrast light {:.2} sky {:.2}",
+            self.hours as u32,
+            ((self.hours.fract()) * 60.0).round() as u32 % 60,
+            self.settings.sun.brightness,
+            if self.settings.sun.dir.y <= 0.0 { " (set)" } else { "" },
+            if self.settings.sky.on { format!("{:.1} lux", self.settings.sky.lux) } else { "off".into() },
+            self.settings.sky.contrast,
+            self.settings.backdrop.contrast
+        );
         format!(
             "FkJensen  {}  {:.0} fps  {}x{} ({:.0}% of the window)  {light}  {sky}  {}  shaded {} of {} points  shadows {} ({:.0} ms)  bounce {}  {}  setup {:.0} raster {:.0} shade {:.0} resolve {:.0} ms  CPU only",
             self.scene_name,
@@ -570,6 +606,22 @@ impl App {
                 }
             }
             KeyCode::KeyC => self.rig.cycle_colour(),
+            KeyCode::KeyT => {
+                self.hours = (self.hours + if self.shift { -0.25 } else { 0.25 }).rem_euclid(24.0);
+                self.apply_daylight();
+            }
+            KeyCode::KeyY => {
+                let b = self.settings.sun.brightness + if self.shift { -50.0 } else { 50.0 };
+                self.settings.sun.brightness = b.clamp(0.0, raster::SUN_MAX);
+            }
+            KeyCode::KeyJ => {
+                let c = self.settings.sky.contrast + if self.shift { -0.05 } else { 0.05 };
+                self.settings.sky.contrast = (c.clamp(0.0, 1.0) * 20.0).round() / 20.0;
+            }
+            KeyCode::KeyU => {
+                let c = self.settings.backdrop.contrast + if self.shift { -0.05 } else { 0.05 };
+                self.settings.backdrop.contrast = (c.clamp(0.0, 1.0) * 20.0).round() / 20.0;
+            }
             #[cfg(target_pointer_width = "64")]
             KeyCode::KeyV => {
                 if let Some(v) = self.visual {
@@ -612,6 +664,15 @@ fn frame_camera(cam: &mut OrbitCamera, scene: &Scene, wide: bool) {
     } else {
         cam.pitch = 0.45;
     }
+}
+
+/// "18:30", "18.5" or "6" as hours.
+fn parse_hours(s: &str) -> Option<f32> {
+    match s.split_once(':') {
+        Some((h, m)) => Some(h.trim().parse::<f32>().ok()? + m.trim().parse::<f32>().ok()? / 60.0),
+        None => s.trim().parse().ok(),
+    }
+    .map(|h: f32| h.rem_euclid(24.0))
 }
 
 fn format_metres(m: f32) -> String {
@@ -829,6 +890,10 @@ fn main() {
     let mut highres: Option<bool> = None;
     let mut shadow_res: Option<usize> = None;
     let mut visual_debug = false;
+    let mut hours: Option<f32> = None;
+    let mut sun_brightness: Option<f32> = None;
+    let mut light_contrast: Option<f32> = None;
+    let mut sky_contrast: Option<f32> = None;
     let mut debug_view: Option<String> = None;
     let mut select: Option<usize> = None;
     let mut i = 0;
@@ -853,6 +918,22 @@ fn main() {
                     }
                 }
                 i += 1;
+            }
+            "--time" => {
+                i += 1;
+                hours = args.get(i).and_then(|s| parse_hours(s));
+            }
+            "--sun" => {
+                i += 1;
+                sun_brightness = args.get(i).and_then(|s| s.parse::<f32>().ok());
+            }
+            "--light-contrast" => {
+                i += 1;
+                light_contrast = args.get(i).and_then(|s| s.parse::<f32>().ok());
+            }
+            "--sky-contrast" => {
+                i += 1;
+                sky_contrast = args.get(i).and_then(|s| s.parse::<f32>().ok());
             }
             "--sky" => {
                 sky_lux = args.get(i + 1).and_then(|s| s.parse().ok());
@@ -919,7 +1000,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -966,8 +1047,24 @@ fn main() {
     }
 
     let mut app = App::new(scene, name);
+    app.apply_daylight();
+    app.settings.sun.brightness = 600.0;
+    if let Some(h) = hours {
+        app.hours = h;
+        app.apply_daylight();
+    }
+    if let Some(b) = sun_brightness {
+        app.settings.sun.brightness = b.clamp(0.0, raster::SUN_MAX);
+    }
+    if let Some(c) = light_contrast {
+        app.settings.sky.contrast = c.clamp(0.0, 1.0);
+    }
+    if let Some(c) = sky_contrast {
+        app.settings.backdrop.contrast = c.clamp(0.0, 1.0);
+    }
     if let Some(l) = sky_lux {
-        app.settings.sky = Sky { lux: l.max(0.0), on: l > 0.0 };
+        app.settings.sky.lux = l.max(0.0);
+        app.settings.sky.on = l > 0.0;
         app.settings.exposure = raster::default_exposure(l);
     }
     if let Some(e) = exposure {
@@ -1261,7 +1358,7 @@ mod tests {
         for l in &mut scene.lights {
             l.lumens = scene::MAX_LUMENS;
         }
-        let sky = Sky { lux: DEFAULT_SKY_LUX, on: true };
+        let sky = Sky::new(DEFAULT_SKY_LUX, true);
         let cut = raster::cut_lux(&sky, raster::default_exposure(sky.lux));
         let mut mountain_clusters = 0;
         for c in &scene.clusters {
@@ -1285,7 +1382,7 @@ mod tests {
         let mut cam = OrbitCamera::new();
         frame_camera(&mut cam, &scene, true);
         let c = Camera { view: cam.view(), proj: cam.proj(w as f32 / h as f32), eye: cam.eye(), near: cam.near() };
-        let sky = Sky { lux: DEFAULT_SKY_LUX, on: true };
+        let sky = Sky::new(DEFAULT_SKY_LUX, true);
         let mut a = Frame::new(w, h);
         reyes::render(&scene, &c, &scene.lights, &RenderSettings::new(sky), &mut a);
         let mut b = Frame::new(w, h);
@@ -1312,7 +1409,7 @@ mod tests {
         let mut cam = OrbitCamera::new();
         frame_camera(&mut cam, &scene, true);
         let c = Camera { view: cam.view(), proj: cam.proj(w as f32 / h as f32), eye: cam.eye(), near: cam.near() };
-        let settings = RenderSettings::new(Sky { lux: DEFAULT_SKY_LUX, on: true });
+        let settings = RenderSettings::new(Sky::new(DEFAULT_SKY_LUX, true));
         let mut r = reyes::Renderer::new();
         let mut f = Frame::new(w, h);
         r.render(&scene, &c, &lights, &settings, &mut f);
@@ -1340,7 +1437,7 @@ mod tests {
         let mut scene = world::build();
         scene.lights = world::small_lights();
         let mut app = App::new(scene, "test".into());
-        app.settings = RenderSettings { shadows: false, bounce: false, ..RenderSettings::new(Sky { lux: DEFAULT_SKY_LUX, on: true }) };
+        app.settings = RenderSettings { shadows: false, bounce: false, ..RenderSettings::new(Sky::new(DEFAULT_SKY_LUX, true)) };
         let (w, h) = (192usize, 108usize);
         let dir = std::env::temp_dir().join(format!("fkjensen-fbloop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

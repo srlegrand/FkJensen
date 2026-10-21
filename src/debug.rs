@@ -35,13 +35,14 @@ pub enum DebugView {
     LightCount,
     Reach,
     Shadow,
+    Sun,
     ShadowMap,
     Surfels,
     Receivers,
     MicroRaster,
 }
 
-pub const ALL: [DebugView; 22] = [
+pub const ALL: [DebugView; 23] = [
     DebugView::Final,
     DebugView::Clusters,
     DebugView::Triangles,
@@ -60,6 +61,7 @@ pub const ALL: [DebugView; 22] = [
     DebugView::LightCount,
     DebugView::Reach,
     DebugView::Shadow,
+    DebugView::Sun,
     DebugView::ShadowMap,
     DebugView::Surfels,
     DebugView::Receivers,
@@ -87,6 +89,7 @@ impl DebugView {
             DebugView::LightCount => "light-count",
             DebugView::Reach => "reach",
             DebugView::Shadow => "shadow",
+            DebugView::Sun => "sun",
             DebugView::ShadowMap => "shadow-map",
             DebugView::Surfels => "surfels",
             DebugView::Receivers => "receivers",
@@ -125,6 +128,7 @@ impl DebugView {
             DebugView::LightCount => ("LIGHTS EVALUATED", &["POINT LIGHTS WHOSE REACH TOUCHES EACH CLUSTER"]),
             DebugView::Reach => ("LIGHT REACH (SELECTED LIGHT)", &["EACH BAND HALVES THE LUX; THE LAST BAND ENDS AT THE REACH", "OUTSIDE: THE LIGHT IS NEVER EVALUATED"]),
             DebugView::Shadow => ("SHADOW (SELECTED LIGHT)", &["WHITE: LIT; BLACK: IN SHADOW; RED: FACES AWAY; BLUE: BEYOND REACH", "3 X 3 PCF FROM THE CUBE MAP, INSET TOP RIGHT"]),
+            DebugView::Sun => ("SUN", &["BLUE, GREEN, ORANGE: THE SHADOW CASCADE EACH POINT READS, FINEST FIRST", "DARK: IN THE SUN'S SHADOW; RED: FACES AWAY; GREY: SUN DOWN OR OFF"]),
             DebugView::ShadowMap => ("SHADOW MAP (SELECTED LIGHT)", &["SIX FACES, UNFOLDED; BRIGHTER IS NEARER THE LIGHT", "BLUE: NOTHING THERE WITHIN THE REACH"]),
             DebugView::Surfels => ("SURFELS", &["THE SURFACES AS DISCS, EACH LIT DIRECTLY", "THIS LIT CLOUD IS WHAT BOUNCE LIGHT IS GATHERED FROM"]),
             DebugView::Receivers => ("BOUNCE RECEIVERS", &["GREEN: GATHERED; RED: WAITING FOR ITS TURN"]),
@@ -351,6 +355,28 @@ pub fn draw(view: DebugView, ctx: &Ctx, frame: &mut Frame) {
                     }
                     None => dim(i, 0.3),
                 },
+                DebugView::Sun => {
+                    let sun = &ctx.settings.sun;
+                    if !sun.up() {
+                        dim(i, 0.4)
+                    } else if hh.n.dot(sun.dir) <= 0.0 {
+                        rgb(110, 25, 25)
+                    } else {
+                        match ctx.peek.sun_shadow {
+                            Some(m) => {
+                                let k = m.cascade_of(hh.p);
+                                let col = match k {
+                                    Some(0) => rgb(90, 150, 240),
+                                    Some(1) => rgb(110, 200, 120),
+                                    Some(_) => rgb(240, 160, 80),
+                                    None => rgb(200, 200, 200),
+                                };
+                                col * (0.08 + 0.92 * m.lit(hh.p, hh.n))
+                            }
+                            None => Vec3::splat(0.9),
+                        }
+                    }
+                }
                 DebugView::Shadow => match selected(ctx) {
                     Some((li, l)) => {
                         let reach = raster::light_reach(l, cut(ctx));
@@ -921,7 +947,7 @@ mod tests {
         let lights = vec![PointLight { position: Vec3::new(0.0, 1.0, 0.0), color: Vec3::ONE, lumens: 800.0 }];
         let c = crate::camera::OrbitCamera { target: Vec3::ZERO, distance: 5.0, yaw: 0.5, pitch: 0.6, fov_y: 45f32.to_radians(), scene_radius: 3.0 };
         let cam = Camera { view: c.view(), proj: c.proj(1.5), eye: c.eye(), near: c.near() };
-        let settings = RenderSettings::new(Sky { lux: 30.0, on: true });
+        let settings = RenderSettings::new(Sky::new(30.0, true));
         let mut r = crate::reyes::Renderer::new();
         let mut frame = Frame::new(96, 64);
         r.render(&scene, &cam, &lights, &settings, &mut frame);

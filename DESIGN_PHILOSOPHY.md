@@ -32,10 +32,11 @@ Read `LLM_instructions.md` too: the checks to run first and how changes are deli
 - Tiles stay on disk and are read per cluster and level when seen, into a capped cache. What is not visible, or not seen closely, costs nothing.
 - Textures are baked at import, filtered once per level from the source's mips. Import bakes geometry and surface data; still nothing about light.
 
-## Light is physical: point lights and the sky
+## Light is physical: point lights, the sun and the sky
 
-- Two kinds of light. Point lights, in lumens, with no falloff radius: the inverse square law alone. And the sky, in lux, which reaches every surface the same way whatever its distance. Nothing else.
-- Lumens are limited to lights that exist in the real world: at most about an 18 kW HMI (2,000,000 lm). No sun in a hand.
+- Three kinds of light. Point lights, in lumens, with no falloff radius: the inverse square law alone. The sun: infinitely far, parallel light and parallel shadows, the same on everything in the scene, with a brightness from 0 to 1000 where 1000 lights a white surface facing it to full white. And the sky, in lux, which reaches every surface the same way whatever its distance. Nothing else.
+- Point lights' lumens are limited to lights that exist in the real world: at most about an 18 kW HMI (2,000,000 lm).
+- The time of day sets the sun's direction and colour, the sky and the exposure, from noon to night. The contrast of the lighting and the contrast of the visible sky are set apart: the first changes shading, the second only the backdrop.
 - A light's reach is where its contribution stops being visible, from physics and the exposure, not a radius set by hand. Work beyond it is never done: a light on the set is never evaluated on the mountains, its shadow map only covers its reach, and light bounced from the set never reaches them. This is what makes large environments affordable.
 - Moving lights interactively and seeing the result is the first job of the viewer.
 
@@ -74,9 +75,10 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 21/10/2026: the sun, a directional light with cascaded orthographic shadow maps and a 0 to 1000 brightness; time of day; lighting contrast and visible sky contrast, independent.
 - 21/10/2026: the chess table, the chess set and the café leave the built-in set: a ground plane with the T-rex (a 10.8 M-triangle ZBrush sculpt, or the 28 K-triangle one when the machine's plan says so) and the car, the mountains behind, three film-sized lights. Models in `assets/models/` are stored with Git LFS. fkj-import reads OBJ.
 - 21/10/2026: the T-rex and the car move into the repository (`assets/models/`) so that anyone who clones it sees them; credits in `assets/README.md`.
-- 21/10/2026: visual debug views (`--visual-debug`, `--debug-view NAME|all`), 21 of them, 64-bit builds only, so that each stage of the renderer can be shown in a screenshot.
+- 21/10/2026: visual debug views (`--visual-debug`, `--debug-view NAME|all`), 64-bit builds only, so that each stage of the renderer can be shown in a screenshot.
 - 21/10/2026: per-triangle texture tiles at the dicer's grid points, levels 1 to 5, baked at import (tools/fkj-import, glTF and FBX) and streamed per cluster and level from the file into a capped cache. Third-party models live in assets/local, outside the repository.
 - 21/10/2026: without X or Wayland, frames go straight to the Linux framebuffer (/dev/fb0) and input comes from /dev/input; the render resolution follows the screen through the machine's pixel budget.
 - 20/10/2026: the machine decides: hardware detection and measurement at start, and a plan (render scale, still size, chess set, shadow map size, bounce, bucket size) from it. Clarisse added to the prior art.

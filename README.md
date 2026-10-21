@@ -26,7 +26,8 @@ its 28 K-triangle version.
 
 ## Light
 
-Two kinds of light, in physical units.
+Three kinds of light: point lights and the sky in physical units, and the
+sun.
 
 **Point lights.** A point light is a position, a colour and a luminous flux
 in lumens. There is no falloff radius: the light gives lumens / 4π candela,
@@ -37,13 +38,36 @@ set opens with three lights sized like film lights on a night exterior: a
 1,000,000 lm warm key high to the front left, a 40,000 lm cool fill and a
 200,000 lm rim behind.
 
+**The sun.** Infinitely far: parallel light and parallel shadows, the same
+on everything in the scene, with no reach. Its brightness runs from 0
+(none) to 1000, which lights a white surface facing it to full white at the
+current exposure; it is not in lumens. Its shadows come from an
+orthographic shadow map in three cascades round the subject (about 1.6
+times its radius, 600 m, 25 km), each 4 times the point lights' texels a
+side, up to 2048, read with the same 3 x 3 filter (`src/sun.rs`).
+
+**Time of day.** One value, in hours, sets the sun's direction (east at 6,
+south at noon at 60 degrees, west at 18) and colour, the sky's light and
+colour, the backdrop's colours and the exposure: about 13,000 lux of sky at
+noon, 400 at sunset, 3 at the end of civil twilight, 0.05 at night. The
+exposure follows the sky three quarters of the way, so noon reads brighter
+than dusk and night darker, and stops following below 3 lux so that lamps
+carry the night. The set opens at 18:12, dusk, where the sky is 30 lux.
+
+**Lighting contrast**, 0 to 1, shapes the sky's light only: 0 is flat
+(every facing gets the same, twice as much: overcast), 0.5 the default
+(sideways gets half), 1 overhead only (half as much in all). Together with
+the sun's brightness it sets key against fill. **Visible sky contrast**, 0
+to 1, is the backdrop only: the zenith to horizon gradient and the sun's
+glow; it re-shades nothing.
+
 **The sky.** Light from the whole sky, with nothing between it and any
 surface, so a mountain 10 km away and the T-rex are lit by it the same way. It
 is set by its illuminance on an upward-facing surface, in lux; the set
 opens at 30 lux, dusk. The sky behind the scene is drawn from the same
 values.
 
-**Shadows.** Each point light has a cube shadow map, 512 x 512 per face
+**Shadows.** The sun's map is above. Each point light has a cube shadow map, 512 x 512 per face
 (Williams 1978), read with a 3 x 3 percentage-closer filter for soft edges
 (Reeves, Salesin, Cook 1987) and a normal offset against self-shadowing.
 A map only holds the geometry inside its light's reach: whatever can shadow
@@ -275,6 +299,7 @@ build leaves them out.
 | `light-count` | how many lights reach each cluster |
 | `reach` | the selected light's illuminance in bands that halve, out to its reach |
 | `shadow` | the selected light's shadow test, with its cube map as an inset |
+| `sun` | the sun's shadow test, coloured by the cascade each point reads |
 | `shadow-map` | the selected light's cube map, unfolded |
 | `surfels` | the surfel cloud as lit discs |
 | `receivers` | bounce receivers: gathered or waiting |
@@ -324,7 +349,10 @@ Headless, for tests and screenshots (no window, no display needed):
 
 - `--light x,y,z[,lumens]` replaces the scene's lights (800 lm when no
   lumens are given); repeatable. Positions in metres.
-- `--sky LUX` sets the sky, 0 for none, and the exposure to match.
+- `--time HH:MM` sets the time of day (`--time 12:00`, `--time 18.5`).
+- `--sun B` sets the sun's brightness, 0 to 1000 (600 at start).
+- `--light-contrast C` and `--sky-contrast C`, 0 to 1 (0.5 at start).
+- `--sky LUX` sets the sky, 0 for none, and the exposure to match, after the time of day.
 - `--exposure E` sets the display value per cd/m².
 - `--view lights` writes the light count view.
 - `--no-reach` evaluates every light at every point, to compare.
@@ -371,6 +399,10 @@ of each pass in milliseconds.
     Tab                    select next light     Delete   remove selected light
     + / -                  lumens x1.25          C        cycle colour
     L                      show / hide lights    R        reset to the scene's lights
+    T / Shift+T            time of day later / earlier (15 min): sun, sky, exposure
+    Y / Shift+Y            sun brighter / dimmer (0 to 1000, steps of 50)
+    J / Shift+J            lighting contrast up / down: flat overcast to overhead
+    U / Shift+U            visible sky contrast up / down (the backdrop only)
     K                      sky on / off          , / .    sky dimmer / brighter (x2)
     H                      light count view: how many lights each pixel evaluates
     X                      light reach off / on (to compare cost and picture)
@@ -525,6 +557,10 @@ Not measured yet: a Raspberry Pi.
   curve gets one set of spherical harmonics for all of it. Gathering is
   the slowest pass of a first frame.
 - The sky is not occluded.
+- The sun: its shadow cascades are fixed round the subject, not the camera,
+  so a close look far from the subject gets coarse sun shadows; its disc is
+  drawn larger than the real one so it reads; no moon, no atmosphere or
+  aerial perspective; the light count view leaves it out.
 - A moved light re-shades its points with every light in reach; keeping
   each light's share apart would let it redo only its own.
 - Shadow maps are drawn at full detail: the key light draws all 10.9 M
