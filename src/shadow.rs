@@ -73,6 +73,13 @@ impl CubeShadow {
         CubeShadow { position, res, inv_depth, tris }
     }
 
+    #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
+    /// Texels per face edge and the faces' 1 / depth, face by face in the
+    /// order (+X, -X, +Y, -Y, +Z, -Z), rows from the face's lower edge.
+    pub fn faces(&self) -> (usize, &[f32]) {
+        (self.res, &self.inv_depth)
+    }
+
     /// How much of the light reaches point `p` with normal `n`: 1 lit, 0 in
     /// shadow, in between at a soft edge. 3 x 3 percentage-closer filter.
     pub fn lit(&self, p: Vec3, n: Vec3) -> f32 {

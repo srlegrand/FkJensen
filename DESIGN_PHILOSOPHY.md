@@ -66,12 +66,15 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Say what is true
 
+- Every stage can be seen. `--visual-debug` draws each one over the frame (clusters, visibility, dicing, the shading cache, light reach, shadow maps, surfels, the micro-raster), so screenshots explain the renderer better than prose. Those views are for a capable machine and are built on 64-bit targets only; the Raspberry Pi never waits on them.
+
 - Documentation states what the program does, measured where it can be, with the hardware named. Every page has a "Not done yet" list.
 - Each feature comes with tests; each change says what was tested and what was not.
 - Credit: FkJensen was created by Simon Legrand.
 
 ## Log
 
+- 21/10/2026: visual debug views (`--visual-debug`, `--debug-view NAME|all`), 21 of them, 64-bit builds only, so that each stage of the renderer can be shown in a screenshot.
 - 21/10/2026: per-triangle texture tiles at the dicer's grid points, levels 1 to 5, baked at import (tools/fkj-import, glTF and FBX) and streamed per cluster and level from the file into a capped cache. Third-party models live in assets/local, outside the repository.
 - 21/10/2026: without X or Wayland, frames go straight to the Linux framebuffer (/dev/fb0) and input comes from /dev/input; the render resolution follows the screen through the machine's pixel budget.
 - 20/10/2026: the machine decides: hardware detection and measurement at start, and a plan (render scale, still size, chess set, shadow map size, bounce, bucket size) from it. Clarisse added to the prior art.

@@ -376,6 +376,27 @@ impl Bounce {
 
     /// Bounce light arriving at receiver `r` of cluster `ci`.
     pub fn gather(&self, r: usize, ci: usize, reach: f32) -> Sh {
+        let (rad, cov) = self.raster(r, ci, reach);
+        let tex = texels();
+        let mut sh = [Vec3::ZERO; 4];
+        for (t, (dir, om)) in tex.iter().enumerate() {
+            if cov[t] <= 0.0 {
+                continue;
+            }
+            let l = rad[t] * *om;
+            sh[0] += l * Y00;
+            sh[1] += l * (Y1 * dir.x);
+            sh[2] += l * (Y1 * dir.y);
+            sh[3] += l * (Y1 * dir.z);
+        }
+        sh
+    }
+
+    #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
+    /// The receiver's cube raster before it is folded: radiance and
+    /// coverage per texel, faces in the order of `FACES` (+X, -X, +Y, -Y,
+    /// +Z, -Z), each `MICRO` x `MICRO`, rows from the face's lower edge.
+    pub fn raster(&self, r: usize, ci: usize, reach: f32) -> ([Vec3; 6 * MICRO * MICRO], [f32; 6 * MICRO * MICRO]) {
         let x = self.receivers[r].0;
         let own_size = self.cluster_size[ci].min(0.05);
         let nudge = nudge(self.cluster_size[ci]);
@@ -508,19 +529,9 @@ impl Bounce {
             rad[t] += l * add;
             cov[t] += add;
         }
-        let mut sh = [Vec3::ZERO; 4];
-        for (t, (dir, om)) in tex.iter().enumerate() {
-            if cov[t] <= 0.0 {
-                continue;
-            }
-            let l = rad[t] * *om;
-            sh[0] += l * Y00;
-            sh[1] += l * (Y1 * dir.x);
-            sh[2] += l * (Y1 * dir.y);
-            sh[3] += l * (Y1 * dir.z);
-        }
-        sh
+        (rad, cov)
     }
+
 }
 
 /// Build the tree over `surfels[lo..hi]`, reordering them; returns the node

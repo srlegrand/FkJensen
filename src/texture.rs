@@ -194,6 +194,18 @@ impl Textures {
         self.entries.get(cluster).copied().unwrap_or_default()
     }
 
+    #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
+    /// Whether cluster `c`'s tiles at `level` (or its finest, if coarser)
+    /// are in the cache now.
+    pub fn resident(&self, c: usize, level: u8) -> bool {
+        let e = self.entry(c);
+        if e.level == 0 || level == 0 {
+            return false;
+        }
+        let key = (c as u32, level.min(e.level));
+        self.cache.lock().unwrap().blocks.contains_key(&key)
+    }
+
     pub fn set_budget(&self, bytes: usize) {
         *self.budget.lock().unwrap() = bytes.max(1 << 20);
     }

@@ -29,6 +29,8 @@
 
 mod bounce;
 mod camera;
+#[cfg(target_pointer_width = "64")]
+mod debug;
 #[cfg(target_os = "linux")]
 mod fbdev;
 mod fkj;
@@ -87,6 +89,7 @@ Controls
   M                      shadow maps on / off
   I                      bounce light on / off
   Z / Shift+Z            render resolution finer / coarser (x1.25)
+  V / Shift+V            next / previous visual debug view (--visual-debug)
 
   Camera
   left drag              orbit                 middle drag / shift+left   pan
@@ -99,6 +102,13 @@ Controls
   G                      wireframe             P    save frame.png
   Esc                    quit
   drop an .fkj file on the window to open it";
+
+/// The visual debug view shown, when `--visual-debug` is on. Built on
+/// 64-bit targets only.
+#[cfg(target_pointer_width = "64")]
+type VisualDebug = Option<debug::DebugView>;
+#[cfg(not(target_pointer_width = "64"))]
+type VisualDebug = Option<()>;
 
 /// A light being dragged with the mouse.
 struct Drag {
@@ -146,6 +156,9 @@ struct App {
     last_frame: Instant,
     fps_accum: (f32, u32),
     title_fps: f32,
+    /// `--visual-debug`: the view shown (Some(Final) for the picture).
+    #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
+    visual: VisualDebug,
 }
 
 impl App {
@@ -183,6 +196,7 @@ impl App {
             last_frame: Instant::now(),
             fps_accum: (0.0, 0),
             title_fps: 0.0,
+            visual: None,
         }
     }
 
@@ -208,6 +222,20 @@ impl App {
     fn render(&mut self) {
         let cam = self.render_camera();
         self.renderer.render(&self.scene, &cam, &self.rig.lights, &self.settings, &mut self.frame);
+        #[cfg(target_pointer_width = "64")]
+        if let Some(v) = self.visual {
+            let ctx = debug::Ctx {
+                scene: &self.scene,
+                cam: &cam,
+                lights: &self.rig.lights,
+                selected: Some(self.rig.selected),
+                settings: &self.settings,
+                peek: self.renderer.peek(),
+                // No pointer yet (a still): the middle of the frame.
+                cursor: if self.mouse == (0.0, 0.0) { None } else { Some(self.mouse) },
+            };
+            debug::draw(v, &ctx, &mut self.frame);
+        }
         if self.rig.show {
             let k = self.render_scale.max(0.25);
             let floor = self.floor();
@@ -545,6 +573,14 @@ impl App {
                 }
             }
             KeyCode::KeyC => self.rig.cycle_colour(),
+            #[cfg(target_pointer_width = "64")]
+            KeyCode::KeyV => {
+                if let Some(v) = self.visual {
+                    let v = v.step(if self.shift { -1 } else { 1 });
+                    eprintln!("view: {}", v.name());
+                    self.visual = Some(v);
+                }
+            }
             KeyCode::KeyP => match save_png(&self.frame, "frame.png") {
                 Ok(()) => eprintln!("saved frame.png"),
                 Err(e) => eprintln!("cannot save frame.png: {e}"),
@@ -807,6 +843,9 @@ fn main() {
     let mut look: Option<(Vec3, Vec3)> = None;
     let mut chess: Option<bool> = None;
     let mut shadow_res: Option<usize> = None;
+    let mut visual_debug = false;
+    let mut debug_view: Option<String> = None;
+    let mut select: Option<usize> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -862,6 +901,16 @@ fn main() {
             }
             "--bench-drag" => bench_drag = true,
             "--fb" => use_fb = true,
+            "--visual-debug" => visual_debug = true,
+            "--debug-view" => {
+                i += 1;
+                debug_view = args.get(i).cloned();
+                visual_debug = true;
+            }
+            "--select" => {
+                i += 1;
+                select = args.get(i).and_then(|v| v.parse::<usize>().ok()).map(|n| n.saturating_sub(1));
+            }
             "--no-chess" => chess = Some(false),
             "--chess" => chess = Some(true),
             "--shadow-res" => {
@@ -885,7 +934,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]chess] [--shadow-res N] [--scale F] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--fb]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]chess] [--shadow-res N] [--scale F] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -972,6 +1021,40 @@ fn main() {
         app.pixel_budget = None;
     }
     let size = size.or(plan.as_ref().map(|p| p.png_size)).unwrap_or((1280, 720));
+    if let Some(n) = select {
+        if n < app.rig.lights.len() {
+            app.rig.selected = n;
+        }
+    }
+    // Visual debug views: illustration on a capable machine, 64-bit only.
+    #[allow(unused_mut)]
+    let mut debug_all = false;
+    if visual_debug {
+        #[cfg(target_pointer_width = "64")]
+        {
+            let v = match debug_view.as_deref() {
+                None | Some("all") => {
+                    debug_all = debug_view.is_some();
+                    debug::DebugView::Final
+                }
+                Some(name) => match debug::DebugView::from_name(name) {
+                    Some(v) => v,
+                    None => {
+                        let names: Vec<&str> = debug::ALL.iter().map(|v| v.name()).collect();
+                        eprintln!("--debug-view takes all or one of: {}", names.join(", "));
+                        std::process::exit(1);
+                    }
+                },
+            };
+            app.visual = Some(v);
+            eprintln!("visual debug on: V / Shift+V step through the views");
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            let _ = &debug_view;
+            eprintln!("--visual-debug is not in this build (64-bit machines only)");
+        }
+    }
 
     if let Some(out) = png_out {
         // A still frame waits for all the bounce light.
@@ -1015,6 +1098,21 @@ fn main() {
             std::process::exit(1);
         }
         eprintln!("wrote {out}");
+        // Every debug view of the same frame, one file each.
+        #[cfg(target_pointer_width = "64")]
+        if debug_all {
+            for v in debug::ALL {
+                app.visual = Some(v);
+                app.render();
+                let p = out.replace(".png", &format!("_{}.png", v.name()));
+                match save_png(&app.frame, &p) {
+                    Ok(()) => eprintln!("wrote {p}"),
+                    Err(e) => eprintln!("cannot write {p}: {e}"),
+                }
+            }
+            app.visual = Some(debug::DebugView::Final);
+        }
+        let _ = debug_all;
         if let Some(mb) = peak_memory_mb() {
             eprintln!("peak memory {mb:.0} MB");
         }

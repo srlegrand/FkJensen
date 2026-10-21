@@ -219,6 +219,49 @@ Decoded at full size, without mips, those textures alone are 71 MB of RGB.
 A 1280 x 720 frame of the wide view read 4.1 MB of tiles; one filling the
 frame with the T-rex read 3.4 MB.
 
+## Visual debug views
+
+`--visual-debug` adds views that draw each stage of the renderer over the
+frame, with a caption saying what the colours mean, for screenshots that
+explain how it works. `V` and `Shift+V` step through them in the window;
+`P` saves the frame. They are built on 64-bit machines only: they are for
+illustration on a capable machine, may read texture tiles and allocate
+freely, and nothing in the renderer depends on them, so the Raspberry Pi
+build leaves them out.
+
+    cargo run --release -- --visual-debug
+    cargo run --release -- --png out.png --debug-view all          one file per view
+    cargo run --release -- --png out.png --debug-view reshaded --bench-drag
+    cargo run --release -- --png out.png --close --debug-view shadow-map --select 2
+
+`--select N` picks the light the light views show (1 is the first).
+
+![Six of the views: clusters, micropolygons, light reach, a shadow map unfolded, the surfel cloud, a receiver's micro-raster](docs/debug_views.png)
+
+| view | what it shows |
+|---|---|
+| `clusters` | one colour per cluster |
+| `triangles` | one colour per triangle id: the visibility buffer |
+| `depth` | distance from the eye, log scale over the range in view |
+| `normals` | world-space normals |
+| `buckets` | the bucket grid, with the number of triangles binned into each |
+| `dice` | each cluster's dicing level |
+| `micropolygons` | the grid each triangle was shaded on, edges drawn |
+| `reshaded` | clusters shaded (red) and bounce gathered (green) in the last frames |
+| `albedo` | base colour: vertex colours or texture tiles |
+| `tiles` | the tile level read for each cluster, dim where finer levels stay on disk |
+| `sky` | the sky's light alone |
+| `direct` | the kept shading, without bounce |
+| `highlight` | the highlight alone, x4 |
+| `bounce` | bounce light alone, x4 |
+| `light-count` | how many lights reach each cluster |
+| `reach` | the selected light's illuminance in bands that halve, out to its reach |
+| `shadow` | the selected light's shadow test, with its cube map as an inset |
+| `shadow-map` | the selected light's cube map, unfolded |
+| `surfels` | the surfel cloud as lit discs |
+| `receivers` | bounce receivers: gathered or waiting |
+| `micro-raster` | the 6 x 8 x 8 cube raster of the receiver under the cursor, x4, and what its spherical harmonics give back |
+
 ## Without a display server
 
 When neither X nor Wayland is running, as on a Raspberry Pi at its text
@@ -313,6 +356,7 @@ of each pass in milliseconds.
     M                      shadow maps on / off
     I                      bounce light on / off
     Z / Shift+Z            render resolution finer / coarser (x1.25)
+    V / Shift+V            next / previous visual debug view (--visual-debug)
 
     Camera
     left drag              orbit                 middle drag / shift+left   pan
@@ -431,6 +475,9 @@ Not measured yet: a Raspberry Pi.
 ## Not done yet
 
 - Reflections (environment and per-object cube maps): not started.
+- Visual debug views: no view yet for culling (frustum and normal cone),
+  for the surfel tree, or for the texture cache over time; text is a 5 x 7
+  pixel font in capitals.
 - Bounce light: one bounce only. A large surfel near a receiver covers its
   raster through a disc enlarged by a third, so that tiled discs leave no
   gaps; the outline of a nearby surface counts a little more light than it

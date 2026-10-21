@@ -50,6 +50,7 @@ At the start of a session, run these and report each to the person as passed or 
 - Third-party models and their `.fkj` files stay in `assets/local/`, which git ignores. They are never committed, and screenshots in `docs/` do not show them.
 - Documentation with every change: `README.md`, and `docs/` pages for anything with a page. Every page has a "Not done yet" list.
 - A screenshot in `docs/` when something visible changed, taken from `--png` or from the running program.
+- To explain or check a stage, render its visual debug view (`--png out.png --debug-view NAME`, or `all`) and look at it. Those views are 64-bit only and are never a reason to hold back the Raspberry Pi build; a new stage gets a view.
 - Say what was tested and what was not. Numbers in the docs are measured and say on what hardware.
 - No GPU API, ever: no wgpu, Vulkan, OpenGL, Metal, DirectX, no shader files. The frame reaches the screen through softbuffer. A dependency that pulls a GPU API in is a bug.
 - Dates DD/MM/YYYY. No em dashes.

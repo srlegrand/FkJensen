@@ -116,6 +116,38 @@ pub struct Renderer {
     frame_no: u64,
 }
 
+#[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
+/// A read-only look at what the renderer keeps, for the visual debug views.
+pub struct Peek<'a> {
+    pub frame_no: u64,
+    /// Dicing level each cluster needs for the current view.
+    pub levels: &'a [u8],
+    cache: &'a [ClusterShade],
+    pub shadows: &'a [Option<CubeShadow>],
+    pub bounce: Option<&'a Bounce>,
+}
+
+#[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
+impl Peek<'_> {
+    /// Dicing level of the shading kept for cluster `c` (`NOT_VISIBLE`: none).
+    pub fn kept_level(&self, c: usize) -> u8 {
+        self.cache.get(c).map(|e| e.level).unwrap_or(NOT_VISIBLE)
+    }
+
+    /// The frame in which cluster `c` was last shaded.
+    pub fn shaded_in(&self, c: usize) -> u64 {
+        self.cache.get(c).map(|e| e.stamp).unwrap_or(0)
+    }
+
+    /// Kept radiance of triangle `tri` of cluster `c` at weights `w`.
+    pub fn radiance(&self, scene: &Scene, c: usize, tri: u32, w: [f32; 3], part: Part) -> Vec3 {
+        match self.cache.get(c) {
+            Some(e) => lookup_part(scene, &scene.clusters[c], e, tri, w, part),
+            None => Vec3::ZERO,
+        }
+    }
+}
+
 impl Default for Renderer {
     fn default() -> Self {
         Self::new()
@@ -148,6 +180,11 @@ impl Renderer {
     #[cfg(test)]
     pub fn bounce_stamps(&self) -> Option<&[u64]> {
         self.bounce.as_ref().map(|b| &b.stamp[..])
+    }
+
+    #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
+    pub fn peek(&self) -> Peek<'_> {
+        Peek { frame_no: self.frame_no, levels: &self.levels, cache: &self.cache, shadows: &self.shadows, bounce: self.bounce.as_ref() }
     }
 
     /// Memory held by the shading cache and the shadow maps, in bytes.
@@ -552,7 +589,22 @@ fn vertex_mask(scene: &Scene, c: &crate::scene::Cluster, tris: u128) -> u128 {
 /// Radiance at a point inside triangle `tri` with weights `w` over its
 /// vertices, from the kept shading.
 fn lookup(scene: &Scene, c: &crate::scene::Cluster, e: &ClusterShade, tri: u32, w: [f32; 3]) -> Vec3 {
-    let at = |i: usize| e.diffuse[i] + e.spec[i];
+    lookup_part(scene, c, e, tri, w, Part::All)
+}
+
+#[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
+/// Which part of the kept shading to read.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Part {
+    All,
+    Highlight,
+}
+
+fn lookup_part(scene: &Scene, c: &crate::scene::Cluster, e: &ClusterShade, tri: u32, w: [f32; 3], part: Part) -> Vec3 {
+    let at = |i: usize| match part {
+        Part::All => e.diffuse[i] + e.spec[i],
+        Part::Highlight => e.spec[i],
+    };
     let t = tri as usize * 3;
     if e.level == 0 {
         let mut r = Vec3::ZERO;
