@@ -103,9 +103,9 @@ pawns: one pawn per side is stored, seven copies each come from `INST`.
 
 Texture tiles, one set per triangle, in the manner of Ptex (Burley and
 Lacewell 2008): no UV atlas at render time. A triangle's tile at level L
-holds its colour at the (2^L + 1)(2^L + 2) / 2 points where the REYES dicer
-shades it at level L (the triangle cut into 2^L parts per edge), so a
-shading point reads its colour directly. Level 0 is the three corners: the
+holds its colour at the (2^L + 1)(2^L + 2) / 2 points of the triangle cut
+into 2^L parts per edge; a shading point, wherever the dicer puts it, reads
+its colour interpolated between them. Level 0 is the three corners: the
 vertex colours of `MESH`.
 
     u32       cluster count (the MESH section's)
@@ -119,12 +119,13 @@ vertex colours of `MESH`.
 
 A cluster's tiles are its levels 1 to its finest, one after the other;
 each level holds its triangles' tiles in the cluster's triangle order, each
-tile its points in dicer order (i towards the triangle's second corner, j
+tile its points in order (i towards the triangle's second corner, j
 towards its third), 3 bytes of sRGB each. The finest level is at most 5
 (561 points a triangle).
 
 The reader keeps the table and leaves the pool in the file. When a cluster
-is shaded at level L, the block of its tiles at min(L, finest) is read with
+is shaded with grids up to level L, the block of its tiles at min(L, 5,
+finest) is read with
 one positioned read and kept in a memory-capped cache, least recently used
 dropped first. Only the tiles of visible triangles, at the level they are
 seen at, are read.

@@ -1,12 +1,19 @@
 //! Shading the REYES way, kept between frames.
 //!
-//! Triangles are diced into micropolygons in world space, a level per
-//! cluster chosen from its size on screen (`raster::dice_level`): level 0
-//! shades the mesh's own vertices, level L cuts each triangle into 2^L parts
-//! per edge. Shading happens on those points, in world space, before the
-//! picture is made, and the results are kept (Cook, Carpenter, Catmull
-//! 1987). The picture is then resolved by interpolating the shaded points
-//! under each pixel.
+//! Each visible triangle is diced into micropolygons from its own size on
+//! screen, not its cluster's or its mesh's: each edge gets a level from its
+//! length in pixels (`raster::dice_level`), and the triangle's grid takes
+//! the finest of its three. Level L cuts each edge into 2^L parts. The grid
+//! is even in the triangle's screen weights, so its points are evenly
+//! spaced on screen however the triangle recedes. Points on an edge between
+//! that edge's own samples are interpolated along it, so two triangles
+//! sharing an edge agree along it. A triangle whose edges are all under
+//! `raster::SHADING_RATE_PX` uses the cluster's shaded vertices.
+//!
+//! Shading happens on those points, in world space, before the picture is
+//! made, and the results are kept (Cook, Carpenter, Catmull 1987). The
+//! picture is then resolved by interpolating the shaded points under each
+//! pixel.
 //!
 //! What is kept, and what throws it away:
 //!
@@ -33,53 +40,187 @@ use crate::scene::{PointLight, Scene};
 use crate::shadow::CubeShadow;
 use crate::sun::SunShadow;
 
+/// How one triangle was diced, and where its points are kept.
+///
+/// Its grid lies on the triangle as seen when it was diced: rows along its
+/// longest edge on screen, 2^lu + 1 points each, and 2^lv + 1 rows up to the
+/// opposite corner, so points are about `raster::SHADING_RATE_PX` apart
+/// both ways on screen however thin or receding the triangle is. The grid
+/// covers the rectangle on that edge, twice the triangle; points outside it
+/// are shaded on the triangle's plane, for interpolating up to its edges.
+#[derive(Clone, Copy)]
+struct TriDice {
+    /// The finer of lu and lv; 0: the triangle reads the cluster's
+    /// vertices; `NOT_VISIBLE`: not diced.
+    level: u8,
+    lu: u8,
+    lv: u8,
+    /// The longest edge on screen when diced (from corner `base` to the
+    /// next).
+    base: u8,
+    /// Depth (clip w) and position on screen (pixels from the centre) of
+    /// each corner when diced.
+    w: [f32; 3],
+    px: [glam::Vec2; 3],
+    /// Where its points start in `diffuse` and `spec`, and how many fit.
+    offset: u32,
+    cap: u32,
+}
+
+impl Default for TriDice {
+    fn default() -> Self {
+        Self { level: NOT_VISIBLE, lu: 0, lv: 0, base: 0, w: [1.0; 3], px: [glam::Vec2::ZERO; 3], offset: 0, cap: 0 }
+    }
+}
+
+impl TriDice {
+    fn points(&self) -> usize {
+        if self.level == 0 || self.level == NOT_VISIBLE { 0 } else { ((1usize << self.lu) + 1) * ((1usize << self.lv) + 1) }
+    }
+
+    /// The grid's origin and its two sides on screen.
+    fn frame(&self) -> (glam::Vec2, glam::Vec2, glam::Vec2) {
+        let k = self.base as usize;
+        let (o, ex) = (self.px[k], self.px[(k + 1) % 3] - self.px[k]);
+        let len = ex.length().max(1e-6);
+        let up = ex.perp() / len;
+        let h = (self.px[(k + 2) % 3] - o).dot(up);
+        let ey = if h.abs() < 1e-6 { up * 1e-6 } else { up * h };
+        (o, ex, ey)
+    }
+
+    /// Screen weights of grid point (u, v), u and v from 0 to 1.
+    fn grid_to_screen(&self, u: f32, v: f32) -> [f32; 3] {
+        let (o, ex, ey) = self.frame();
+        let q = o + ex * u + ey * v - self.px[0];
+        let (e1, e2) = (self.px[1] - self.px[0], self.px[2] - self.px[0]);
+        let det = e1.perp_dot(e2);
+        let det = if det.abs() < 1e-12 { 1e-12 } else { det };
+        let (s1, s2) = (q.perp_dot(e2) / det, e1.perp_dot(q) / det);
+        [1.0 - s1 - s2, s1, s2]
+    }
+
+    /// Grid position (u, v), each 0 to 1, of screen weights `s`.
+    fn screen_to_grid(&self, s: [f32; 3]) -> (f32, f32) {
+        let (o, ex, ey) = self.frame();
+        let q = self.px[0] * s[0] + self.px[1] * s[1] + self.px[2] * s[2] - o;
+        ((q.dot(ex) / ex.length_squared()).clamp(0.0, 1.0), (q.dot(ey) / ey.length_squared()).clamp(0.0, 1.0))
+    }
+}
+
+/// A triangle diced for the view `vp` on a `size` pixel frame. Corners
+/// behind the near plane are taken at it.
+fn dice_triangle(vp: Mat4, p: [Vec3; 3], near: f32, size: (usize, usize)) -> TriDice {
+    let (hw, hh) = (size.0 as f32 * 0.5, size.1 as f32 * 0.5);
+    let c = p.map(|q| vp * q.extend(1.0));
+    let w = c.map(|q| q.w.max(near));
+    let px = [0, 1, 2].map(|k| glam::Vec2::new(c[k].x / w[k] * hw, c[k].y / w[k] * hh));
+    let base = (0..3).max_by(|&a, &b| px[a].distance_squared(px[(a + 1) % 3]).total_cmp(&px[b].distance_squared(px[(b + 1) % 3]))).unwrap_or(0);
+    let mut d = TriDice { base: base as u8, w, px, ..Default::default() };
+    let (_, ex, ey) = d.frame();
+    d.lu = raster::dice_level(ex.length());
+    d.lv = raster::dice_level(ey.length());
+    d.level = d.lu.max(d.lv);
+    d
+}
+
+/// Widest spacing on screen, under view `vp`, of the grid `d` keeps, from
+/// its steps at the triangle's corners; `None` when a corner is behind the
+/// near plane.
+fn kept_spacing(d: &TriDice, p: [Vec3; 3], vp: Mat4, near: f32, size: (usize, usize)) -> Option<f32> {
+    let (hw, hh) = (size.0 as f32 * 0.5, size.1 as f32 * 0.5);
+    let (du, dv) = (1.0 / (1u32 << d.lu) as f32, 1.0 / (1u32 << d.lv) as f32);
+    let to_px = |u: f32, v: f32| -> Option<glam::Vec2> {
+        let b = screen_to_tri(d.grid_to_screen(u, v), d.w);
+        let q = vp * (p[0] * b[0] + p[1] * b[1] + p[2] * b[2]).extend(1.0);
+        (q.w >= near).then(|| glam::Vec2::new(q.x / q.w * hw, q.y / q.w * hh))
+    };
+    let mut widest = 0f32;
+    for k in 0..3 {
+        let mut s = [0.0; 3];
+        s[k] = 1.0;
+        let (u, v) = d.screen_to_grid(s);
+        let (u2, v2) = (if u > 0.5 { u - du } else { u + du }, if v > 0.5 { v - dv } else { v + dv });
+        let a = to_px(u, v)?;
+        widest = widest.max(a.distance(to_px(u2, v)?)).max(a.distance(to_px(u, v2)?));
+    }
+    Some(widest)
+}
+
+/// A triangle's own weights from its screen weights `s`, for corner
+/// depths `w` (perspective-correct interpolation).
+#[inline]
+fn screen_to_tri(s: [f32; 3], w: [f32; 3]) -> [f32; 3] {
+    let b = [s[0] / w[0], s[1] / w[1], s[2] / w[2]];
+    let t = b[0] + b[1] + b[2];
+    let t = if t.abs() < 1e-30 { 1e-30 } else { t };
+    [b[0] / t, b[1] / t, b[2] / t]
+}
+
+/// Screen weights from a triangle's own weights `b`.
+#[inline]
+fn tri_to_screen(b: [f32; 3], w: [f32; 3]) -> [f32; 3] {
+    let s = [b[0] * w[0], b[1] * w[1], b[2] * w[2]];
+    let t = 1.0 / (s[0] + s[1] + s[2]).max(1e-30);
+    [s[0] * t, s[1] * t, s[2] * t]
+}
+
 /// Shading kept for one cluster.
 #[derive(Default)]
 struct ClusterShade {
-    /// Dicing level of what is stored; `NOT_VISIBLE` when nothing is.
+    /// Finest level kept for any triangle; `NOT_VISIBLE` when none is.
     level: u8,
-    /// Per unit (vertex at level 0, triangle above), where its points start
-    /// in `diffuse` and `spec`; `u32::MAX` before first use.
-    offset: Vec<u32>,
+    tris: Vec<TriDice>,
+    /// Grid points of triangles diced above level 0.
     diffuse: Vec<Vec3>,
     spec: Vec<Vec3>,
-    /// Units whose diffuse light is current.
+    /// Grid points in use, against `diffuse.len()`: the rest is garbage
+    /// left by triangles diced again at a larger size.
+    live: usize,
+    /// Grid triangles whose diffuse light is current.
     done: u128,
-    /// Units whose highlight is current for `spec_eye`.
+    /// Grid triangles whose highlight is current for `spec_eye`.
     spec_done: u128,
+    /// Grid triangles seen from their back when last shaded. Shading is
+    /// two-sided: normals are turned towards the eye, so a triangle seen
+    /// from the other side has its diffuse light redone.
+    back: u128,
+    /// The cluster's vertices, shaded for triangles at level 0.
+    vdiffuse: Vec<Vec3>,
+    vspec: Vec<Vec3>,
+    vdone: u128,
+    vspec_done: u128,
+    vback: u128,
     spec_eye: Vec3,
     /// The frame in which anything here was last shaded.
     stamp: u64,
-    /// Units seen from their back when last shaded. Shading is two-sided:
-    /// normals are turned towards the eye, so a unit seen from the other
-    /// side has its diffuse light redone.
-    back: u128,
 }
 
 impl ClusterShade {
-    fn reset(&mut self, level: u8, units: usize) {
-        self.level = level;
-        self.offset.clear();
-        self.offset.resize(units, u32::MAX);
+    fn init(&mut self, tris: usize, verts: usize) {
+        self.tris = vec![TriDice::default(); tris];
+        self.vdiffuse = vec![Vec3::ZERO; verts];
+        self.vspec = vec![Vec3::ZERO; verts];
+        self.forget_grids();
+        self.vdone = 0;
+        self.vspec_done = 0;
+        self.vback = 0;
+    }
+
+    /// Drops every grid, keeping the vertices.
+    fn forget_grids(&mut self) {
+        for d in &mut self.tris {
+            if d.level != 0 {
+                *d = TriDice::default();
+            }
+        }
         self.diffuse.clear();
         self.spec.clear();
+        self.live = 0;
         self.done = 0;
         self.spec_done = 0;
         self.back = 0;
     }
-}
-
-/// Points per triangle at a dicing level.
-pub fn grid_points(level: u8) -> usize {
-    let n = 1usize << level;
-    (n + 1) * (n + 2) / 2
-}
-
-/// Index of grid point (i, j), i steps towards the triangle's second vertex
-/// and j towards its third, i + j <= n.
-#[inline]
-fn grid_index(n: usize, i: usize, j: usize) -> usize {
-    i * (n + 1) - i * i.saturating_sub(1) / 2 + j
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -126,8 +267,6 @@ pub struct Renderer {
 /// A read-only look at what the renderer keeps, for the visual debug views.
 pub struct Peek<'a> {
     pub frame_no: u64,
-    /// Dicing level each cluster needs for the current view.
-    pub levels: &'a [u8],
     cache: &'a [ClusterShade],
     pub shadows: &'a [Option<CubeShadow>],
     pub bounce: Option<&'a Bounce>,
@@ -139,6 +278,27 @@ impl Peek<'_> {
     /// Dicing level of the shading kept for cluster `c` (`NOT_VISIBLE`: none).
     pub fn kept_level(&self, c: usize) -> u8 {
         self.cache.get(c).map(|e| e.level).unwrap_or(NOT_VISIBLE)
+    }
+
+    /// Dicing level kept for triangle `tri` of cluster `c`.
+    pub fn tri_level(&self, c: usize, tri: u32, scene: &Scene) -> u8 {
+        self.tri(c, tri, scene).map(|d| d.level).unwrap_or(NOT_VISIBLE)
+    }
+
+    /// Where weights `w` of triangle `tri` of cluster `c` fall in its kept
+    /// grid, in grid steps, and the grid's level. `None` at level 0 or when
+    /// not diced.
+    pub fn grid_at(&self, c: usize, tri: u32, scene: &Scene, w: [f32; 3]) -> Option<(f32, f32, u8)> {
+        let d = self.tri(c, tri, scene)?;
+        if d.level == 0 || d.level == NOT_VISIBLE {
+            return None;
+        }
+        let (u, v) = d.screen_to_grid(tri_to_screen(w, d.w));
+        Some((u * (1u32 << d.lu) as f32, v * (1u32 << d.lv) as f32, d.level))
+    }
+
+    fn tri(&self, c: usize, tri: u32, scene: &Scene) -> Option<&TriDice> {
+        self.cache.get(c)?.tris.get((tri - scene.clusters[c].first_tri) as usize)
     }
 
     /// The frame in which cluster `c` was last shaded.
@@ -194,12 +354,12 @@ impl Renderer {
 
     #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
     pub fn peek(&self) -> Peek<'_> {
-        Peek { frame_no: self.frame_no, levels: &self.levels, cache: &self.cache, shadows: &self.shadows, bounce: self.bounce.as_ref(), sun_shadow: self.sun_shadow.as_ref() }
+        Peek { frame_no: self.frame_no, cache: &self.cache, shadows: &self.shadows, bounce: self.bounce.as_ref(), sun_shadow: self.sun_shadow.as_ref() }
     }
 
     /// Memory held by the shading cache and the shadow maps, in bytes.
     pub fn memory(&self) -> usize {
-        let shade: usize = self.cache.iter().map(|c| (c.diffuse.capacity() + c.spec.capacity()) * 12 + c.offset.capacity() * 4).sum();
+        let shade: usize = self.cache.iter().map(|c| (c.diffuse.capacity() + c.spec.capacity() + c.vdiffuse.capacity() + c.vspec.capacity()) * 12 + c.tris.capacity() * std::mem::size_of::<TriDice>()).sum();
         let shadows: usize = self.shadows.iter().flatten().map(|s| s.bytes()).sum();
         shade + shadows + self.sun_shadow.as_ref().map(|s| s.bytes()).unwrap_or(0)
     }
@@ -379,9 +539,10 @@ impl Renderer {
         let used = AtomicU64::new(0);
         let clusters_shaded = AtomicU64::new(0);
         let eye = cam.eye;
-        let levels = &self.levels;
         let need = &self.need;
         let ground = !settings.bounce;
+        let vp = cam.proj * cam.view;
+        let (near, size) = (cam.near, (frame.width, frame.height));
         if settings.view == View::Shaded {
             self.cache.par_iter_mut().enumerate().for_each(|(ci, e)| {
                 let need_tris = need[ci];
@@ -389,58 +550,132 @@ impl Renderer {
                     return;
                 }
                 let c = &scene.clusters[ci];
-                let want = levels[ci];
-                // Keep what is stored if it is as fine as needed and not more
-                // than one level finer.
-                if e.level == NOT_VISIBLE || e.level < want || e.level > want.saturating_add(1) {
-                    let units = if want == 0 { c.vertex_count } else { c.tri_count } as usize;
-                    e.reset(want, units);
+                let fv = c.first_vertex as usize;
+                if e.tris.len() != c.tri_count as usize {
+                    e.init(c.tri_count as usize, c.vertex_count as usize);
+                }
+                // Too much garbage from triangles diced again: start the
+                // grids over.
+                if e.diffuse.len() > 2 * e.live + 65_536 {
+                    e.forget_grids();
                 }
                 if e.spec_eye != eye {
                     e.spec_done = 0;
+                    e.vspec_done = 0;
                     e.spec_eye = eye;
                 }
-                let level = e.level;
-                let need_units = if level == 0 { vertex_mask(scene, c, need_tris) } else { need_tris };
-                used.fetch_add(
-                    if level == 0 { need_units.count_ones() as u64 } else { need_units.count_ones() as u64 * grid_points(level) as u64 },
-                    Ordering::Relaxed,
-                );
-                let todo = need_units & !(e.done & e.spec_done);
-                if todo == 0 {
+                // Dice each needed triangle from its own size on screen.
+                // A kept grid stays while it is at most one level finer,
+                // edge by edge, and its spacing on screen within a factor
+                // of two.
+                let (mut vneed, mut tneed, mut n_used) = (0u128, 0u128, 0u64);
+                let mut bits = need_tris;
+                while bits != 0 {
+                    let u = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let t = (c.first_tri as usize + u) * 3;
+                    let idx = [scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize];
+                    let corners = idx.map(|i| scene.positions[i]);
+                    let d = &mut e.tris[u];
+                    // A kept grid stays while its points are no further
+                    // apart on screen than the rate and no more than a
+                    // level finer than a fresh one.
+                    let rate = raster::SHADING_RATE_PX;
+                    let keep = d.level != 0
+                        && d.level != NOT_VISIBLE
+                        && kept_spacing(d, corners, vp, near, size).is_some_and(|s| s <= rate * 1.05 && s > rate * 0.25);
+                    if !keep {
+                        let fresh = dice_triangle(vp, corners, near, size);
+                        if fresh.level == 0 {
+                            if d.level != 0 {
+                                e.live -= d.points();
+                                d.level = 0;
+                            }
+                            for i in idx {
+                                vneed |= 1u128 << (i - fv);
+                            }
+                            continue;
+                        }
+                        e.live -= d.points();
+                        let pts = fresh.points();
+                        let (mut offset, mut cap) = (d.offset, d.cap);
+                        if (cap as usize) < pts {
+                            offset = e.diffuse.len() as u32;
+                            cap = pts as u32;
+                            e.diffuse.resize(e.diffuse.len() + pts, Vec3::ZERO);
+                            e.spec.resize(e.spec.len() + pts, Vec3::ZERO);
+                        }
+                        *d = TriDice { offset, cap, ..fresh };
+                        e.live += pts;
+                        e.done &= !(1u128 << u);
+                        e.spec_done &= !(1u128 << u);
+                    }
+                    tneed |= 1u128 << u;
+                    n_used += d.points() as u64;
+                }
+                n_used += vneed.count_ones() as u64;
+                used.fetch_add(n_used, Ordering::Relaxed);
+                e.level = e.tris.iter().map(|d| d.level).filter(|l| *l != NOT_VISIBLE).max().unwrap_or(NOT_VISIBLE);
+                let vtodo = vneed & !(e.vdone & e.vspec_done);
+                let ttodo = tneed & !(e.done & e.spec_done);
+                if vtodo == 0 && ttodo == 0 {
                     return;
                 }
                 clusters_shaded.fetch_add(1, Ordering::Relaxed);
                 e.stamp = frame_no;
                 // Lights that reach this cluster.
                 let in_reach: Vec<usize> = (0..lights.len()).filter(|&i| lights[i].position.distance(c.centre) <= c.radius + reach[i]).collect();
-                let per = if level == 0 { 1 } else { grid_points(level) };
-                // Texture tiles at this level, read from the file if not in
-                // the cache. Level 0 shades the vertices, whose colours hold
-                // the tiles' corners already.
-                let tiles = if level > 0 { scene.textures.block(ci, c.tri_count as usize, level) } else { None };
-                let mut bits = todo;
                 let (mut n_shaded, mut n_evals) = (0u64, 0u64);
+
+                // Vertices, for triangles at level 0.
+                let mut bits = vtodo;
                 while bits != 0 {
                     let u = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    if e.offset[u] == u32::MAX {
-                        e.offset[u] = e.diffuse.len() as u32;
-                        e.diffuse.resize(e.diffuse.len() + per, Vec3::ZERO);
-                        e.spec.resize(e.spec.len() + per, Vec3::ZERO);
-                    }
-                    let off = e.offset[u] as usize;
-                    // Which side the eye is on: from the vertex normal at
-                    // level 0, from the triangle's face otherwise.
-                    let back = if level == 0 {
-                        let v = c.first_vertex as usize + u;
-                        scene.normals[v].dot(eye - scene.positions[v]) < 0.0
+                    let v = fv + u;
+                    let back = scene.normals[v].dot(eye - scene.positions[v]) < 0.0;
+                    let bit = 1u128 << u;
+                    let diffuse_too = e.vdone & bit == 0 || ((e.vback & bit != 0) != back);
+                    if back {
+                        e.vback |= bit;
                     } else {
-                        let t = (c.first_tri as usize + u) * 3;
-                        let (a, b, cc) = (scene.positions[scene.indices[t] as usize], scene.positions[scene.indices[t + 1] as usize], scene.positions[scene.indices[t + 2] as usize]);
-                        let fnrm = scene.normals[scene.indices[t] as usize] + scene.normals[scene.indices[t + 1] as usize] + scene.normals[scene.indices[t + 2] as usize];
-                        fnrm.dot(eye - (a + b + cc) / 3.0) < 0.0
-                    };
+                        e.vback &= !bit;
+                    }
+                    let side = if back { -1.0 } else { 1.0 };
+                    let (d, s, k) = shade_point(scene.positions[v], scene.normals[v] * side, scene.colors[v], eye, sky, ground, lights, &in_reach, &reach, &shadows, sun);
+                    if diffuse_too {
+                        e.vdiffuse[u] = d;
+                    }
+                    e.vspec[u] = s;
+                    n_evals += k;
+                    n_shaded += 1;
+                }
+                e.vdone |= vtodo;
+                e.vspec_done |= vtodo;
+
+                // Grids, even on screen. Texture tiles at the finest level
+                // needed, read from the file if not in the cache; grids
+                // finer than the finest tile sample it.
+                let finest = {
+                    let mut l = 0;
+                    let mut bits = ttodo;
+                    while bits != 0 {
+                        l = l.max(e.tris[bits.trailing_zeros() as usize].level);
+                        bits &= bits - 1;
+                    }
+                    l
+                };
+                let tiles = if ttodo != 0 { scene.textures.block(ci, c.tri_count as usize, finest.min(crate::texture::MAX_LEVEL)) } else { None };
+                let mut bits = ttodo;
+                while bits != 0 {
+                    let u = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let d = e.tris[u];
+                    let t = (c.first_tri as usize + u) * 3;
+                    let (i0, i1, i2) = (scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize);
+                    let (p0, p1, p2) = (scene.positions[i0], scene.positions[i1], scene.positions[i2]);
+                    let fnrm = scene.normals[i0] + scene.normals[i1] + scene.normals[i2];
+                    let back = fnrm.dot(eye - (p0 + p1 + p2) / 3.0) < 0.0;
                     let bit = 1u128 << u;
                     let diffuse_too = e.done & bit == 0 || ((e.back & bit != 0) != back);
                     if back {
@@ -449,46 +684,30 @@ impl Renderer {
                         e.back &= !bit;
                     }
                     let side = if back { -1.0 } else { 1.0 };
-                    if level == 0 {
-                        let v = c.first_vertex as usize + u;
-                        let (d, s, k) = shade_point(scene.positions[v], scene.normals[v] * side, scene.colors[v], eye, sky, ground, lights, &in_reach, &reach, &shadows, sun);
-                        if diffuse_too {
-                            e.diffuse[off] = d;
-                        }
-                        e.spec[off] = s;
-                        n_evals += k;
-                        n_shaded += 1;
-                    } else {
-                        let t = (c.first_tri as usize + u) * 3;
-                        let (i0, i1, i2) = (scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize);
-                        let n = 1usize << level;
-                        let inv = 1.0 / n as f32;
-                        let mut k = 0;
-                        for i in 0..=n {
-                            for j in 0..=(n - i) {
-                                let (b1, b2) = (i as f32 * inv, j as f32 * inv);
-                                let b0 = 1.0 - b1 - b2;
-                                let p = scene.positions[i0] * b0 + scene.positions[i1] * b1 + scene.positions[i2] * b2;
-                                let nn = (scene.normals[i0] * b0 + scene.normals[i1] * b1 + scene.normals[i2] * b2).normalize_or(Vec3::Y) * side;
-                                let a = match &tiles {
-                                    Some(b) if b.level == level => b.point(u, i, j),
-                                    Some(b) => b.sample(u, b1, b2),
-                                    None => scene.colors[i0] * b0 + scene.colors[i1] * b1 + scene.colors[i2] * b2,
-                                };
-                                let (d, s, ev) = shade_point(p, nn, a, eye, sky, ground, lights, &in_reach, &reach, &shadows, sun);
-                                if diffuse_too {
-                                    e.diffuse[off + k] = d;
-                                }
-                                e.spec[off + k] = s;
-                                n_evals += ev;
-                                k += 1;
+                    let (nu, nv) = (1usize << d.lu, 1usize << d.lv);
+                    let mut g = d.offset as usize;
+                    for a in 0..=nu {
+                        for b in 0..=nv {
+                            let [b0, b1, b2] = screen_to_tri(d.grid_to_screen(a as f32 / nu as f32, b as f32 / nv as f32), d.w);
+                            let p = p0 * b0 + p1 * b1 + p2 * b2;
+                            let nn = (scene.normals[i0] * b0 + scene.normals[i1] * b1 + scene.normals[i2] * b2).normalize_or(Vec3::Y) * side;
+                            let alb = match &tiles {
+                                Some(t) => t.sample(u, b1, b2),
+                                None => (scene.colors[i0] * b0 + scene.colors[i1] * b1 + scene.colors[i2] * b2).max(Vec3::ZERO),
+                            };
+                            let (dd, s, ev) = shade_point(p, nn, alb, eye, sky, ground, lights, &in_reach, &reach, &shadows, sun);
+                            if diffuse_too {
+                                e.diffuse[g] = dd;
                             }
+                            e.spec[g] = s;
+                            g += 1;
+                            n_evals += ev;
+                            n_shaded += 1;
                         }
-                        n_shaded += per as u64;
                     }
                 }
-                e.done |= todo;
-                e.spec_done |= todo;
+                e.done |= ttodo;
+                e.spec_done |= ttodo;
                 evals.fetch_add(n_evals, Ordering::Relaxed);
                 shaded.fetch_add(n_shaded, Ordering::Relaxed);
             });
@@ -603,22 +822,6 @@ impl Renderer {
     }
 }
 
-/// Vertices used by the triangles in `tris`, as a mask over the cluster's
-/// vertices.
-fn vertex_mask(scene: &Scene, c: &crate::scene::Cluster, tris: u128) -> u128 {
-    let mut m = 0u128;
-    let mut bits = tris;
-    while bits != 0 {
-        let t = bits.trailing_zeros();
-        bits &= bits - 1;
-        let i = (c.first_tri + t) as usize * 3;
-        for k in 0..3 {
-            m |= 1u128 << (scene.indices[i + k] - c.first_vertex);
-        }
-    }
-    m
-}
-
 /// Radiance at a point inside triangle `tri` with weights `w` over its
 /// vertices, from the kept shading.
 fn lookup(scene: &Scene, c: &crate::scene::Cluster, e: &ClusterShade, tri: u32, w: [f32; 3]) -> Vec3 {
@@ -634,47 +837,36 @@ pub enum Part {
 }
 
 fn lookup_part(scene: &Scene, c: &crate::scene::Cluster, e: &ClusterShade, tri: u32, w: [f32; 3], part: Part) -> Vec3 {
+    let u = (tri - c.first_tri) as usize;
+    let Some(d) = e.tris.get(u) else {
+        return Vec3::ZERO;
+    };
+    if d.level == NOT_VISIBLE {
+        return Vec3::ZERO;
+    }
+    if d.level == 0 {
+        let t = tri as usize * 3;
+        let mut r = Vec3::ZERO;
+        for k in 0..3 {
+            let v = (scene.indices[t + k] - c.first_vertex) as usize;
+            r += match part {
+                Part::All => e.vdiffuse[v] + e.vspec[v],
+                Part::Highlight => e.vspec[v],
+            } * w[k];
+        }
+        return r;
+    }
     let at = |i: usize| match part {
         Part::All => e.diffuse[i] + e.spec[i],
         Part::Highlight => e.spec[i],
     };
-    let t = tri as usize * 3;
-    if e.level == 0 {
-        let mut r = Vec3::ZERO;
-        for k in 0..3 {
-            let u = (scene.indices[t + k] - c.first_vertex) as usize;
-            let off = e.offset.get(u).copied().unwrap_or(u32::MAX);
-            if off != u32::MAX {
-                r += at(off as usize) * w[k];
-            }
-        }
-        return r;
-    }
-    let u = (tri - c.first_tri) as usize;
-    let off = e.offset.get(u).copied().unwrap_or(u32::MAX);
-    if off == u32::MAX || e.level == NOT_VISIBLE {
-        return Vec3::ZERO;
-    }
-    let off = off as usize;
-    let n = 1usize << e.level;
-    let nf = n as f32;
-    let (u1, u2) = (w[1].clamp(0.0, 1.0) * nf, w[2].clamp(0.0, 1.0) * nf);
-    let i = (u1.floor() as usize).min(n - 1);
-    let j = (u2.floor() as usize).min(n - 1 - i);
-    let (fi, fj) = (u1 - i as f32, u2 - j as f32);
-    if fi + fj <= 1.0 || i + j + 1 >= n {
-        // Lower micro-triangle (i, j), (i+1, j), (i, j+1).
-        let (fi, fj) = if fi + fj > 1.0 {
-            let s = fi + fj;
-            (fi / s, fj / s)
-        } else {
-            (fi, fj)
-        };
-        at(off + grid_index(n, i, j)) * (1.0 - fi - fj) + at(off + grid_index(n, i + 1, j)) * fi + at(off + grid_index(n, i, j + 1)) * fj
-    } else {
-        // Upper micro-triangle (i+1, j+1), (i, j+1), (i+1, j).
-        at(off + grid_index(n, i + 1, j + 1)) * (fi + fj - 1.0) + at(off + grid_index(n, i, j + 1)) * (1.0 - fi) + at(off + grid_index(n, i + 1, j)) * (1.0 - fj)
-    }
+    let (u, v) = d.screen_to_grid(tri_to_screen(w, d.w));
+    let (nu, nv) = (1usize << d.lu, 1usize << d.lv);
+    let (fu, fv) = (u * nu as f32, v * nv as f32);
+    let (a, b) = ((fu as usize).min(nu - 1), (fv as usize).min(nv - 1));
+    let (fu, fv) = (fu - a as f32, fv - b as f32);
+    let p = |a: usize, b: usize| at(d.offset as usize + a * (nv + 1) + b);
+    (p(a, b) * (1.0 - fu) + p(a + 1, b) * fu) * (1.0 - fv) + (p(a, b + 1) * (1.0 - fu) + p(a + 1, b + 1) * fu) * fv
 }
 
 /// The sun as `shade_point` needs it: illuminance facing it, direction,
@@ -797,23 +989,103 @@ pub fn render(scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &Ren
 mod tests {
     use super::*;
 
+    /// A ground triangle seen at a grazing angle: wide and thin on screen,
+    /// receding. Its grid is fine along its length only, its points no
+    /// further apart than the shading rate, and there are about as many as
+    /// its area on screen needs.
     #[test]
-    fn grid_index_walks_every_point_once() {
-        for level in 0..=5u8 {
-            let n = 1usize << level;
-            let mut seen = vec![false; grid_points(level)];
-            let mut k = 0;
-            for i in 0..=n {
-                for j in 0..=(n - i) {
-                    let g = grid_index(n, i, j);
-                    assert_eq!(g, k, "level {level} ({i}, {j})");
-                    assert!(!seen[g]);
-                    seen[g] = true;
-                    k += 1;
+    fn dicing_is_even_on_screen() {
+        let (w, h) = (640, 360);
+        let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.0, -10.0), 30.0, 0.06);
+        let vp = cam.proj * cam.view;
+        let p = [Vec3::new(-6.0, 0.0, 0.0), Vec3::new(6.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -30.0)];
+        let d = dice_triangle(vp, p, cam.near, (w, h));
+        let to_px = |b: [f32; 3]| {
+            let q = vp * (p[0] * b[0] + p[1] * b[1] + p[2] * b[2]).extend(1.0);
+            glam::Vec2::new(q.x / q.w * w as f32 * 0.5, q.y / q.w * h as f32 * 0.5)
+        };
+        let corner = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].map(to_px);
+        let area = ((corner[1] - corner[0]).perp_dot(corner[2] - corner[0]) * 0.5).abs();
+        let (nu, nv) = (1usize << d.lu, 1usize << d.lv);
+        let at = |a: usize, b: usize| to_px(screen_to_tri(d.grid_to_screen(a as f32 / nu as f32, b as f32 / nv as f32), d.w));
+        let (mut widest, mut closest) = (0f32, f32::MAX);
+        for a in 0..=nu {
+            for b in 0..=nv {
+                for (a2, b2) in [(a + 1, b), (a, b + 1)] {
+                    if a2 <= nu && b2 <= nv {
+                        let s = at(a, b).distance(at(a2, b2));
+                        widest = widest.max(s);
+                        closest = closest.min(s);
+                    }
                 }
             }
-            assert!(seen.iter().all(|s| *s));
         }
+        let rate = raster::SHADING_RATE_PX;
+        assert!(widest <= rate * 1.001 && closest > rate * 0.5 * 0.999, "{closest} to {widest} px apart");
+        // Even micropolygons of the rate would need area / rate^2 points;
+        // the grid covers twice the triangle, and rounding to powers of two
+        // can double each way.
+        let ideal = area / (rate * rate);
+        assert!(area > 2000.0 && (d.points() as f32) < 8.0 * ideal, "{} points for {ideal}", d.points());
+        // One grid even on the whole triangle, cut as finely as its longest
+        // edge needs, would hold far more.
+        let longest = (0..3).map(|k| corner[k].distance(corner[(k + 1) % 3])).fold(0f32, f32::max);
+        let n = (longest / rate).ceil();
+        assert!(n * n / 2.0 > 1.5 * d.points() as f32, "{} against {}", n * n / 2.0, d.points());
+    }
+
+    /// Weights to grid and back give the same point.
+    #[test]
+    fn grid_points_are_found_where_they_were_made() {
+        let d = TriDice { lu: 4, lv: 2, level: 4, base: 1, w: [1.0, 7.0, 2.5], px: [glam::Vec2::new(-40.0, 3.0), glam::Vec2::new(10.0, -20.0), glam::Vec2::new(90.0, 11.0)], ..Default::default() };
+        for (u, v) in [(0.1, 0.2), (0.5, 0.5), (0.9, 0.3), (0.25, 0.95), (0.02, 0.6)] {
+            let (uu, vv) = d.screen_to_grid(d.grid_to_screen(u, v));
+            assert!((uu - u).abs() < 1e-4 && (vv - v).abs() < 1e-4, "({u}, {v}) came back ({uu}, {vv})");
+        }
+        // The triangle lies in the grid: its corners are on the grid's edges.
+        for k in 0..3 {
+            let mut s = [0.0; 3];
+            s[k] = 1.0;
+            let (u, v) = d.screen_to_grid(s);
+            assert!((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v));
+        }
+        let b = [0.2, 0.3, 0.5];
+        let r = screen_to_tri(tri_to_screen(b, d.w), d.w);
+        assert!((0..3).all(|k| (r[k] - b[k]).abs() < 1e-5));
+    }
+
+    /// Two triangles of very different size on screen share an edge, each
+    /// with its own grid. Along the edge they read the same light to well
+    /// under an 8-bit step, with a lamp 30 cm off the surface and
+    /// micropolygons of about 3 cm. Grids do not share points, so light
+    /// changing faster than the micropolygons (a lamp 10 cm off: 2 %)
+    /// shows as a seam.
+    #[test]
+    fn neighbours_agree_along_a_shared_edge() {
+        let mut scene = Scene::new();
+        // Shared edge 0-2; triangle (0, 1, 2) reaches far down, (0, 2, 3)
+        // barely up.
+        let pos = [Vec3::new(-0.25, 0.0, 0.0), Vec3::new(0.0, -3.0, 0.0), Vec3::new(0.25, 0.0, 0.0), Vec3::new(0.0, 0.05, 0.0)];
+        scene.push_mesh(&pos, &[], &[Vec3::splat(0.6)], &[0, 1, 2, 0, 2, 3]);
+        let lights = [PointLight { position: Vec3::new(0.07, 0.0, 0.3), color: Vec3::ONE, lumens: 300.0 }];
+        let (w, h) = (320, 320);
+        let cam = cam_at(0.0, w, h, Vec3::new(0.0, -1.2, 0.0), 6.0, 0.0);
+        let settings = RenderSettings { shadows: false, bounce: false, ..RenderSettings::new(Sky::new(30.0, true)) };
+        let mut r = Renderer::new();
+        let mut f = Frame::new(w, h);
+        r.render(&scene, &cam, &lights, &settings, &mut f);
+        let peek = r.peek();
+        let (big, small) = (peek.tri_level(0, 0, &scene), peek.tri_level(0, 1, &scene));
+        assert!(big >= small + 2, "levels {big} and {small}");
+        let mut worst = 0f32;
+        for k in 0..=200 {
+            let t = k as f32 / 200.0;
+            // The same point: 1 - t of corner 0, t of corner 2.
+            let a = peek.radiance(&scene, 0, 0, [1.0 - t, 0.0, t], Part::All);
+            let b = peek.radiance(&scene, 0, 1, [1.0 - t, t, 0.0], Part::All);
+            worst = worst.max((a - b).abs().max_element() / a.max_element().max(1e-6));
+        }
+        assert!(worst < 0.004, "{worst}");
     }
 
     use crate::raster::Sky;

@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 
 use glam::Vec3;
 
-/// Finest tile level; the same as the dicer's finest level
-/// (`raster::MAX_DICE_LEVEL`).
+/// Finest tile level. The dicer goes finer (`raster::MAX_DICE_LEVEL`) and
+/// samples this level there.
 pub const MAX_LEVEL: u8 = 5;
 
 /// Points in a triangle tile at level `l` (the dicer's grid points).

@@ -222,9 +222,9 @@ It sets the model on the ground, centred, Y up, in metres (`--length`:
 longest horizontal side; `--height`; `--rotate-x`, `--rotate-y` in
 degrees), cuts it into clusters, and bakes its base colour textures to
 per-triangle tiles, in the manner of Ptex: a triangle's tile at level L is
-its colour at exactly the points the REYES dicer shades at level L, so a
-shading point reads its colour with no UVs and no filtering at render time
-(`src/texture.rs`, `docs/format.md`). Levels 1 to 5 are stored, each
+its colour at the points of the triangle cut into 2^L parts per edge, and a
+shading point reads its colour by interpolating between them, with no UVs
+and no filtering at render time (`src/texture.rs`, `docs/format.md`). Levels 1 to 5 are stored, each
 filtered from the source's mip chain at its own spacing; a triangle's
 finest level stops where its points would be finer than the source's
 texels or closer than `--texel` (2 mm). A triangle covering two texels or
@@ -278,7 +278,7 @@ build leaves them out.
 
 `--select N` picks the light the light views show (1 is the first).
 
-![Six of the views: clusters, micropolygons, light reach, a shadow map unfolded, the surfel cloud, a receiver's micro-raster](docs/debug_views.png)
+![Six of the views: clusters, micropolygons, light reach, a shadow map unfolded, the surfel cloud, dicing levels](docs/debug_views.png)
 
 | view | what it shows |
 |---|---|
@@ -287,8 +287,8 @@ build leaves them out.
 | `depth` | distance from the eye, log scale over the range in view |
 | `normals` | world-space normals |
 | `buckets` | the bucket grid, with the number of triangles binned into each |
-| `dice` | each cluster's dicing level |
-| `micropolygons` | the grid each triangle was shaded on, edges drawn |
+| `dice` | each triangle's dicing level |
+| `micropolygons` | the grid each triangle was shaded on, even on screen, edges drawn |
 | `reshaded` | clusters shaded (red) and bounce gathered (green) in the last frames |
 | `albedo` | base colour: vertex colours or texture tiles |
 | `tiles` | the tile level read for each cluster, dim where finer levels stay on disk |
@@ -445,12 +445,18 @@ rig holds 64 lights at most.
    Clusters are culled against the view frustum as a whole (and their
    normal cone, with back-face culling on), then their triangles are set
    up, binned into 64 x 64 buckets and hidden with a depth buffer, one
-   bucket per thread, no atomics. Each visible cluster gets a dicing level
-   from the size of its triangles on screen.
-4. **Shading** (`src/reyes.rs`). Triangles are diced into micropolygons in
-   world space, 2^level parts per edge so that a micropolygon is about two
-   pixels across, up to 32 parts; level 0 shades the mesh's own vertices.
-   Only triangles under visible pixels are diced and shaded, and only those
+   bucket per thread, no atomics.
+4. **Shading** (`src/reyes.rs`). Each triangle is diced from its own size
+   on screen, whatever the mesh's topology: a grid laid on it as seen,
+   rows along its longest edge and rows up to the opposite corner, 2^level
+   + 1 points each way so that points are at most two pixels apart on
+   screen, up to 256 parts. The grid is even on screen however thin or
+   receding the triangle is, and covers the rectangle on that edge, twice
+   the triangle; its points are placed on the triangle's plane in world
+   space (perspective-correct). A triangle under two pixels shades the
+   mesh's own vertices. A kept grid stays while its points are between a
+   quarter of the rate and the rate apart on the new view. Only triangles
+   under visible pixels are diced and shaded, and only those
    whose shading was not kept: radiance in cd/m² from the sky, then each
    light in reach through its shadow map, Lambert diffuse and a small
    Blinn-Phong highlight. Diffuse light is kept until a light, the sky or
@@ -575,14 +581,28 @@ Not measured yet: a Raspberry Pi.
 - Points, curves and volumes in `.fkj` (tags reserved).
 - Materials: albedo only, per vertex or from texture tiles.
 - Light reach is per cluster and per point, not per pixel.
-- The shading cache holds 142 to 178 MB for the views above and is not
+- The shading cache holds 119 MB for that view (186 MB before even
+  dicing), and is not
   capped or evicted yet. With the high-resolution T-rex the program needs
   about 2.5 GB, and with the low-resolution one it still does not fit: geometry is decoded to f32 at load and every visible triangle
   gets a setup record each frame, so it does not fit a 256 MB Raspberry
   Pi 1. Quantised geometry in memory, cluster level of detail and
   per-bucket setup are what it needs.
-- Shading points are not shared between neighbouring triangles above
-  level 0, so edges are shaded twice.
+- Each triangle above two pixels has its own grid, covering twice its
+  area; neighbours share no points. Light that changes faster than the
+  micropolygons (a lamp 10 cm off a surface diced at 3 cm) leaves a seam
+  of about 2 % along their edge. Grids past the finest texture tile
+  (level 5) interpolate it.
+- At two pixels, shadow edges on the ground show the grid's steps and
+  texture detail is softer than with the old topology-led dicing, which
+  over-diced. One pixel smooths them: for the view at 16:30 with the
+  low-resolution T-rex (`--time 16:30 --sun 900 --no-highres`, 1280 x 720,
+  2 cores of a Xeon at 2.1 GHz, 22/10/2026), 4.5 M points and 859 ms of
+  shading against 1.3 M and 260 to 277 ms at two pixels (3.7 M and 545 to
+  569 ms before this change).
+- Dicing down: triangles smaller than two pixels are still shaded at
+  their vertices, so the high-resolution T-rex costs a point per vertex;
+  cluster level of detail is next.
 - `tools/fkj-import` does not read USD (`docs/format.md`).
 - Light rigs and the sky setting are not saved.
 - Text overlay: the numbers are in the window title.

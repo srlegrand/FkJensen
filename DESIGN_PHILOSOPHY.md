@@ -28,7 +28,7 @@ Read `LLM_instructions.md` too: the checks to run first and how changes are deli
 
 ## Textures are tiles per triangle, streamed
 
-- No UV atlas at render time. Each triangle carries its own tiles (the Ptex idea, Burley and Lacewell 2008), and a tile at level L holds the colour at the points the dicer shades at level L. Shading reads a colour; it does not filter.
+- No UV atlas at render time. Each triangle carries its own tiles (the Ptex idea, Burley and Lacewell 2008), and a tile at level L holds the colour at the points of the triangle cut into 2^L parts per edge. Shading reads a colour, interpolated between a tile's points; it does not filter.
 - Tiles stay on disk and are read per cluster and level when seen, into a capped cache. What is not visible, or not seen closely, costs nothing.
 - Textures are baked at import, filtered once per level from the source's mips. Import bakes geometry and surface data; still nothing about light.
 
@@ -42,7 +42,7 @@ Read `LLM_instructions.md` too: the checks to run first and how changes are deli
 
 ## Cost follows pixels, not polygons
 
-- REYES is the core: clusters are diced into micropolygons about a pixel across, shaded in world space before visibility, then sampled into the frame (Cook, Carpenter, Catmull 1987). Shading is per micropolygon, not per pixel per frame, and it is kept.
+- REYES is the core: triangles are diced into micropolygons evenly spaced on screen, about a pixel across, from each triangle's own size on screen and not the mesh's topology, shaded in world space before visibility, then sampled into the frame (Cook, Carpenter, Catmull 1987). Shading is per micropolygon, not per pixel per frame, and it is kept.
 - Shading results stay in memory between frames, keyed by micropolygon. Moving the camera reuses them; moving a light re-shades only the micropolygons inside its old and new reach. Cost follows what changed, not the size of the frame.
 - Work is decided per region: sparse where the picture is smooth, refined where neighbours disagree (silhouettes, shadow edges, highlights), front to back, stopping where a tile is covered.
 - Tiles (buckets) own their pixels: one thread works one bucket, with no atomics and no locks.
@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 22/10/2026: micropolygons evenly spaced on screen: each triangle gets its own grid, laid along its longest edge on screen, fine along its length only when thin, perspective-correct when receding, up to 256 parts per side. Replaces one level per cluster from its longest edge, capped at 32 parts. Next: cluster level of detail, for triangles under the shading rate.
 - 21/10/2026: the sun, a directional light with cascaded orthographic shadow maps and a 0 to 1000 brightness; time of day; lighting contrast and visible sky contrast, independent.
 - 21/10/2026: the chess table, the chess set and the café leave the built-in set: a ground plane with the T-rex (a 10.8 M-triangle ZBrush sculpt, or the 28 K-triangle one when the machine's plan says so) and the car, the mountains behind, three film-sized lights. Models in `assets/models/` are stored with Git LFS. fkj-import reads OBJ.
 - 21/10/2026: the T-rex and the car move into the repository (`assets/models/`) so that anyone who clones it sees them; credits in `assets/README.md`.

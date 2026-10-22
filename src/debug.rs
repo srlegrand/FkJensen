@@ -116,8 +116,8 @@ impl DebugView {
             DebugView::Depth => ("DEPTH", &["DISTANCE FROM THE EYE, LOG SCALE, OVER THE RANGE IN VIEW"]),
             DebugView::Normals => ("NORMALS", &["WORLD-SPACE NORMAL, X Y Z AS RED GREEN BLUE"]),
             DebugView::Buckets => ("BUCKETS", &["EACH BUCKET IS HIDDEN BY ONE THREAD, WITH NO LOCKS", "NUMBER: TRIANGLES BINNED INTO IT; BLUE FEW, RED MANY"]),
-            DebugView::Dice => ("DICING LEVEL", &["PER CLUSTER, FROM ITS LONGEST EDGE ON SCREEN", "LEVEL L CUTS A TRIANGLE INTO 2^L PARTS PER EDGE"]),
-            DebugView::Micropolygons => ("MICROPOLYGONS", &["THE GRID EACH TRIANGLE WAS SHADED ON, IN WORLD SPACE", "WHITE: TRIANGLE EDGES; COLOUR: MICROPOLYGON EDGES BY LEVEL"]),
+            DebugView::Dice => ("DICING LEVEL", &["PER TRIANGLE, FROM ITS EDGES ON SCREEN", "LEVEL L CUTS A TRIANGLE INTO 2^L PARTS PER EDGE"]),
+            DebugView::Micropolygons => ("MICROPOLYGONS", &["THE GRID EACH TRIANGLE WAS SHADED ON, EVEN ON SCREEN", "WHITE: TRIANGLE EDGES; COLOUR: MICROPOLYGON EDGES BY LEVEL"]),
             DebugView::Reshaded => ("SHADING CACHE", &["RED: SHADED IN THE LAST FRAMES; GREEN: BOUNCE GATHERED", "GREY: KEPT FROM EARLIER FRAMES. DRAG A LIGHT TO SEE ITS REACH REDONE"]),
             DebugView::Albedo => ("ALBEDO", &["BASE COLOUR: VERTEX COLOURS, OR TEXTURE TILES AT THE KEPT LEVEL"]),
             DebugView::Tiles => ("TEXTURE TILES", &["BRIGHT: THE TILE LEVEL READ FOR WHAT IS SEEN, IN THE CACHE NOW", "DIM: FINER LEVELS LEFT ON DISK; GREY: VERTEX COLOURS ONLY"]),
@@ -199,7 +199,7 @@ fn albedo(ctx: &Ctx, h: &Hit) -> Vec3 {
         return h.vcol;
     }
     let c = &ctx.scene.clusters[h.cluster];
-    match ctx.scene.textures.block(h.cluster, c.tri_count as usize, level) {
+    match ctx.scene.textures.block(h.cluster, c.tri_count as usize, level.min(crate::texture::MAX_LEVEL)) {
         Some(b) => b.sample((h.tri - c.first_tri) as usize, h.w[1], h.w[2]),
         None => h.vcol,
     }
@@ -222,6 +222,9 @@ fn level_colour(l: u8) -> Vec3 {
         3 => rgb(250, 200, 88),
         4 => rgb(252, 132, 82),
         5 => rgb(238, 102, 102),
+        6 => rgb(200, 80, 160),
+        7 => rgb(150, 90, 210),
+        8 => rgb(235, 235, 235),
         _ => rgb(40, 40, 40),
     }
 }
@@ -302,7 +305,7 @@ pub fn draw(view: DebugView, ctx: &Ctx, frame: &mut Frame) {
                     depth_ramp(((d.ln() - d_lo.ln()) / (d_hi.ln() - d_lo.ln()).max(1e-6)).clamp(0.0, 1.0))
                 }
                 DebugView::Normals => (hh.n * 0.5 + Vec3::splat(0.5)).powf(2.2),
-                DebugView::Dice => level_colour(ctx.peek.levels.get(hh.cluster).copied().unwrap_or(NOT_VISIBLE)) * facing(ctx, &hh),
+                DebugView::Dice => level_colour(ctx.peek.tri_level(hh.cluster, hh.tri, ctx.scene)) * facing(ctx, &hh),
                 DebugView::Micropolygons => micropolygon(ctx, fr, x, y, &hh, dim(i, 0.55)),
                 DebugView::Reshaded => {
                     let now = ctx.peek.frame_no;
@@ -319,6 +322,7 @@ pub fn draw(view: DebugView, ctx: &Ctx, frame: &mut Frame) {
                         Vec3::splat(0.05) * facing(ctx, &hh)
                     } else {
                         let lv = ctx.peek.kept_level(hh.cluster);
+                        let lv = if lv == NOT_VISIBLE { lv } else { lv.min(crate::texture::MAX_LEVEL) };
                         let read = if lv == NOT_VISIBLE { 0 } else { lv.min(e.level) };
                         if read > 0 && ctx.scene.textures.resident(hh.cluster, lv) {
                             level_colour(read) * facing(ctx, &hh)
@@ -464,24 +468,25 @@ fn micropolygon(ctx: &Ctx, fr: &Frame, x: usize, y: usize, hh: &Hit, under: Vec3
     let id = fr.tri_id[y * fr.width + x];
     let s = &fr.setups[id as usize];
     let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-    let w0 = hh.w;
     let wx = weights(s, px + 1.0, py);
     let wy = weights(s, px, py + 1.0);
-    let level = ctx.peek.kept_level(hh.cluster);
-    let level = if level == NOT_VISIBLE { 0 } else { level };
-    let n = (1u32 << level) as f32;
     let mut tri_edge = false;
-    let mut mp_edge = false;
     for k in 0..3 {
-        let g = ((wx[k] - w0[k]).powi(2) + (wy[k] - w0[k]).powi(2)).sqrt().max(1e-9);
+        let g = ((wx[k] - hh.w[k]).powi(2) + (wy[k] - hh.w[k]).powi(2)).sqrt().max(1e-9);
         // Triangle edge: this weight near 0.
-        if w0[k] / g < 0.8 {
+        if hh.w[k] / g < 0.8 {
             tri_edge = true;
         }
-        if level > 0 {
-            let v = w0[k] * n;
-            let f = (v - v.round()).abs();
-            if f / (g * n) < 0.6 {
+    }
+    // Micropolygon edges: where the grid coordinates cross a whole step.
+    let at = |w: [f32; 3]| ctx.peek.grid_at(hh.cluster, hh.tri, ctx.scene, w);
+    let mut mp_edge = false;
+    let mut level = 0;
+    if let (Some(g0), Some(gx), Some(gy)) = (at(hh.w), at(wx), at(wy)) {
+        level = g0.2;
+        for (c0, cx, cy) in [(g0.0, gx.0, gy.0), (g0.1, gx.1, gy.1)] {
+            let g = ((cx - c0).powi(2) + (cy - c0).powi(2)).sqrt().max(1e-9);
+            if (c0 - c0.round()).abs() / g < 0.6 {
                 mp_edge = true;
             }
         }
@@ -787,7 +792,7 @@ fn legend(view: DebugView, ctx: &Ctx, frame: &mut Frame) {
     }
     // Swatches for views whose colours are a scale.
     let swatches: Vec<(Vec3, String)> = match view {
-        DebugView::Dice | DebugView::Micropolygons => (0..=5u8).map(|l| (level_colour(l), format!("L{} {}", l, ["VERTICES", "<4 PX", "<8 PX", "<16 PX", "<32 PX", "FINEST"][l as usize]))).collect(),
+        DebugView::Dice | DebugView::Micropolygons => (0..=raster::MAX_DICE_LEVEL).map(|l| (level_colour(l), match l { 0 => "L0 VERTS".to_string(), 1 => "L1 <4 PX".to_string(), _ => format!("L{} <{}", l, 2u32 << l) })).collect(),
         DebugView::Tiles => (1..=5u8).map(|l| (level_colour(l), format!("L{l} {} PTS", crate::texture::tile_points(l)))).collect(),
         DebugView::LightCount => (0..=5u32).map(|k| (raster::heat(k) * 1.4, if k == 5 { "5+".to_string() } else { k.to_string() })).collect(),
         DebugView::Reach => (0..8u32).map(|k| (reach_colour(k), if k == 0 { "REACH".to_string() } else { format!("X{}", 1u32 << k) })).collect(),
