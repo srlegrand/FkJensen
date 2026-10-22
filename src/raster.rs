@@ -90,6 +90,11 @@ pub struct Stats {
     pub shadow_ms: f32,
     pub shade_ms: f32,
     pub resolve_ms: f32,
+    /// Bytes held by the shading cache after the frame, clusters dropped
+    /// from it to fit the budget, and the shading rate's multiplier.
+    pub cache_bytes: usize,
+    pub clusters_evicted: usize,
+    pub rate_scale: f32,
 }
 
 /// A triangle after projection: screen positions, 1/w, and each corner's
@@ -283,11 +288,16 @@ pub struct RenderSettings {
     /// Time per frame for gathering bounce light, in ms; None: all of it.
     pub bounce_budget_ms: Option<f32>,
     pub view: View,
+    /// Most bytes the shading cache may hold (`reyes::Renderer`).
+    pub cache_budget: usize,
 }
+
+/// Shading cache budget when the machine's plan does not set one.
+pub const CACHE_BUDGET: usize = if cfg!(target_pointer_width = "64") { 1 << 30 } else { 16 << 20 };
 
 impl RenderSettings {
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded }
+        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET }
     }
 }
 
@@ -498,10 +508,15 @@ pub const NOT_VISIBLE: u8 = u8::MAX;
 /// `MAX_DICE_LEVEL`. Per cluster, from its longest edge, it is the finest
 /// level any of its triangles can need.
 pub fn dice_level(edge_px: f32) -> u8 {
-    if !(edge_px > SHADING_RATE_PX) {
+    dice_level_at(edge_px, SHADING_RATE_PX)
+}
+
+/// `dice_level` for micropolygons of `rate` pixels.
+pub fn dice_level_at(edge_px: f32, rate: f32) -> u8 {
+    if !(edge_px > rate) {
         return 0;
     }
-    ((edge_px / SHADING_RATE_PX).log2().ceil() as i32).clamp(0, MAX_DICE_LEVEL as i32) as u8
+    ((edge_px / rate).log2().ceil() as i32).clamp(0, MAX_DICE_LEVEL as i32) as u8
 }
 
 /// Work out what each pixel sees. Fills `frame.depth`, `frame.tri_id` and

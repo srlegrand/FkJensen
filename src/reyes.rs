@@ -110,7 +110,7 @@ impl TriDice {
 
 /// A triangle diced for the view `vp` on a `size` pixel frame. Corners
 /// behind the near plane are taken at it.
-fn dice_triangle(vp: Mat4, p: [Vec3; 3], near: f32, size: (usize, usize)) -> TriDice {
+fn dice_triangle(vp: Mat4, p: [Vec3; 3], near: f32, size: (usize, usize), rate: f32) -> TriDice {
     let (hw, hh) = (size.0 as f32 * 0.5, size.1 as f32 * 0.5);
     let c = p.map(|q| vp * q.extend(1.0));
     let w = c.map(|q| q.w.max(near));
@@ -118,8 +118,8 @@ fn dice_triangle(vp: Mat4, p: [Vec3; 3], near: f32, size: (usize, usize)) -> Tri
     let base = (0..3).max_by(|&a, &b| px[a].distance_squared(px[(a + 1) % 3]).total_cmp(&px[b].distance_squared(px[(b + 1) % 3]))).unwrap_or(0);
     let mut d = TriDice { base: base as u8, w, px, ..Default::default() };
     let (_, ex, ey) = d.frame();
-    d.lu = raster::dice_level(ex.length());
-    d.lv = raster::dice_level(ey.length());
+    d.lu = raster::dice_level_at(ex.length(), rate);
+    d.lv = raster::dice_level_at(ey.length(), rate);
     d.level = d.lu.max(d.lv);
     d
 }
@@ -170,7 +170,11 @@ fn tri_to_screen(b: [f32; 3], w: [f32; 3]) -> [f32; 3] {
 struct ClusterShade {
     /// Finest level kept for any triangle; `NOT_VISIBLE` when none is.
     level: u8,
-    tris: Vec<TriDice>,
+    /// Per triangle: `UNDICED`, `ON_VERTICES`, or which of `grids` it has.
+    state: Vec<u8>,
+    /// Grids of triangles diced above level 0; an entry at `NOT_VISIBLE` is
+    /// free, its points kept for the next triangle that fits.
+    grids: Vec<TriDice>,
     /// Grid points of triangles diced above level 0.
     diffuse: Vec<Vec3>,
     spec: Vec<Vec3>,
@@ -194,11 +198,44 @@ struct ClusterShade {
     spec_eye: Vec3,
     /// The frame in which anything here was last shaded.
     stamp: u64,
+    /// The frame in which it was last on screen.
+    seen: u64,
 }
 
+/// A triangle not diced yet.
+const UNDICED: u8 = u8::MAX;
+/// A triangle under two pixels, read from the cluster's vertices.
+const ON_VERTICES: u8 = u8::MAX - 1;
+
 impl ClusterShade {
+    fn empty() -> Self {
+        Self { level: NOT_VISIBLE, ..Default::default() }
+    }
+
+    /// Bytes held.
+    fn bytes(&self) -> usize {
+        (self.diffuse.capacity() + self.spec.capacity() + self.vdiffuse.capacity() + self.vspec.capacity()) * 12 + self.state.capacity() + self.grids.capacity() * std::mem::size_of::<TriDice>()
+    }
+
+    /// Dicing level of triangle `u` (`NOT_VISIBLE`: not diced).
+    fn tri_level(&self, u: usize) -> u8 {
+        match self.state.get(u).copied().unwrap_or(UNDICED) {
+            UNDICED => NOT_VISIBLE,
+            ON_VERTICES => 0,
+            i => self.grids[i as usize].level,
+        }
+    }
+
+    /// Grid of triangle `u`, when it has one.
+    fn grid(&self, u: usize) -> Option<&TriDice> {
+        match self.state.get(u).copied().unwrap_or(UNDICED) {
+            UNDICED | ON_VERTICES => None,
+            i => Some(&self.grids[i as usize]),
+        }
+    }
+
     fn init(&mut self, tris: usize, verts: usize) {
-        self.tris = vec![TriDice::default(); tris];
+        self.state = vec![UNDICED; tris];
         self.vdiffuse = vec![Vec3::ZERO; verts];
         self.vspec = vec![Vec3::ZERO; verts];
         self.forget_grids();
@@ -207,15 +244,16 @@ impl ClusterShade {
         self.vback = 0;
     }
 
-    /// Drops every grid, keeping the vertices.
+    /// Drops every grid and its memory, keeping the vertices.
     fn forget_grids(&mut self) {
-        for d in &mut self.tris {
-            if d.level != 0 {
-                *d = TriDice::default();
+        for st in &mut self.state {
+            if *st != ON_VERTICES {
+                *st = UNDICED;
             }
         }
-        self.diffuse.clear();
-        self.spec.clear();
+        self.grids = Vec::new();
+        self.diffuse = Vec::new();
+        self.spec = Vec::new();
         self.live = 0;
         self.done = 0;
         self.spec_done = 0;
@@ -261,6 +299,8 @@ pub struct Renderer {
     /// Which view the base was resolved with.
     base_view: Option<View>,
     frame_no: u64,
+    /// The shading rate is multiplied by this to fit the cache budget.
+    rate_scale: f32,
 }
 
 #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
@@ -282,7 +322,7 @@ impl Peek<'_> {
 
     /// Dicing level kept for triangle `tri` of cluster `c`.
     pub fn tri_level(&self, c: usize, tri: u32, scene: &Scene) -> u8 {
-        self.tri(c, tri, scene).map(|d| d.level).unwrap_or(NOT_VISIBLE)
+        self.cache.get(c).map(|e| e.tri_level((tri - scene.clusters[c].first_tri) as usize)).unwrap_or(NOT_VISIBLE)
     }
 
     /// Where weights `w` of triangle `tri` of cluster `c` fall in its kept
@@ -298,7 +338,7 @@ impl Peek<'_> {
     }
 
     fn tri(&self, c: usize, tri: u32, scene: &Scene) -> Option<&TriDice> {
-        self.cache.get(c)?.tris.get((tri - scene.clusters[c].first_tri) as usize)
+        self.cache.get(c)?.grid((tri - scene.clusters[c].first_tri) as usize)
     }
 
     /// The frame in which cluster `c` was last shaded.
@@ -342,6 +382,7 @@ impl Renderer {
             base: Vec::new(),
             base_view: None,
             frame_no: 0,
+            rate_scale: 1.0,
         }
     }
 
@@ -359,7 +400,7 @@ impl Renderer {
 
     /// Memory held by the shading cache and the shadow maps, in bytes.
     pub fn memory(&self) -> usize {
-        let shade: usize = self.cache.iter().map(|c| (c.diffuse.capacity() + c.spec.capacity() + c.vdiffuse.capacity() + c.vspec.capacity()) * 12 + c.tris.capacity() * std::mem::size_of::<TriDice>()).sum();
+        let shade: usize = self.cache.iter().map(|c| c.bytes()).sum();
         let shadows: usize = self.shadows.iter().flatten().map(|s| s.bytes()).sum();
         shade + shadows + self.sun_shadow.as_ref().map(|s| s.bytes()).unwrap_or(0)
     }
@@ -371,7 +412,7 @@ impl Renderer {
         if key != self.scene_key {
             *self = Self::new();
             self.scene_key = key;
-            self.cache = (0..scene.clusters.len()).map(|_| ClusterShade { level: NOT_VISIBLE, ..Default::default() }).collect();
+            self.cache = (0..scene.clusters.len()).map(|_| ClusterShade::empty()).collect();
         }
         frame.stats = Default::default();
         self.frame_no += 1;
@@ -543,6 +584,7 @@ impl Renderer {
         let ground = !settings.bounce;
         let vp = cam.proj * cam.view;
         let (near, size) = (cam.near, (frame.width, frame.height));
+        let rate = raster::SHADING_RATE_PX * self.rate_scale;
         if settings.view == View::Shaded {
             self.cache.par_iter_mut().enumerate().for_each(|(ci, e)| {
                 let need_tris = need[ci];
@@ -551,12 +593,13 @@ impl Renderer {
                 }
                 let c = &scene.clusters[ci];
                 let fv = c.first_vertex as usize;
-                if e.tris.len() != c.tri_count as usize {
+                e.seen = frame_no;
+                if e.state.len() != c.tri_count as usize {
                     e.init(c.tri_count as usize, c.vertex_count as usize);
                 }
-                // Too much garbage from triangles diced again: start the
-                // grids over.
-                if e.diffuse.len() > 2 * e.live + 65_536 {
+                // Too much left by grids that moved to larger places:
+                // start the grids over.
+                if e.diffuse.len() > 2 * e.live + 4096 {
                     e.forget_grids();
                 }
                 if e.spec_eye != eye {
@@ -576,46 +619,58 @@ impl Renderer {
                     let t = (c.first_tri as usize + u) * 3;
                     let idx = [scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize];
                     let corners = idx.map(|i| scene.positions[i]);
-                    let d = &mut e.tris[u];
+                    let cur = match e.state[u] {
+                        UNDICED | ON_VERTICES => None,
+                        i => Some(i as usize),
+                    };
                     // A kept grid stays while its points are no further
                     // apart on screen than the rate and no more than a
                     // level finer than a fresh one.
-                    let rate = raster::SHADING_RATE_PX;
-                    let keep = d.level != 0
-                        && d.level != NOT_VISIBLE
-                        && kept_spacing(d, corners, vp, near, size).is_some_and(|s| s <= rate * 1.05 && s > rate * 0.25);
+                    let keep = cur.is_some_and(|i| kept_spacing(&e.grids[i], corners, vp, near, size).is_some_and(|s| s <= rate * 1.05 && s > rate * 0.25));
                     if !keep {
-                        let fresh = dice_triangle(vp, corners, near, size);
+                        let fresh = dice_triangle(vp, corners, near, size, rate);
+                        if let Some(i) = cur {
+                            e.live -= e.grids[i].points();
+                            e.grids[i].level = NOT_VISIBLE;
+                        }
                         if fresh.level == 0 {
-                            if d.level != 0 {
-                                e.live -= d.points();
-                                d.level = 0;
-                            }
+                            e.state[u] = ON_VERTICES;
                             for i in idx {
                                 vneed |= 1u128 << (i - fv);
                             }
                             continue;
                         }
-                        e.live -= d.points();
+                        // Its own entry, or a free one, keeping their points.
+                        let i = cur.or_else(|| e.grids.iter().position(|g| g.level == NOT_VISIBLE)).unwrap_or_else(|| {
+                            e.grids.push(TriDice::default());
+                            e.grids.len() - 1
+                        });
                         let pts = fresh.points();
-                        let (mut offset, mut cap) = (d.offset, d.cap);
+                        let (mut offset, mut cap) = (e.grids[i].offset, e.grids[i].cap);
                         if (cap as usize) < pts {
                             offset = e.diffuse.len() as u32;
                             cap = pts as u32;
                             e.diffuse.resize(e.diffuse.len() + pts, Vec3::ZERO);
                             e.spec.resize(e.spec.len() + pts, Vec3::ZERO);
                         }
-                        *d = TriDice { offset, cap, ..fresh };
+                        e.grids[i] = TriDice { offset, cap, ..fresh };
+                        e.state[u] = i as u8;
                         e.live += pts;
                         e.done &= !(1u128 << u);
                         e.spec_done &= !(1u128 << u);
                     }
+                    if e.state[u] == ON_VERTICES {
+                        for i in idx {
+                            vneed |= 1u128 << (i - fv);
+                        }
+                        continue;
+                    }
                     tneed |= 1u128 << u;
-                    n_used += d.points() as u64;
+                    n_used += e.grids[e.state[u] as usize].points() as u64;
                 }
                 n_used += vneed.count_ones() as u64;
                 used.fetch_add(n_used, Ordering::Relaxed);
-                e.level = e.tris.iter().map(|d| d.level).filter(|l| *l != NOT_VISIBLE).max().unwrap_or(NOT_VISIBLE);
+                e.level = (0..e.state.len()).map(|u| e.tri_level(u)).filter(|l| *l != NOT_VISIBLE).max().unwrap_or(NOT_VISIBLE);
                 let vtodo = vneed & !(e.vdone & e.vspec_done);
                 let ttodo = tneed & !(e.done & e.spec_done);
                 if vtodo == 0 && ttodo == 0 {
@@ -660,7 +715,7 @@ impl Renderer {
                     let mut l = 0;
                     let mut bits = ttodo;
                     while bits != 0 {
-                        l = l.max(e.tris[bits.trailing_zeros() as usize].level);
+                        l = l.max(e.tri_level(bits.trailing_zeros() as usize));
                         bits &= bits - 1;
                     }
                     l
@@ -670,7 +725,7 @@ impl Renderer {
                 while bits != 0 {
                     let u = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    let d = e.tris[u];
+                    let d = e.grids[e.state[u] as usize];
                     let t = (c.first_tri as usize + u) * 3;
                     let (i0, i1, i2) = (scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize);
                     let (p0, p1, p2) = (scene.positions[i0], scene.positions[i1], scene.positions[i2]);
@@ -819,6 +874,45 @@ impl Renderer {
         });
         frame.color.copy_from_slice(&self.base);
         frame.stats.resolve_ms = t_res.elapsed().as_secs_f32() * 1000.0;
+        self.fit_budget(settings.cache_budget, frame);
+    }
+
+    /// Keeps the shading cache within `budget` bytes. Clusters off screen
+    /// go first, least recently seen first, down to three quarters of the
+    /// budget. When what is on screen alone does not fit, the shading rate
+    /// doubles (up to 16 times) and the grids on screen are dropped, to be
+    /// diced coarser next frame; it halves again once the cache is under an
+    /// eighth of the budget. Slower or coarser, never out of memory.
+    fn fit_budget(&mut self, budget: usize, frame: &mut Frame) {
+        let frame_no = self.frame_no;
+        let mut total: usize = self.cache.par_iter().map(|e| e.bytes()).sum();
+        if total > budget {
+            let mut old: Vec<(u64, u32)> = self.cache.iter().enumerate().filter(|(_, e)| e.seen != frame_no && e.bytes() > 0).map(|(i, e)| (e.seen, i as u32)).collect();
+            old.sort_unstable();
+            for (_, i) in old {
+                if total <= budget / 4 * 3 {
+                    break;
+                }
+                let e = &mut self.cache[i as usize];
+                total -= e.bytes();
+                *e = ClusterShade::empty();
+                frame.stats.clusters_evicted += 1;
+            }
+            if total > budget && self.rate_scale < 16.0 {
+                self.rate_scale *= 2.0;
+                for e in &mut self.cache {
+                    if e.grids.capacity() > 0 {
+                        total -= e.bytes();
+                        e.forget_grids();
+                        total += e.bytes();
+                    }
+                }
+            }
+        } else if total < budget / 8 && self.rate_scale > 1.0 {
+            self.rate_scale /= 2.0;
+        }
+        frame.stats.cache_bytes = total;
+        frame.stats.rate_scale = self.rate_scale;
     }
 }
 
@@ -838,13 +932,11 @@ pub enum Part {
 
 fn lookup_part(scene: &Scene, c: &crate::scene::Cluster, e: &ClusterShade, tri: u32, w: [f32; 3], part: Part) -> Vec3 {
     let u = (tri - c.first_tri) as usize;
-    let Some(d) = e.tris.get(u) else {
-        return Vec3::ZERO;
-    };
-    if d.level == NOT_VISIBLE {
+    let state = e.state.get(u).copied().unwrap_or(UNDICED);
+    if state == UNDICED {
         return Vec3::ZERO;
     }
-    if d.level == 0 {
+    if state == ON_VERTICES {
         let t = tri as usize * 3;
         let mut r = Vec3::ZERO;
         for k in 0..3 {
@@ -856,6 +948,7 @@ fn lookup_part(scene: &Scene, c: &crate::scene::Cluster, e: &ClusterShade, tri: 
         }
         return r;
     }
+    let d = &e.grids[state as usize];
     let at = |i: usize| match part {
         Part::All => e.diffuse[i] + e.spec[i],
         Part::Highlight => e.spec[i],
@@ -999,7 +1092,7 @@ mod tests {
         let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.0, -10.0), 30.0, 0.06);
         let vp = cam.proj * cam.view;
         let p = [Vec3::new(-6.0, 0.0, 0.0), Vec3::new(6.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -30.0)];
-        let d = dice_triangle(vp, p, cam.near, (w, h));
+        let d = dice_triangle(vp, p, cam.near, (w, h), raster::SHADING_RATE_PX);
         let to_px = |b: [f32; 3]| {
             let q = vp * (p[0] * b[0] + p[1] * b[1] + p[2] * b[2]).extend(1.0);
             glam::Vec2::new(q.x / q.w * w as f32 * 0.5, q.y / q.w * h as f32 * 0.5)
@@ -1159,6 +1252,47 @@ mod tests {
         let mut fresh = Frame::new(w, h);
         render(&scene, &cam2, &lights, &settings, &mut fresh);
         assert!(worst(&frame, &fresh) <= 6, "{}", worst(&frame, &fresh));
+    }
+
+    /// Orbiting and zooming for a while keeps the shading cache under its
+    /// budget: what is off screen is dropped.
+    #[test]
+    fn the_cache_stays_within_its_budget() {
+        let (scene, lights) = world();
+        let (w, h) = (320, 180);
+        let budget = 24 << 20;
+        let settings = RenderSettings { cache_budget: budget, ..RenderSettings::new(Sky::new(30.0, true)) };
+        let mut r = Renderer::new();
+        let mut f = Frame::new(w, h);
+        let mut evicted = 0;
+        for i in 0..80 {
+            let cam = cam_at(i as f32 * 0.08, w, h, Vec3::new(0.0, 0.5, 0.0), 3.0 + (i as f32 * 0.3).sin() * 2.0, 0.1 + (i as f32 * 0.2).cos() * 0.08);
+            r.render(&scene, &cam, &lights, &settings, &mut f);
+            assert!(f.stats.cache_bytes <= budget || f.stats.rate_scale > 1.0, "frame {i}: {} bytes", f.stats.cache_bytes);
+            evicted += f.stats.clusters_evicted;
+        }
+        assert!(evicted > 0);
+        assert_eq!(f.stats.rate_scale, 1.0, "what is on screen fits");
+    }
+
+    /// With a budget too small for what is on screen, micropolygons grow
+    /// until it fits, and the picture is still drawn.
+    #[test]
+    fn a_tiny_budget_makes_micropolygons_coarser_not_a_crash() {
+        let (scene, lights) = world();
+        let (w, h) = (320, 180);
+        let budget = 1 << 20;
+        let settings = RenderSettings { cache_budget: budget, ..RenderSettings::new(Sky::new(30.0, true)) };
+        let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.5, 0.0), 2.0, 0.1);
+        let mut r = Renderer::new();
+        let mut f = Frame::new(w, h);
+        for _ in 0..6 {
+            r.render(&scene, &cam, &lights, &settings, &mut f);
+        }
+        assert!(f.stats.rate_scale > 1.0);
+        assert!(f.stats.cache_bytes <= budget, "{} bytes", f.stats.cache_bytes);
+        let lit = f.color.iter().filter(|p| (**p & 0xff) > 10).count();
+        assert!(lit > w * h / 2, "{lit} pixels drawn");
     }
 
     /// A card between a light and the floor darkens the floor under it.

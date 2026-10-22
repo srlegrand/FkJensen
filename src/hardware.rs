@@ -68,6 +68,8 @@ pub struct Plan {
     pub tile: usize,
     /// Memory the texture tile cache may hold, bytes.
     pub texture_cache: usize,
+    /// Memory the shading cache may hold, bytes.
+    pub shade_cache: usize,
     /// Why, one line per choice.
     pub reasons: Vec<String>,
 }
@@ -350,7 +352,13 @@ impl Hardware {
         let texture_cache = (self.mem_available.unwrap_or(2 << 30) / 8).clamp(8 << 20, 1 << 30) as usize;
         reasons.push(format!("texture tile cache up to {} MB", texture_cache >> 20));
 
-        Plan { texture_cache, render_scale, pixel_budget, png_size, highres, shadows, shadow_res, bounce, bounce_budget_ms, tile, reasons }
+        // Shading cache: a quarter of available memory, 8 MB to 4 GB.
+        // Past it, clusters off screen are dropped, then micropolygons
+        // grow.
+        let shade_cache = (self.mem_available.unwrap_or(2 << 30) / 4).clamp(8 << 20, if cfg!(target_pointer_width = "64") { 4 << 30 } else { 256 << 20 }) as usize;
+        reasons.push(format!("shading cache up to {} MB", shade_cache >> 20));
+
+        Plan { texture_cache, shade_cache, render_scale, pixel_budget, png_size, highres, shadows, shadow_res, bounce, bounce_budget_ms, tile, reasons }
     }
 
     pub fn report(&self) -> String {

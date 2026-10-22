@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 22/10/2026: the shading cache has a budget, a quarter of available memory: clusters off screen are dropped first, then micropolygons grow until what is on screen fits. Slower or coarser, never out of memory. Before this, moving the camera grew the cache without end.
 - 22/10/2026: micropolygons evenly spaced on screen: each triangle gets its own grid, laid along its longest edge on screen, fine along its length only when thin, perspective-correct when receding, up to 256 parts per side. Replaces one level per cluster from its longest edge, capped at 32 parts. Next: cluster level of detail, for triangles under the shading rate.
 - 21/10/2026: the sun, a directional light with cascaded orthographic shadow maps and a 0 to 1000 brightness; time of day; lighting contrast and visible sky contrast, independent.
 - 21/10/2026: the chess table, the chess set and the café leave the built-in set: a ground plane with the T-rex (a 10.8 M-triangle ZBrush sculpt, or the 28 K-triangle one when the machine's plan says so) and the car, the mountains behind, three film-sized lights. Models in `assets/models/` are stored with Git LFS. fkj-import reads OBJ.

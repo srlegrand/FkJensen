@@ -197,6 +197,14 @@ On the machine this was written on (21/10/2026):
       bounce light on, gathered 29 ms per window frame
       buckets 64 x 64 (32 KB of depth and ids, L2 2048 KB)
       texture tile cache up to 931 MB
+      shading cache up to 1862 MB (added 22/10/2026)
+
+The shading cache's budget is kept every frame: past it, clusters off
+screen are dropped, least recently seen first; when what is on screen alone
+does not fit, micropolygons grow (4, 8, up to 32 pixels apart) until it
+does, and shrink back once there is room. A small machine renders coarser
+or slower; it does not run out of memory. Without a plan the budget is
+1 GB, or 16 MB on 32-bit machines.
 
 On a Raspberry Pi 1 Model B Rev 1 (59 MB available, about 80 K shading
 points per second measured in a frame on 20/10/2026) the rules give, as the
@@ -581,9 +589,10 @@ Not measured yet: a Raspberry Pi.
 - Points, curves and volumes in `.fkj` (tags reserved).
 - Materials: albedo only, per vertex or from texture tiles.
 - Light reach is per cluster and per point, not per pixel.
-- The shading cache holds 119 MB for that view (186 MB before even
-  dicing), and is not
-  capped or evicted yet. With the high-resolution T-rex the program needs
+- The shading cache holds 118 MB for that view (186 MB before even
+  dicing). Only the shading cache has a budget: geometry, shadow maps
+  and surfels are as large as the scene makes them. With the
+  high-resolution T-rex the program needs
   about 2.5 GB, and with the low-resolution one it still does not fit: geometry is decoded to f32 at load and every visible triangle
   gets a setup record each frame, so it does not fit a 256 MB Raspberry
   Pi 1. Quantised geometry in memory, cluster level of detail and

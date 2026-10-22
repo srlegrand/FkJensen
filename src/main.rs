@@ -406,7 +406,7 @@ impl App {
             self.settings.backdrop.contrast
         );
         format!(
-            "FkJensen  {}  {:.0} fps  {}x{} ({:.0}% of the window)  {light}  {sky}  {}  shaded {} of {} points  shadows {} ({:.0} ms)  bounce {}  {}  setup {:.0} raster {:.0} shade {:.0} resolve {:.0} ms  CPU only",
+            "FkJensen  {}  {:.0} fps  {}x{} ({:.0}% of the window)  {light}  {sky}  {}  shaded {} of {} points{}  cache {} of {} MB  shadows {} ({:.0} ms)  bounce {}  {}  setup {:.0} raster {:.0} shade {:.0} resolve {:.0} ms  CPU only",
             self.scene_name,
             self.title_fps,
             self.frame.width,
@@ -415,6 +415,9 @@ impl App {
             if s.visibility_kept { "visibility kept" } else { "visibility new" },
             s.points_shaded,
             s.points_used,
+            if s.rate_scale > 1.0 { format!(" ({:.0} px apart to fit memory)", raster::SHADING_RATE_PX * s.rate_scale) } else { String::new() },
+            s.cache_bytes >> 20,
+            self.settings.cache_budget >> 20,
             if self.settings.shadows { "on" } else { "off" },
             s.shadow_ms,
             if !self.settings.bounce { "off".to_string() } else if s.receivers_pending > 0 { format!("{} receivers to go", s.receivers_pending) } else { "done".to_string() },
@@ -1088,6 +1091,7 @@ fn main() {
         app.render_scale = p.render_scale;
         app.pixel_budget = Some(p.pixel_budget);
         app.scene.textures.set_budget(p.texture_cache);
+        app.settings.cache_budget = p.shade_cache;
     }
     if let Some(v) = shadows {
         app.settings.shadows = v;
@@ -1146,7 +1150,7 @@ fn main() {
         app.render();
         let s = app.frame.stats;
         eprintln!(
-            "rendered {}x{} in {:.1} ms on {} threads: texture tiles {} reads, {:.1} MB read, {:.1} MB held; shadows {:.1} ms ({} maps, {} triangles), bounce: {} surfels lit in {:.1} ms, {} receivers gathered in {:.1} ms; setup {:.1}, bin {:.1}, raster {:.1}, shade {:.1}, resolve {:.1} ms; {} of {} clusters, {} of {} triangles; {} shading points, {} light evaluations of {} without reach; cache {:.0} MB",
+            "rendered {}x{} in {:.1} ms on {} threads: texture tiles {} reads, {:.1} MB read, {:.1} MB held; shadows {:.1} ms ({} maps, {} triangles), bounce: {} surfels lit in {:.1} ms, {} receivers gathered in {:.1} ms; setup {:.1}, bin {:.1}, raster {:.1}, shade {:.1}, resolve {:.1} ms; {} of {} clusters, {} of {} triangles; {} shading points, {} light evaluations of {} without reach; cache {:.0} MB of {:.0}{}",
             size.0,
             size.1,
             t.elapsed().as_secs_f32() * 1000.0,
@@ -1173,7 +1177,9 @@ fn main() {
             s.points_shaded,
             s.light_evals,
             s.light_evals_all,
-            app.renderer.memory() as f64 / 1e6
+            app.renderer.memory() as f64 / 1e6,
+            app.settings.cache_budget as f64 / 1e6,
+            if s.rate_scale > 1.0 { format!(", micropolygons {:.0} px apart to fit it", raster::SHADING_RATE_PX * s.rate_scale) } else { String::new() }
         );
         if let Err(e) = save_png(&app.frame, &out) {
             eprintln!("cannot write {out}: {e}");
