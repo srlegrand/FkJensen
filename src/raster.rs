@@ -95,6 +95,10 @@ pub struct Stats {
     pub cache_bytes: usize,
     pub clusters_evicted: usize,
     pub rate_scale: f32,
+    /// Occlusion culling: clusters drawn first (those seen last frame),
+    /// clusters then found hidden behind them and skipped.
+    pub clusters_first: usize,
+    pub clusters_occluded: usize,
 }
 
 /// A triangle after projection: screen positions, 1/w, and each corner's
@@ -292,6 +296,9 @@ pub struct RenderSettings {
     pub cache_budget: usize,
     /// Micropolygon spacing on screen, pixels.
     pub shading_rate_px: f32,
+    /// Skip clusters hidden behind what was seen last frame. Off only to
+    /// compare.
+    pub occlusion: bool,
 }
 
 /// Shading cache budget when the machine's plan does not set one.
@@ -305,7 +312,7 @@ impl RenderSettings {
     }
 
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX }
+        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true }
     }
 }
 
@@ -528,6 +535,11 @@ pub fn dice_level_at(edge_px: f32, rate: f32) -> u8 {
     ((edge_px / rate).log2().ceil() as i32).clamp(0, MAX_DICE_LEVEL as i32) as u8
 }
 
+/// Pixels per side of a block of the hierarchical depth buffer. 4 culls
+/// twice what 8 does in the close view of the built-in set (a block holds
+/// its farthest depth, so a block on an outline holds the background).
+pub const HIZ_BLOCK: usize = 4;
+
 /// Work out what each pixel sees. Fills `frame.depth`, `frame.tri_id` and
 /// `frame.setups`, and returns each cluster's dicing level (`NOT_VISIBLE`
 /// for clusters culled whole).
@@ -535,36 +547,157 @@ pub fn dice_level_at(edge_px: f32, rate: f32) -> u8 {
 /// Of clusters with levels of detail, only those whose error looks no
 /// bigger than `lod_px` pixels and whose replacement's does are drawn
 /// (`Cluster::lod_drawn`).
-pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile: usize, lod_px: f32, frame: &mut Frame) -> Vec<u8> {
+///
+/// Occlusion culling in two passes (as Nanite does): the clusters that
+/// owned a pixel last frame (`prev`, one entry per cluster, non-zero when
+/// seen) are drawn first; the farthest depth of each
+/// 8 x 8 block of what they cover is kept; every other cluster whose
+/// bounding sphere is behind that depth in all the blocks it covers is
+/// skipped. Whatever the first pass misses, the second draws, so nothing
+/// is ever wrongly hidden; a camera that moves only makes the first pass
+/// less useful. Without `prev` (the first frame) everything is drawn in
+/// one pass.
+#[allow(clippy::too_many_arguments)]
+pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile: usize, lod_px: f32, prev: Option<&[u128]>, frame: &mut Frame) -> Vec<u8> {
     // The last frame's setup records go before the new ones are made: with
     // the high-resolution T-rex they are about 1 GB.
     frame.setups = Vec::new();
     let tile = tile.max(8);
-    let width = frame.width;
-    let height = frame.height;
+    let (width, height) = (frame.width, frame.height);
     let vp = cam.proj * cam.view;
     let t0 = std::time::Instant::now();
-
-    // Pass 1: cull clusters, then project each survivor's vertices into a
-    // local array and set up its triangles.
     let near = cam.near;
     let planes = frustum_planes(vp, near);
     let eye = cam.eye;
     let lod_scale = crate::scene::perspective_scale(eye, cam.proj.y_axis.y * height as f32 * 0.5, near);
-    let parts: Vec<(Vec<TriSetup>, Vec<(u32, u8)>)> = scene
-        .clusters
+
+    // Clusters that can be seen at all: the level of detail for this view,
+    // in the frustum, not all turned away.
+    let candidates: Vec<u32> = (0..scene.clusters.len() as u32)
+        .into_par_iter()
+        .filter(|&i| {
+            let c = &scene.clusters[i as usize];
+            c.lod_drawn(lod_px, &lod_scale) && !cluster_hidden(c, &planes, eye, cull)
+        })
+        .collect();
+    let prev = prev.filter(|p| p.len() == scene.clusters.len());
+    let (first, second): (Vec<u32>, Vec<u32>) = match prev {
+        Some(p) => candidates.iter().partition(|&&i| p[i as usize] != 0),
+        None => (candidates, Vec::new()),
+    };
+    let mut level = vec![NOT_VISIBLE; scene.clusters.len()];
+    frame.depth.iter_mut().for_each(|d| *d = 0.0);
+    frame.tri_id.iter_mut().for_each(|t| *t = NO_TRI);
+    let mut setups: Vec<TriSetup> = Vec::new();
+    let mut times = [0f32; 3];
+
+    let first_n = first.len();
+    draw_clusters(scene, &first, vp, near, cull, wireframe, tile, frame, &mut setups, &mut level, &mut times);
+    let mut occluded = 0;
+    if !second.is_empty() {
+        let th = std::time::Instant::now();
+        let hiz = hiz_blocks(&frame.depth, width, height);
+        let bw = width.div_ceil(HIZ_BLOCK);
+        let visible: Vec<u32> = second.par_iter().copied().filter(|&i| !sphere_hidden(&scene.clusters[i as usize], vp, near, width, height, &hiz, bw)).collect();
+        occluded = second.len() - visible.len();
+        times[0] += th.elapsed().as_secs_f32() * 1000.0;
+        draw_clusters(scene, &visible, vp, near, cull, wireframe, tile, frame, &mut setups, &mut level, &mut times);
+    }
+
+    frame.stats.clusters_in = scene.clusters.len();
+    frame.stats.clusters_drawn = level.iter().filter(|l| **l != NOT_VISIBLE).count();
+    frame.stats.clusters_first = first_n;
+    frame.stats.clusters_occluded = occluded;
+    frame.stats.tris_in = scene.triangle_count();
+    frame.stats.tris_drawn = setups.len();
+    frame.stats.setup_ms = times[0] + (t0.elapsed().as_secs_f32() * 1000.0 - times.iter().sum::<f32>()).max(0.0);
+    frame.stats.bin_ms = times[1];
+    frame.stats.raster_ms = times[2];
+    frame.setups = setups;
+    level
+}
+
+/// The farthest depth (smallest 1/w) of each `HIZ_BLOCK` square of the
+/// frame, 0 where any pixel is empty.
+pub fn hiz_blocks(depth: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let bw = width.div_ceil(HIZ_BLOCK);
+    let bh = height.div_ceil(HIZ_BLOCK);
+    (0..bw * bh)
+        .into_par_iter()
+        .map(|b| {
+            let (bx, by) = (b % bw, b / bw);
+            let (x0, y0) = (bx * HIZ_BLOCK, by * HIZ_BLOCK);
+            let (x1, y1) = ((x0 + HIZ_BLOCK).min(width), (y0 + HIZ_BLOCK).min(height));
+            let mut far = f32::INFINITY;
+            for y in y0..y1 {
+                for &d in &depth[y * width + x0..y * width + x1] {
+                    far = far.min(d);
+                }
+            }
+            far
+        })
+        .collect()
+}
+
+/// Whether a cluster's bounding sphere is behind what is drawn in every
+/// block it covers on screen. A sphere reaching the near plane is never
+/// hidden.
+fn sphere_hidden(c: &Cluster, vp: Mat4, near: f32, width: usize, height: usize, hiz: &[f32], bw: usize) -> bool {
+    // The box round the sphere, projected: its corners bound the sphere on
+    // screen.
+    let r = c.radius;
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for k in 0..8 {
+        let corner = c.centre + Vec3::new(if k & 1 == 0 { -r } else { r }, if k & 2 == 0 { -r } else { r }, if k & 4 == 0 { -r } else { r });
+        let q = vp * corner.extend(1.0);
+        if q.w <= near {
+            return false;
+        }
+        let (sx, sy) = ((q.x / q.w * 0.5 + 0.5) * width as f32, (0.5 - q.y / q.w * 0.5) * height as f32);
+        x0 = x0.min(sx);
+        y0 = y0.min(sy);
+        x1 = x1.max(sx);
+        y1 = y1.max(sy);
+    }
+    // The sphere's nearest point, as 1/w (the depth buffer's measure);
+    // w along the view grows one for one with distance.
+    let w_centre = (vp * c.centre.extend(1.0)).w;
+    let nearest = 1.0 / (w_centre - r).max(near);
+    let bh = hiz.len() / bw.max(1);
+    let clamp = |v: f32, n: usize| (v.max(0.0) as usize / HIZ_BLOCK).min(n.saturating_sub(1));
+    if x1 < 0.0 || y1 < 0.0 || x0 >= width as f32 || y0 >= height as f32 {
+        return true;
+    }
+    let (bx0, bx1, by0, by1) = (clamp(x0, bw), clamp(x1, bw), clamp(y0, bh), clamp(y1, bh));
+    for by in by0..=by1 {
+        for bx in bx0..=bx1 {
+            if hiz[by * bw + bx] <= nearest {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Set up, bin and rasterise clusters `list` into the frame's depth and
+/// triangle ids (keeping what is there), adding their records to `setups`
+/// and their dicing levels to `level`. `times` gains setup, bin and raster
+/// milliseconds.
+#[allow(clippy::too_many_arguments)]
+fn draw_clusters(scene: &Scene, list: &[u32], vp: Mat4, near: f32, cull: bool, wireframe: bool, tile: usize, frame: &mut Frame, setups: &mut Vec<TriSetup>, level: &mut [u8], times: &mut [f32; 3]) {
+    let (width, height) = (frame.width, frame.height);
+    let t0 = std::time::Instant::now();
+    // Project each cluster's vertices into a local array and set up its
+    // triangles.
+    let parts: Vec<(Vec<TriSetup>, Vec<(u32, u8)>)> = list
         .par_chunks(64)
-        .enumerate()
-        .map(|(ci, chunk)| {
+        .map(|chunk| {
             let mut out: Vec<TriSetup> = Vec::new();
             let mut levels: Vec<(u32, u8)> = Vec::new();
             let mut clipped: Vec<[ClipVert; 3]> = Vec::new();
             let mut clip = [Vec4::ZERO; crate::scene::CLUSTER_VERTS];
-            for (k, c) in chunk.iter().enumerate() {
-                let cluster = (ci * 64 + k) as u32;
-                if !c.lod_drawn(lod_px, &lod_scale) || cluster_hidden(c, &planes, eye, cull) {
-                    continue;
-                }
+            for &cluster in chunk {
+                let c = &scene.clusters[cluster as usize];
                 let fv = c.first_vertex as usize;
                 for (k, p) in scene.positions[fv..fv + c.vertex_count as usize].iter().enumerate() {
                     clip[k] = vp * p.extend(1.0);
@@ -617,36 +750,32 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile
             (out, levels)
         })
         .collect();
-    let mut level = vec![NOT_VISIBLE; scene.clusters.len()];
-    let mut setups: Vec<TriSetup> = Vec::with_capacity(parts.iter().map(|p| p.0.len()).sum());
+    let base = setups.len();
+    setups.reserve(parts.iter().map(|p| p.0.len()).sum());
     for (s, l) in parts {
         setups.extend(s);
         for (c, lv) in l {
             level[c as usize] = lv;
         }
     }
-    let clusters_drawn = level.iter().filter(|l| **l != NOT_VISIBLE).count();
+    let new = &setups[base..];
     let t1 = std::time::Instant::now();
 
-    // Pass 2: bin into buckets. Each chunk of records writes its own per-
-    // bucket lists; the lists are then joined per bucket.
+    // Bin into buckets. Each chunk of records writes its own per-bucket
+    // lists; the lists are then joined per bucket.
     let tiles_x = width.div_ceil(tile);
     let tiles_y = height.div_ceil(tile);
     let n_tiles = tiles_x * tiles_y;
-    let chunk_lists: Vec<Vec<Vec<u32>>> = setups
+    let chunk_lists: Vec<Vec<Vec<u32>>> = new
         .par_chunks(8192)
         .enumerate()
         .map(|(ci, chunk)| {
             let mut lists: Vec<Vec<u32>> = vec![Vec::new(); n_tiles];
-            let base = (ci * 8192) as u32;
+            let first = (base + ci * 8192) as u32;
             for (k, s) in chunk.iter().enumerate() {
-                let id = base + k as u32;
-                let tx0 = s.min_x as usize / tile;
-                let tx1 = s.max_x as usize / tile;
-                let ty0 = s.min_y as usize / tile;
-                let ty1 = s.max_y as usize / tile;
-                for ty in ty0..=ty1 {
-                    for tx in tx0..=tx1 {
+                let id = first + k as u32;
+                for ty in s.min_y as usize / tile..=s.max_y as usize / tile {
+                    for tx in s.min_x as usize / tile..=s.max_x as usize / tile {
                         lists[ty * tiles_x + tx].push(id);
                     }
                 }
@@ -666,35 +795,36 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile
         .collect();
     let t2 = std::time::Instant::now();
 
-    // Pass 3: hide. Each bucket is rasterised into a scratch of its own,
-    // then copied out, so the buffers are written without sharing.
-    let tile_results: Vec<(Vec<f32>, Vec<u32>)> = (0..n_tiles)
+    // Hide. Each bucket is rasterised into a scratch of its own, starting
+    // from what the frame holds, then copied back, so the buffers are
+    // written without sharing.
+    let all: &[TriSetup] = setups;
+    let (fdepth, fid) = (&frame.depth, &frame.tri_id);
+    let tile_results: Vec<Option<(Vec<f32>, Vec<u32>)>> = (0..n_tiles)
         .into_par_iter()
         .map(|t| {
-            let tx = t % tiles_x;
-            let ty = t / tiles_x;
-            let x0 = tx * tile;
-            let y0 = ty * tile;
-            let x1 = (x0 + tile).min(width);
-            let y1 = (y0 + tile).min(height);
-            let tw = x1 - x0;
-            let th = y1 - y0;
-            let mut depth = vec![0f32; tw * th];
-            let mut id = vec![NO_TRI; tw * th];
-            for &sid in &tile_lists[t] {
-                let s = &setups[sid as usize];
-                raster_tri(s, sid, x0, y0, x1, y1, tw, &mut depth, &mut id, wireframe);
+            if tile_lists[t].is_empty() {
+                return None;
             }
-            (depth, id)
+            let (x0, y0) = ((t % tiles_x) * tile, (t / tiles_x) * tile);
+            let (x1, y1) = ((x0 + tile).min(width), (y0 + tile).min(height));
+            let (tw, th) = (x1 - x0, y1 - y0);
+            let mut depth = Vec::with_capacity(tw * th);
+            let mut id = Vec::with_capacity(tw * th);
+            for y in y0..y1 {
+                depth.extend_from_slice(&fdepth[y * width + x0..y * width + x1]);
+                id.extend_from_slice(&fid[y * width + x0..y * width + x1]);
+            }
+            for &sid in &tile_lists[t] {
+                raster_tri(&all[sid as usize], sid, x0, y0, x1, y1, tw, &mut depth, &mut id, wireframe);
+            }
+            Some((depth, id))
         })
         .collect();
-    for (t, (depth, id)) in tile_results.iter().enumerate() {
-        let tx = t % tiles_x;
-        let ty = t / tiles_x;
-        let x0 = tx * tile;
-        let y0 = ty * tile;
-        let x1 = (x0 + tile).min(width);
-        let y1 = (y0 + tile).min(height);
+    for (t, r) in tile_results.into_iter().enumerate() {
+        let Some((depth, id)) = r else { continue };
+        let (x0, y0) = ((t % tiles_x) * tile, (t / tiles_x) * tile);
+        let (x1, y1) = ((x0 + tile).min(width), (y0 + tile).min(height));
         let tw = x1 - x0;
         for (row, y) in (y0..y1).enumerate() {
             let dst = y * width + x0;
@@ -703,16 +833,9 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile
         }
     }
     let t3 = std::time::Instant::now();
-
-    frame.stats.clusters_in = scene.clusters.len();
-    frame.stats.clusters_drawn = clusters_drawn;
-    frame.stats.tris_in = scene.triangle_count();
-    frame.stats.tris_drawn = setups.len();
-    frame.stats.setup_ms = (t1 - t0).as_secs_f32() * 1000.0;
-    frame.stats.bin_ms = (t2 - t1).as_secs_f32() * 1000.0;
-    frame.stats.raster_ms = (t3 - t2).as_secs_f32() * 1000.0;
-    frame.setups = setups;
-    level
+    times[0] += (t1 - t0).as_secs_f32() * 1000.0;
+    times[1] += (t2 - t1).as_secs_f32() * 1000.0;
+    times[2] += (t3 - t2).as_secs_f32() * 1000.0;
 }
 
 /// The direction of the view ray through pixel (x, y), for the sky behind

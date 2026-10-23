@@ -374,6 +374,9 @@ impl Editor {
             ui.label("Light reach");
             ui.checkbox(&mut self.app.settings.light_reach, "");
             ui.end_row();
+            ui.label("Occlusion culling");
+            ui.checkbox(&mut self.app.settings.occlusion, "");
+            ui.end_row();
             ui.label("Back-face culling");
             ui.checkbox(&mut self.app.settings.cull_backfaces, "");
             ui.end_row();
@@ -423,6 +426,9 @@ impl Editor {
                 row("Frame rate", format!("{:.1} fps", self.app.title_fps));
                 row("Triangles", format!("{} of {}", thousands(s.tris_drawn), thousands(s.tris_in)));
                 row("Clusters", format!("{} of {}", thousands(s.clusters_drawn), thousands(s.clusters_in)));
+                if s.clusters_occluded > 0 {
+                    row("Hidden, skipped", thousands(s.clusters_occluded));
+                }
                 row("Points shaded", format!("{} of {}", thousands(s.points_shaded as usize), thousands(s.points_used as usize)));
                 row("Shading cache", format!("{} of {} MB", s.cache_bytes >> 20, self.app.settings.cache_budget >> 20));
                 row("Shadows", format!("{:.0} ms", s.shadow_ms));

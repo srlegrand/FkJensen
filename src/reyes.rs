@@ -282,6 +282,7 @@ impl ClusterShade {
 
 #[derive(PartialEq, Clone, Copy)]
 struct VisKey {
+    occlusion: bool,
     tile: usize,
     view: Mat4,
     proj: Mat4,
@@ -584,7 +585,7 @@ impl Renderer {
         frame.stats.bounce_ms = tb.elapsed().as_secs_f32() * 1000.0;
 
         // Visibility, unless the camera and the frame are as they were.
-        let vk = VisKey { tile: settings.tile, view: cam.view, proj: cam.proj, size: (frame.width, frame.height), cull: settings.cull_backfaces, wireframe: settings.wireframe, lod_px: settings.lod_px().to_bits() };
+        let vk = VisKey { occlusion: settings.occlusion, tile: settings.tile, view: cam.view, proj: cam.proj, size: (frame.width, frame.height), cull: settings.cull_backfaces, wireframe: settings.wireframe, lod_px: settings.lod_px().to_bits() };
         if self.vis_key == Some(vk) && frame.vis_stamp == self.vis_stamp && self.vis_stamp != 0 {
             frame.stats.visibility_kept = true;
             frame.stats.clusters_in = scene.clusters.len();
@@ -593,7 +594,10 @@ impl Renderer {
             frame.stats.tris_drawn = frame.setups.len();
         } else {
             full_resolve = true;
-            self.levels = raster::visibility(scene, cam, settings.cull_backfaces, settings.wireframe, settings.tile, settings.lod_px(), frame);
+            // What owned a pixel last frame is drawn first, to hide the rest
+            // behind.
+            let prev = (settings.occlusion && self.need.len() == scene.clusters.len()).then_some(&self.need[..]);
+            self.levels = raster::visibility(scene, cam, settings.cull_backfaces, settings.wireframe, settings.tile, settings.lod_px(), prev, frame);
             self.vis_key = Some(vk);
             self.vis_stamp = NEXT_STAMP.fetch_add(1, Ordering::Relaxed);
             frame.vis_stamp = self.vis_stamp;
@@ -1430,6 +1434,44 @@ mod tests {
     fn cam_at(eye_yaw: f32, w: usize, h: usize, target: Vec3, dist: f32, pitch: f32) -> Camera {
         let c = crate::camera::OrbitCamera { target, distance: dist, yaw: eye_yaw, pitch, fov_y: 45f32.to_radians(), scene_radius: 1.0 };
         Camera { view: c.view(), proj: c.proj(w as f32 / h as f32), eye: c.eye(), near: c.near() }
+    }
+
+    /// Behind a wall, a grid of small boxes: once the wall has been seen,
+    /// the boxes are skipped without being set up, and the picture and the
+    /// pixels' triangles are those of a frame drawn without skipping.
+    #[test]
+    fn what_is_behind_what_was_seen_is_skipped() {
+        let mut scene = Scene::new();
+        let quad = |c: Vec3, hx: f32, hy: f32| [c + Vec3::new(-hx, -hy, 0.0), c + Vec3::new(hx, -hy, 0.0), c + Vec3::new(hx, hy, 0.0), c + Vec3::new(-hx, hy, 0.0)];
+        // The wall, facing +z, in small quads so it is many clusters.
+        for i in 0..8 {
+            for j in 0..8 {
+                scene.push_mesh(&quad(Vec3::new(-3.5 + i as f32, 0.5 + j as f32 * 0.5, 0.0), 0.5, 0.25), &[], &[], &[0, 1, 2, 0, 2, 3]);
+            }
+        }
+        let behind = scene.clusters.len();
+        for i in 0..10 {
+            for j in 0..4 {
+                scene.push_mesh(&quad(Vec3::new(-2.0 + i as f32 * 0.4, 1.0 + j as f32 * 0.5, -2.0), 0.1, 0.1), &[], &[], &[0, 1, 2, 0, 2, 3]);
+            }
+        }
+        let (w, h) = (160, 90);
+        let settings = RenderSettings { bounce: false, ..RenderSettings::new(Sky::new(30.0, true)) };
+        let cam = |yaw: f32| cam_at(yaw, w, h, Vec3::new(0.0, 2.0, 0.0), 6.0, 0.0);
+        let lights = [PointLight { position: Vec3::new(0.0, 3.0, 3.0), color: Vec3::ONE, lumens: 800.0 }];
+        let mut r = Renderer::new();
+        let mut frame = Frame::new(w, h);
+        r.render(&scene, &cam(0.0), &lights, &settings, &mut frame);
+        assert_eq!(frame.stats.clusters_occluded, 0, "the first frame draws everything");
+        r.render(&scene, &cam(0.01), &lights, &settings, &mut frame);
+        assert!(frame.stats.clusters_occluded >= scene.clusters.len() - behind - 4, "{} skipped", frame.stats.clusters_occluded);
+        let mut fresh = Frame::new(w, h);
+        render(&scene, &cam(0.01), &lights, &settings, &mut fresh);
+        assert!(worst(&frame, &fresh) <= 2, "{}", worst(&frame, &fresh));
+        let cluster_of = |f: &Frame, i: usize| (f.tri_id[i] != NO_TRI).then(|| f.setups[f.tri_id[i] as usize].cluster);
+        for i in 0..w * h {
+            assert_eq!(cluster_of(&frame, i), cluster_of(&fresh, i));
+        }
     }
 
     fn world() -> (Scene, Vec<PointLight>) {

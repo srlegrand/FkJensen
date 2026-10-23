@@ -16,6 +16,7 @@
 //!   fkjensen --exposure E              display value per cd/m²
 //!   fkjensen --view lights             show how many lights each pixel evaluates
 //!   fkjensen --no-reach                evaluate every light everywhere (to compare)
+//!   fkjensen --no-occlusion            draw what is hidden behind what was seen (to compare)
 //!   fkjensen --close                   start on the close framing of the subject
 //!   fkjensen --look ex,ey,ez,tx,ty,tz  camera at e looking at t, in metres
 //!   fkjensen --no-shadows              point lights without shadow maps
@@ -28,6 +29,7 @@
 //!   fkjensen --no-highres              the low-resolution T-rex (28 K triangles, not 10.8 M)
 //!   fkjensen --shadow-res N            shadow map texels per cube face edge (512)
 //!   fkjensen --png out.png --bench-drag  then move the first light five times, timing each frame
+//!   fkjensen --png out.png --bench-orbit then turn the camera five times, timing each frame
 //!   fkjensen --editor [scene.fkj]      the editor: outliner, attribute editor, timeline, importer (64-bit)
 //!   fkjensen --editor --png out.png [--import model.glb]  the editor drawn to a file
 //!
@@ -1182,6 +1184,7 @@ fn main() {
     let mut exposure: Option<f32> = None;
     let mut view = View::Shaded;
     let mut reach = true;
+    let mut occlusion = true;
     let mut close = false;
     let mut shadows: Option<bool> = None;
     let mut bounce: Option<bool> = None;
@@ -1190,6 +1193,7 @@ fn main() {
     let mut scale: Option<f32> = None;
     let mut shading_rate: Option<f32> = None;
     let mut bench_drag = false;
+    let mut bench_orbit = false;
     let mut use_fb = false;
     let mut look: Option<(Vec3, Vec3)> = None;
     let mut highres: Option<bool> = None;
@@ -1257,6 +1261,7 @@ fn main() {
                 i += 1;
             }
             "--no-reach" => reach = false,
+            "--no-occlusion" => occlusion = false,
             "--close" => close = true,
             "--no-shadows" => shadows = Some(false),
             "--shadows" => shadows = Some(true),
@@ -1281,6 +1286,7 @@ fn main() {
                 i += 1;
             }
             "--bench-drag" => bench_drag = true,
+            "--bench-orbit" => bench_orbit = true,
             "--editor" => editor = true,
             "--import" => {
                 i += 1;
@@ -1321,7 +1327,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1403,6 +1409,7 @@ fn main() {
         app.cam.look_from(eye, target);
     }
     app.settings.light_reach = reach;
+    app.settings.occlusion = occlusion;
     if let Some(p) = &plan {
         app.settings.shadows = p.shadows;
         app.settings.shadow_res = p.shadow_res;
@@ -1597,6 +1604,37 @@ fn main() {
             let drag_out = out.replace(".png", "_dragged.png");
             if save_png(&app.frame, &drag_out).is_ok() {
                 eprintln!("wrote {drag_out}");
+            }
+        }
+        if bench_orbit {
+            // Turn the camera round its target a degree at a time, as a
+            // tumble would: visibility is made again each frame, with the
+            // last frame's to start from.
+            app.settings.bounce_budget_ms = Some(30.0);
+            for step in 1..=5 {
+                app.cam.orbit(2.2, 0.0);
+                let t = Instant::now();
+                app.render();
+                let s = app.frame.stats;
+                eprintln!(
+                    "orbit step {step}: {:.1} ms: setup {:.1} bin {:.1} raster {:.1} ms, {} triangles in {} clusters ({} drawn first, {} hidden behind them), shade {:.1} ms ({} points), gather {:.1} ms, resolve {:.1} ms",
+                    t.elapsed().as_secs_f32() * 1000.0,
+                    s.setup_ms,
+                    s.bin_ms,
+                    s.raster_ms,
+                    s.tris_drawn,
+                    s.clusters_drawn,
+                    s.clusters_first,
+                    s.clusters_occluded,
+                    s.shade_ms,
+                    s.points_shaded,
+                    s.gather_ms,
+                    s.resolve_ms
+                );
+            }
+            let orbit_out = out.replace(".png", "_orbited.png");
+            if save_png(&app.frame, &orbit_out).is_ok() {
+                eprintln!("wrote {orbit_out}");
             }
         }
         return;

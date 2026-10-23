@@ -578,7 +578,13 @@ Painting the interface took about 7 ms a frame at 1920 x 1080 on the same
    no bigger than the micropolygon spacing from the eye, so geometry follows
    the machine's plan as shading does. Shadow maps pick their level the
    same way, by texels as seen from the light or the sun; the surfel cloud
-   uses the level whose error is under 2 cm.
+   uses the level whose error is under 2 cm. Occlusion culling, in two
+   passes as Nanite does it: the clusters that owned a pixel last frame
+   are drawn first; the farthest depth of each 4 x 4 block of what they
+   cover is kept; every other cluster whose bounding sphere is behind it
+   in every block it covers is skipped before its triangles are set up,
+   and the rest are drawn. What the first pass misses the second draws,
+   so nothing is wrongly hidden; the first frame draws everything.
 4. **Shading** (`src/reyes.rs`). Each triangle is diced from its own size
    on screen, whatever the mesh's topology: a grid laid on it as seen,
    rows along its longest edge and rows up to the opposite corner, 2^level
@@ -628,7 +634,25 @@ three runs, 23/10/2026:
 | dragging the key light, a frame | 1,306 ms | 437 ms |
 | shading in it | 1,112 ms | 266 ms |
 
-Most of the gain is the shadow map lookups (a 3 x 3 filter per light per
+Occlusion culling (`--no-occlusion` turns it off to compare), turning the
+camera a degree a frame (`--bench-orbit`), high-resolution T-rex, median
+of fifteen frames:
+
+| | off | on |
+|---|---|---|
+| wide view: triangles set up | 720,605 | 681,143 (2,613 clusters skipped) |
+| visibility, a frame | 134 ms | 125 ms |
+| close view: triangles set up | 706,274 | 660,035 (3,198 clusters skipped) |
+| visibility, a frame | 130 ms | 125 ms |
+
+Little is hidden in this set: a T-rex and a car on open ground. Of about
+19,700 clusters the second pass draws, about 870 end up owning a pixel;
+about 10,000 of the rest are under a pixel across, levels of detail that
+stopped simplifying (the T-rex's coarsest cut is about 230 K triangles),
+and they are in front of what is behind them, so no depth test can skip
+them. Shading was already only for triangles that own a pixel.
+
+Most of the gain of the eight-wide work is the shadow map lookups (a 3 x 3 filter per light per
 point), which were 85% of shading; then the highlight's x^48 by squaring
 instead of `powf`, and building for the machine. The picture is the same:
 24 of 518,400 pixels differ, by 1 of 255. The first frame is still mostly
@@ -740,6 +764,10 @@ Not measured yet: a Raspberry Pi.
   not. The texel loads of a shadow lookup are one lane at a time. On the
   Raspberry Pi 1 (no NEON) the eight lanes are plain arrays.
 - Vertex splatting.
+- Occlusion culling tests bounding spheres against the farthest depth of
+  4 x 4 blocks, so a block on an outline (the T-rex against the sky)
+  hides nothing behind it; masked occlusion culling keeps two depths a
+  block for that. Clusters under a pixel are drawn however many there are.
 - Levels of detail: every level is loaded, so a small machine cannot yet
   leave the finest in the file; seams and separate parts never move when
   simplifying, so a model of many parts (the car) gains one level at
