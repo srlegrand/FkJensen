@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 23/10/2026: the light changed last keeps its own share of the shading cache, so dragging it redoes one light's share a point, not every light; grids are not checked again while the camera is still. A drag frame with the high-resolution T-rex went from 437 ms to 298 ms on 2 cores.
 - 23/10/2026: occlusion culling in two passes: what owned a pixel last frame is drawn first, and clusters behind it in a 4 x 4 block depth buffer are skipped before set-up. 5 to 7% fewer triangles in the built-in set, which hides little.
 - 23/10/2026: eight-wide SIMD in shading, shadow map lookups and fills, and the bounce raster; each machine builds for its own processor. Dragging a light on the built-in set went from 1.31 s to 0.44 s a frame with the high-resolution T-rex on 2 cores.
 - 23/10/2026: objects rotate about any axis: three rings in the rotate manipulator, Rotate X Y Z in the attribute editor (Maya's xyz order), `OBJS` version 2. A rotation never mirrors, so texture tiles stay valid.

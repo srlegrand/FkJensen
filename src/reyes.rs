@@ -207,6 +207,20 @@ struct ClusterShade {
     vspec_done: u128,
     vback: u128,
     spec_eye: Vec3,
+    /// Each point light's share of the kept shading, so a light that
+    /// changes has only its own share redone: the lights with a share
+    /// (`slots`, the hot light), and per slot, per grid point and per
+    /// vertex, its diffuse and highlight.
+    slots: Vec<u8>,
+    gshare: Vec<Vec<[Vec3; 2]>>,
+    vshare: Vec<Vec<[Vec3; 2]>>,
+    /// Lights changed since this cluster's shading was kept, one bit each.
+    light_todo: u64,
+    /// The view, rate and triangles needed when its grids were last
+    /// checked, and what that found (vertices and grids needed, points
+    /// used): while the camera holds still the check is not done again.
+    diced_for: Option<(Mat4, f32, u128)>,
+    diced: (u128, u128, u64),
     /// The frame in which anything here was last shaded.
     stamp: u64,
     /// The frame in which it was last on screen.
@@ -225,7 +239,33 @@ impl ClusterShade {
 
     /// Bytes held.
     fn bytes(&self) -> usize {
-        (self.diffuse.capacity() + self.spec.capacity() + self.vdiffuse.capacity() + self.vspec.capacity()) * 12 + self.state.capacity() + self.grids.capacity() * std::mem::size_of::<TriDice>()
+        (self.diffuse.capacity() + self.spec.capacity() + self.vdiffuse.capacity() + self.vspec.capacity()) * 12
+            + self.state.capacity()
+            + self.grids.capacity() * std::mem::size_of::<TriDice>()
+            + self.gshare.iter().chain(&self.vshare).map(|v| v.capacity() * 24).sum::<usize>()
+    }
+
+    /// Room for `pts` more grid points (and their shares); where they start.
+    fn grow(&mut self, pts: usize) -> u32 {
+        let at = self.diffuse.len();
+        self.diffuse.resize(at + pts, Vec3::ZERO);
+        self.spec.resize(at + pts, Vec3::ZERO);
+        for sh in &mut self.gshare {
+            sh.resize(at + pts, [Vec3::ZERO; 2]);
+        }
+        at as u32
+    }
+
+    /// The slot of light `l`'s share, made (all zero: it gave nothing) if
+    /// it has none.
+    fn slot_of(&mut self, l: usize) -> usize {
+        if let Some(k) = self.slots.iter().position(|&s| s as usize == l) {
+            return k;
+        }
+        self.slots.push(l as u8);
+        self.gshare.push(vec![[Vec3::ZERO; 2]; self.diffuse.len()]);
+        self.vshare.push(vec![[Vec3::ZERO; 2]; self.vdiffuse.len()]);
+        self.slots.len() - 1
     }
 
     /// Dicing level of triangle `u` (`NOT_VISIBLE`: not diced).
@@ -249,6 +289,11 @@ impl ClusterShade {
         self.state = vec![UNDICED; tris];
         self.vdiffuse = vec![Vec3::ZERO; verts];
         self.vspec = vec![Vec3::ZERO; verts];
+        self.slots = Vec::new();
+        self.gshare = Vec::new();
+        self.vshare = Vec::new();
+        self.light_todo = 0;
+        self.diced_for = None;
         self.forget_grids();
         self.vdone = 0;
         self.vspec_done = 0;
@@ -261,6 +306,11 @@ impl ClusterShade {
         self.spec_done = 0;
         self.vdone = 0;
         self.vspec_done = 0;
+        self.slots = Vec::new();
+        self.gshare = Vec::new();
+        self.vshare = Vec::new();
+        self.light_todo = 0;
+        self.diced_for = None;
     }
 
     /// Drops every grid and its memory, keeping the vertices.
@@ -273,7 +323,11 @@ impl ClusterShade {
         self.grids = Vec::new();
         self.diffuse = Vec::new();
         self.spec = Vec::new();
+        for sh in &mut self.gshare {
+            *sh = Vec::new();
+        }
         self.live = 0;
+        self.diced_for = None;
         self.done = 0;
         self.spec_done = 0;
         self.back = 0;
@@ -301,6 +355,10 @@ pub struct Renderer {
     shadows: Vec<Option<CubeShadow>>,
     prev_lights: Vec<PointLight>,
     prev_reach: Vec<f32>,
+    /// The light changed last (`HOT_LIGHTS` at most, most recent first):
+    /// only it keeps a share of its own in the shading cache, so memory
+    /// grows by one share a point.
+    hot: Vec<usize>,
     prev_global: Option<(Sky, raster::Sun, f32, bool, bool, bool, usize)>,
     /// The sun's shadow map, and what it was built for (direction, texels,
     /// scene).
@@ -390,6 +448,7 @@ impl Renderer {
             shadows: Vec::new(),
             prev_lights: Vec::new(),
             prev_reach: Vec::new(),
+            hot: Vec::new(),
             prev_global: None,
             sun_shadow: None,
             sun_key: None,
@@ -468,13 +527,16 @@ impl Renderer {
         // What changed since the last frame decides what is thrown away.
         let global = (settings.sky, settings.sun, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.bounce, settings.shadow_res);
         let global_changed = self.prev_global != Some(global) || self.prev_lights.len() != lights.len();
-        // Spheres (old and new position, with reach) of lights that changed.
+        // Spheres (old and new position, with reach) of lights that changed,
+        // and which light.
         let mut spheres: Vec<(Vec3, f32)> = Vec::new();
+        let mut changed_lights: Vec<usize> = Vec::new();
         if global_changed {
             full_resolve = true;
             for c in &mut self.cache {
                 c.forget_light();
             }
+            self.hot.clear();
             self.shadows = (0..lights.len()).map(|_| None).collect();
         } else {
             for (i, l) in lights.iter().enumerate() {
@@ -482,15 +544,23 @@ impl Renderer {
                 if old != l {
                     spheres.push((old.position, self.prev_reach[i]));
                     spheres.push((l.position, reach[i]));
+                    changed_lights.push(i);
+                    self.hot.retain(|&h| h != i);
+                    self.hot.insert(0, i);
+                    self.hot.truncate(HOT_LIGHTS);
                     if old.position != l.position || old.lumens != l.lumens {
                         self.shadows[i] = None;
                     }
                 }
             }
             if !spheres.is_empty() {
+                // Only the changed lights' shares are redone, where they
+                // reach or reached.
                 self.cache.par_iter_mut().zip(scene.clusters.par_iter()).for_each(|(e, c)| {
-                    if spheres.iter().any(|(p, r)| p.distance(c.centre) <= c.radius + r) {
-                        e.forget_light();
+                    for (k, &i) in changed_lights.iter().enumerate() {
+                        if spheres[2 * k..2 * k + 2].iter().any(|(p, r)| p.distance(c.centre) <= c.radius + r) {
+                            e.light_todo |= 1u64 << i;
+                        }
                     }
                 });
             }
@@ -623,6 +693,7 @@ impl Renderer {
         let eye = cam.eye;
         let need = &self.need;
         let ground = !settings.bounce;
+        let hot = &self.hot;
         let vp = cam.proj * cam.view;
         let (near, size) = (cam.near, (frame.width, frame.height));
         let rate = settings.shading_rate_px.max(0.25) * self.rate_scale;
@@ -653,7 +724,11 @@ impl Renderer {
                 // edge by edge, and its spacing on screen within a factor
                 // of two.
                 let (mut vneed, mut tneed, mut n_used) = (0u128, 0u128, 0u64);
-                let mut bits = need_tris;
+                let still = e.diced_for == Some((vp, rate, need_tris));
+                let mut bits = if still { 0 } else { need_tris };
+                if still {
+                    (vneed, tneed, n_used) = e.diced;
+                }
                 while bits != 0 {
                     let u = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
@@ -689,10 +764,8 @@ impl Renderer {
                         let pts = fresh.points();
                         let (mut offset, mut cap) = (e.grids[i].offset, e.grids[i].cap);
                         if (cap as usize) < pts {
-                            offset = e.diffuse.len() as u32;
+                            offset = e.grow(pts);
                             cap = pts as u32;
-                            e.diffuse.resize(e.diffuse.len() + pts, Vec3::ZERO);
-                            e.spec.resize(e.spec.len() + pts, Vec3::ZERO);
                         }
                         e.grids[i] = TriDice { offset, cap, ..fresh };
                         e.state[u] = i as u8;
@@ -709,120 +782,309 @@ impl Renderer {
                     tneed |= 1u128 << u;
                     n_used += e.grids[e.state[u] as usize].points() as u64;
                 }
-                n_used += vneed.count_ones() as u64;
+                if !still {
+                    n_used += vneed.count_ones() as u64;
+                    e.diced_for = Some((vp, rate, need_tris));
+                    e.diced = (vneed, tneed, n_used);
+                }
                 used.fetch_add(n_used, Ordering::Relaxed);
                 e.level = (0..e.state.len()).map(|u| e.tri_level(u)).filter(|l| *l != NOT_VISIBLE).max().unwrap_or(NOT_VISIBLE);
                 let vtodo = vneed & !(e.vdone & e.vspec_done);
                 let ttodo = tneed & !(e.done & e.spec_done);
-                if vtodo == 0 && ttodo == 0 {
+                // Lights changed since the rest was kept: only their shares
+                // are redone, on what is on screen; what is kept off screen
+                // is shaded in full when it comes back.
+                // Lights that reach this cluster.
+                let in_reach: Vec<usize> = (0..lights.len()).filter(|&i| lights[i].position.distance(c.centre) <= c.radius + reach[i]).collect();
+                let lchange = std::mem::take(&mut e.light_todo);
+                let (mut vlight, mut tlight) = (0u128, 0u128);
+                let (mut vtodo, mut ttodo) = (vtodo, ttodo);
+                if lchange != 0 {
+                    e.vdone &= vneed;
+                    e.vspec_done &= vneed;
+                    e.done &= tneed;
+                    e.spec_done &= tneed;
+                    // A changed light without a share of its own is in the
+                    // sum: redo what is on screen in full.
+                    let all_kept = (0..64).filter(|l| lchange & (1u64 << l) != 0).all(|l| e.slots.contains(&(l as u8)));
+                    if all_kept {
+                        vlight = vneed & !vtodo;
+                        tlight = tneed & !ttodo;
+                    } else {
+                        vtodo = vneed;
+                        ttodo = tneed;
+                    }
+                }
+                // A light that has just become hot gets a share of its own:
+                // what is kept has it in the sum, so what is on screen is
+                // redone in full, the rest when it is next on screen.
+                let new_slot = hot.iter().any(|&l| l < lights.len() && in_reach.contains(&l) && !e.slots.contains(&(l as u8)));
+                let mut all_diffuse = lchange != 0;
+                if new_slot && (e.done != 0 || e.vdone != 0) {
+                    e.vdone &= vneed;
+                    e.vspec_done &= vneed;
+                    e.done &= tneed;
+                    e.spec_done &= tneed;
+                    vtodo = vneed;
+                    ttodo = tneed;
+                    vlight = 0;
+                    tlight = 0;
+                    all_diffuse = true;
+                }
+                if vtodo == 0 && ttodo == 0 && vlight == 0 && tlight == 0 {
                     return;
                 }
                 clusters_shaded.fetch_add(1, Ordering::Relaxed);
                 e.stamp = frame_no;
-                // Lights that reach this cluster.
-                let in_reach: Vec<usize> = (0..lights.len()).filter(|&i| lights[i].position.distance(c.centre) <= c.radius + reach[i]).collect();
                 let (mut n_shaded, mut n_evals) = (0u64, 0u64);
 
-                // Every point to shade goes into one batch, shaded eight at
-                // a time, then back to its place.
-                let mut batch = Batch::default();
-                // Vertices, for triangles at level 0: (vertex, diffuse too).
-                let mut vdest: Vec<(usize, bool)> = Vec::new();
-                let mut bits = vtodo;
-                while bits != 0 {
-                    let u = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    let v = fv + u;
-                    let back = scene.normals[v].dot(eye - scene.positions[v]) < 0.0;
-                    let bit = 1u128 << u;
-                    let diffuse_too = e.vdone & bit == 0 || ((e.vback & bit != 0) != back);
-                    if back {
-                        e.vback |= bit;
-                    } else {
-                        e.vback &= !bit;
-                    }
-                    let side = if back { -1.0 } else { 1.0 };
-                    batch.push(scene.positions[v], scene.normals[v] * side, scene.colors[v]);
-                    vdest.push((u, diffuse_too));
-                }
-                e.vdone |= vtodo;
-                e.vspec_done |= vtodo;
-
-                // Grids, even on screen. Texture tiles at the finest level
-                // needed, read from the file if not in the cache; grids
-                // finer than the finest tile sample it.
+                // Texture tiles at the finest level needed, read from the
+                // file if not in the cache; grids finer than the finest tile
+                // sample it.
                 let finest = {
                     let mut l = 0;
-                    let mut bits = ttodo;
+                    let mut bits = ttodo | tlight;
                     while bits != 0 {
                         l = l.max(e.tri_level(bits.trailing_zeros() as usize));
                         bits &= bits - 1;
                     }
                     l
                 };
-                let tiles = if ttodo != 0 { scene.textures.block(ci, c.tri_count as usize, finest.min(crate::texture::MAX_LEVEL)) } else { None };
-                // Runs of grid points: (first in the cache, count, diffuse too).
-                let mut gdest: Vec<(usize, usize, bool)> = Vec::new();
-                let mut bits = ttodo;
-                while bits != 0 {
-                    let u = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    let d = e.grids[e.state[u] as usize];
-                    let t = (c.first_tri as usize + u) * 3;
-                    let (i0, i1, i2) = (scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize);
-                    let (p0, p1, p2) = (scene.positions[i0], scene.positions[i1], scene.positions[i2]);
-                    let fnrm = scene.normals[i0] + scene.normals[i1] + scene.normals[i2];
-                    let back = fnrm.dot(eye - (p0 + p1 + p2) / 3.0) < 0.0;
-                    let bit = 1u128 << u;
-                    let diffuse_too = e.done & bit == 0 || ((e.back & bit != 0) != back);
-                    if back {
-                        e.back |= bit;
-                    } else {
-                        e.back &= !bit;
+                let tiles = if ttodo | tlight != 0 { scene.textures.block(ci, c.tri_count as usize, finest.min(crate::texture::MAX_LEVEL)) } else { None };
+                // The points of the vertices `vbits` and grids `tbits` into
+                // a batch, normals turned to the side each was last shaded
+                // from; their places: vertices, then runs of grid points.
+                let gather = |e: &ClusterShade, vbits: u128, tbits: u128, batch: &mut Batch, vdest: &mut Vec<usize>, gdest: &mut Vec<(usize, usize)>| {
+                    let mut bits = vbits;
+                    while bits != 0 {
+                        let u = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let v = fv + u;
+                        let side = if e.vback & (1u128 << u) != 0 { -1.0 } else { 1.0 };
+                        batch.push(scene.positions[v], scene.normals[v] * side, scene.colors[v]);
+                        vdest.push(u);
                     }
-                    let side = if back { -1.0 } else { 1.0 };
-                    let (nu, nv) = (1usize << d.lu, 1usize << d.lv);
-                    gdest.push((d.offset as usize, (nu + 1) * (nv + 1), diffuse_too));
-                    let (s0, su, sv) = d.screen_affine();
-                    let (n0, n1, n2) = (scene.normals[i0], scene.normals[i1], scene.normals[i2]);
-                    let (c0, c1, c2) = (scene.colors[i0], scene.colors[i1], scene.colors[i2]);
-                    for a in 0..=nu {
-                        let fu = a as f32 / nu as f32;
-                        for b in 0..=nv {
-                            let fv = b as f32 / nv as f32;
-                            let sw = [0, 1, 2].map(|k| s0[k] + su[k] * fu + sv[k] * fv);
-                            let [b0, b1, b2] = screen_to_tri(sw, d.w);
-                            let p = p0 * b0 + p1 * b1 + p2 * b2;
-                            let nn = (n0 * b0 + n1 * b1 + n2 * b2).normalize_or(Vec3::Y) * side;
-                            let alb = match &tiles {
-                                Some(t) => t.sample(u, b1, b2),
-                                None => (c0 * b0 + c1 * b1 + c2 * b2).max(Vec3::ZERO),
-                            };
-                            batch.push(p, nn, alb);
+                    let mut bits = tbits;
+                    while bits != 0 {
+                        let u = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let d = e.grids[e.state[u] as usize];
+                        let t = (c.first_tri as usize + u) * 3;
+                        let (i0, i1, i2) = (scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize);
+                        let (p0, p1, p2) = (scene.positions[i0], scene.positions[i1], scene.positions[i2]);
+                        let side = if e.back & (1u128 << u) != 0 { -1.0 } else { 1.0 };
+                        let (nu, nv) = (1usize << d.lu, 1usize << d.lv);
+                        gdest.push((d.offset as usize, (nu + 1) * (nv + 1)));
+                        let (s0, su, sv) = d.screen_affine();
+                        let (n0, n1, n2) = (scene.normals[i0], scene.normals[i1], scene.normals[i2]);
+                        let (c0, c1, c2) = (scene.colors[i0], scene.colors[i1], scene.colors[i2]);
+                        // Eight points of a row at a time.
+                        use crate::simd::F;
+                        let steps = F::from([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+                        let inv_w = [1.0 / d.w[0], 1.0 / d.w[1], 1.0 / d.w[2]];
+                        for a in 0..=nu {
+                            let fu = a as f32 / nu as f32;
+                            let mut b = 0;
+                            while b <= nv {
+                                let m = (nv + 1 - b).min(8);
+                                let fv = (steps + b as f32) * (1.0 / nv as f32);
+                                // Screen weights, then the triangle's own
+                                // (perspective-correct), as `screen_to_tri`.
+                                let q = [0, 1, 2].map(|k| (F::splat(s0[k] + su[k] * fu) + fv * sv[k]) * inv_w[k]);
+                                let t = q[0] + q[1] + q[2];
+                                let t = t.abs().simd_lt(F::splat(1e-30)).select(F::splat(1e-30), t);
+                                let (b0, b1, b2) = (q[0] / t, q[1] / t, q[2] / t);
+                                let lerp = |a: f32, bb: f32, c: f32| b0 * a + b1 * bb + b2 * c;
+                                let (px, py, pz) = (lerp(p0.x, p1.x, p2.x), lerp(p0.y, p1.y, p2.y), lerp(p0.z, p1.z, p2.z));
+                                let (nx, ny, nz) = (lerp(n0.x, n1.x, n2.x), lerp(n0.y, n1.y, n2.y), lerp(n0.z, n1.z, n2.z));
+                                let l2 = nx * nx + ny * ny + nz * nz;
+                                let ok = l2.simd_gt(F::splat(1e-20));
+                                let k = F::splat(side) / l2.max(F::splat(1e-20)).sqrt();
+                                let (nx, ny, nz) = (ok.select(nx * k, F::ZERO), ok.select(ny * k, F::splat(side)), ok.select(nz * k, F::ZERO));
+                                let (bb1, bb2) = (b1.to_array(), b2.to_array());
+                                let alb: [Vec3; 8] = match &tiles {
+                                    Some(t) => std::array::from_fn(|j| if j < m { t.sample(u, bb1[j], bb2[j]) } else { Vec3::ZERO }),
+                                    None => {
+                                        let (r, g, bl) = (lerp(c0.x, c1.x, c2.x).max(F::ZERO).to_array(), lerp(c0.y, c1.y, c2.y).max(F::ZERO).to_array(), lerp(c0.z, c1.z, c2.z).max(F::ZERO).to_array());
+                                        std::array::from_fn(|j| Vec3::new(r[j], g[j], bl[j]))
+                                    }
+                                };
+                                batch.push8(m, [px, py, pz, nx, ny, nz], &alb);
+                                b += 8;
+                            }
+                        }
+                    }
+                };
+                // One light's share for every point of a batch.
+                let dark = Sky { on: false, ..sky };
+                let no_sun = SunLit { lux: Vec3::ZERO, dir: sun.dir, shadow: None };
+                let share_of = |batch: &Batch, l: usize, d: &mut [Vec3], s: &mut [Vec3]| -> u64 { shade_batch(batch, eye, dark, false, lights, &[l], &reach, &shadows, &no_sun, d, s, true) };
+
+                // In full: the sky and the sun, then each light's share.
+                if vtodo != 0 || ttodo != 0 {
+                    // Which side each is seen from now; a flip redoes the
+                    // diffuse light too.
+                    let mut vdiff = 0u128;
+                    let mut bits = vtodo;
+                    while bits != 0 {
+                        let u = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let v = fv + u;
+                        let back = scene.normals[v].dot(eye - scene.positions[v]) < 0.0;
+                        let bit = 1u128 << u;
+                        if e.vdone & bit == 0 || ((e.vback & bit != 0) != back) {
+                            vdiff |= bit;
+                        }
+                        if back { e.vback |= bit } else { e.vback &= !bit }
+                    }
+                    let mut tdiff = 0u128;
+                    let mut bits = ttodo;
+                    while bits != 0 {
+                        let u = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let t = (c.first_tri as usize + u) * 3;
+                        let (i0, i1, i2) = (scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize);
+                        let (p0, p1, p2) = (scene.positions[i0], scene.positions[i1], scene.positions[i2]);
+                        let fnrm = scene.normals[i0] + scene.normals[i1] + scene.normals[i2];
+                        let back = fnrm.dot(eye - (p0 + p1 + p2) / 3.0) < 0.0;
+                        let bit = 1u128 << u;
+                        if e.done & bit == 0 || ((e.back & bit != 0) != back) {
+                            tdiff |= bit;
+                        }
+                        if back { e.back |= bit } else { e.back &= !bit }
+                    }
+                    // A changed light makes kept diffuse light stale too.
+                    if all_diffuse {
+                        vdiff = vtodo;
+                        tdiff = ttodo;
+                    }
+                    // Shares of their own for the hot lights; the others are
+                    // in the sum, and a share that is no longer hot goes.
+                    let mut k = 0;
+                    while k < e.slots.len() {
+                        if hot.contains(&(e.slots[k] as usize)) {
+                            k += 1;
+                        } else {
+                            e.slots.remove(k);
+                            e.gshare.remove(k);
+                            e.vshare.remove(k);
+                        }
+                    }
+                    let mut lights_now: Vec<usize> = hot.iter().copied().filter(|&l| in_reach.contains(&l) || e.slots.contains(&(l as u8))).collect();
+                    lights_now.retain(|&l| l < lights.len());
+                    let in_sum: Vec<usize> = in_reach.iter().copied().filter(|l| !lights_now.contains(l)).collect();
+                    let mut batch = Batch::default();
+                    let (mut vdest, mut gdest) = (Vec::new(), Vec::new());
+                    gather(e, vtodo, ttodo, &mut batch, &mut vdest, &mut gdest);
+                    let n = batch.len();
+                    let mut dd = vec![Vec3::ZERO; n];
+                    let mut ss = vec![Vec3::ZERO; n];
+                    n_evals += shade_batch(&batch, eye, sky, ground, lights, &in_sum, &reach, &shadows, sun, &mut dd, &mut ss, true);
+                    // Each hot light's share, rounded as kept, added in; one
+                    // that no longer reaches gives nothing.
+                    let mut ld = vec![Vec3::ZERO; n];
+                    let mut ls = vec![Vec3::ZERO; n];
+                    for &l in &lights_now {
+                        let k = e.slot_of(l);
+                        if in_reach.contains(&l) {
+                            n_evals += share_of(&batch, l, &mut ld, &mut ls);
+                        } else {
+                            ld.iter_mut().for_each(|v| *v = Vec3::ZERO);
+                            ls.iter_mut().for_each(|v| *v = Vec3::ZERO);
+                        }
+                        let mut j = 0;
+                        for &u in &vdest {
+                            let diff = vdiff & (1u128 << u) != 0;
+                            let d = if diff { ld[j] } else { e.vshare[k][u][0] };
+                            dd[j] += d;
+                            ss[j] += ls[j];
+                            e.vshare[k][u] = [d, ls[j]];
+                            j += 1;
+                        }
+                        let mut bits = ttodo;
+                        for &(g, count) in &gdest {
+                            let u = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            let diff = tdiff & (1u128 << u) != 0;
+                            for q in g..g + count {
+                                let d = if diff { ld[j] } else { e.gshare[k][q][0] };
+                                dd[j] += d;
+                                ss[j] += ls[j];
+                                e.gshare[k][q] = [d, ls[j]];
+                                j += 1;
+                            }
+                        }
+                    }
+                    n_shaded += n as u64;
+                    for (j, &u) in vdest.iter().enumerate() {
+                        if vdiff & (1u128 << u) != 0 {
+                            e.vdiffuse[u] = dd[j];
+                        }
+                        e.vspec[u] = ss[j];
+                    }
+                    let mut j = vdest.len();
+                    let mut bits = ttodo;
+                    for &(g, count) in &gdest {
+                        let u = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        if tdiff & (1u128 << u) != 0 {
+                            e.diffuse[g..g + count].copy_from_slice(&dd[j..j + count]);
+                        }
+                        e.spec[g..g + count].copy_from_slice(&ss[j..j + count]);
+                        j += count;
+                    }
+                    e.vdone |= vtodo;
+                    e.vspec_done |= vtodo;
+                    e.done |= ttodo;
+                    e.spec_done |= ttodo;
+                }
+
+                // Changed lights only: the old share out, the new one in.
+                if vlight != 0 || tlight != 0 {
+                    let mut batch = Batch::default();
+                    let (mut vdest, mut gdest) = (Vec::new(), Vec::new());
+                    gather(e, vlight, tlight, &mut batch, &mut vdest, &mut gdest);
+                    let n = batch.len();
+                    let mut ld = vec![Vec3::ZERO; n];
+                    let mut ls = vec![Vec3::ZERO; n];
+                    let mut bits = lchange;
+                    while bits != 0 {
+                        let l = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        if l >= lights.len() {
+                            continue;
+                        }
+                        let reaches = in_reach.contains(&l);
+                        if !reaches && !e.slots.contains(&(l as u8)) {
+                            continue;
+                        }
+                        let k = e.slot_of(l);
+                        if reaches {
+                            n_evals += share_of(&batch, l, &mut ld, &mut ls);
+                        } else {
+                            ld.iter_mut().for_each(|v| *v = Vec3::ZERO);
+                            ls.iter_mut().for_each(|v| *v = Vec3::ZERO);
+                        }
+                        n_shaded += n as u64;
+                        let mut j = 0;
+                        for &u in &vdest {
+                            let [od, os] = e.vshare[k][u];
+                            e.vdiffuse[u] += ld[j] - od;
+                            e.vspec[u] += ls[j] - os;
+                            e.vshare[k][u] = [ld[j], ls[j]];
+                            j += 1;
+                        }
+                        for &(g, count) in &gdest {
+                            for q in g..g + count {
+                                let [od, os] = e.gshare[k][q];
+                                e.diffuse[q] += ld[j] - od;
+                                e.spec[q] += ls[j] - os;
+                                e.gshare[k][q] = [ld[j], ls[j]];
+                                j += 1;
+                            }
                         }
                     }
                 }
-                let n = batch.len();
-                let mut dd = vec![Vec3::ZERO; n];
-                let mut ss = vec![Vec3::ZERO; n];
-                n_evals += shade_batch(&batch, eye, sky, ground, lights, &in_reach, &reach, &shadows, sun, &mut dd, &mut ss, true);
-                n_shaded += n as u64;
-                for (k, &(u, diffuse_too)) in vdest.iter().enumerate() {
-                    if diffuse_too {
-                        e.vdiffuse[u] = dd[k];
-                    }
-                    e.vspec[u] = ss[k];
-                }
-                let mut k = vdest.len();
-                for &(g, count, diffuse_too) in &gdest {
-                    if diffuse_too {
-                        e.diffuse[g..g + count].copy_from_slice(&dd[k..k + count]);
-                    }
-                    e.spec[g..g + count].copy_from_slice(&ss[k..k + count]);
-                    k += count;
-                }
-                e.done |= ttodo;
-                e.spec_done |= ttodo;
                 evals.fetch_add(n_evals, Ordering::Relaxed);
                 shaded.fetch_add(n_shaded, Ordering::Relaxed);
             });
@@ -1093,6 +1355,9 @@ fn shade_point(
     (diffuse, spec, evals)
 }
 
+/// Lights that keep a share of their own in the shading cache.
+const HOT_LIGHTS: usize = 1;
+
 /// x to the 48th, the highlight's sharpness: five squarings and a product,
 /// not a `powf`.
 #[inline]
@@ -1122,6 +1387,24 @@ pub struct Batch {
 impl Batch {
     pub fn len(&self) -> usize {
         self.px.len()
+    }
+
+    /// The first `m` lanes of eight points (position and normal, a
+    /// component a lane group) with their albedos.
+    #[inline]
+    pub fn push8(&mut self, m: usize, pn: [crate::simd::F; 6], albedo: &[Vec3; 8]) {
+        let [px, py, pz, nx, ny, nz] = pn.map(|v| v.to_array());
+        self.px.extend_from_slice(&px[..m]);
+        self.py.extend_from_slice(&py[..m]);
+        self.pz.extend_from_slice(&pz[..m]);
+        self.nx.extend_from_slice(&nx[..m]);
+        self.ny.extend_from_slice(&ny[..m]);
+        self.nz.extend_from_slice(&nz[..m]);
+        for a in &albedo[..m] {
+            self.ar.push(a.x);
+            self.ag.push(a.y);
+            self.ab.push(a.z);
+        }
     }
 
     #[inline]
@@ -1472,6 +1755,28 @@ mod tests {
         for i in 0..w * h {
             assert_eq!(cluster_of(&frame, i), cluster_of(&fresh, i));
         }
+    }
+
+    /// Dragging one light redoes only its share: far fewer light
+    /// evaluations than shading in full, and the picture of a fresh render.
+    #[test]
+    fn a_dragged_light_redoes_only_its_share() {
+        let (scene, mut lights) = world();
+        let (w, h) = (200, 112);
+        let settings = RenderSettings { bounce: false, ..RenderSettings::new(Sky::new(30.0, true)) };
+        let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.85, 0.0), 6.0, 0.07);
+        let mut r = Renderer::new();
+        let mut frame = Frame::new(w, h);
+        r.render(&scene, &cam, &lights, &settings, &mut frame);
+        let full = frame.stats.light_evals;
+        for _ in 0..4 {
+            lights[0].position += Vec3::new(0.15, 0.0, 0.05);
+            r.render(&scene, &cam, &lights, &settings, &mut frame);
+        }
+        assert!(frame.stats.light_evals * 3 < full * 2, "{} evaluations dragging, {} in full", frame.stats.light_evals, full);
+        let mut fresh = Frame::new(w, h);
+        render(&scene, &cam, &lights, &settings, &mut fresh);
+        assert!(worst(&frame, &fresh) <= 2, "{}", worst(&frame, &fresh));
     }
 
     fn world() -> (Scene, Vec<PointLight>) {

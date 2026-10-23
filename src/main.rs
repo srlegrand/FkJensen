@@ -1584,8 +1584,9 @@ fn main() {
                 app.render();
                 let s = app.frame.stats;
                 eprintln!(
-                    "drag step {step}: {:.1} ms: visibility {}, shadows {:.1} ms ({} maps, {} triangles), bounce {:.1} ms ({} surfels lit) + gather {:.1} ms ({} receivers, {} waiting), shade {:.1} ms ({} points in {} clusters), resolve {:.1} ms",
+                    "drag step {step}: {:.1} ms (cache {} MB): visibility {}, shadows {:.1} ms ({} maps, {} triangles), bounce {:.1} ms ({} surfels lit) + gather {:.1} ms ({} receivers, {} waiting), shade {:.1} ms ({} points in {} clusters), resolve {:.1} ms",
                     t.elapsed().as_secs_f32() * 1000.0,
+                    s.cache_bytes >> 20,
                     if s.visibility_kept { "kept" } else { "redone" },
                     s.shadow_ms,
                     s.shadow_maps_built,

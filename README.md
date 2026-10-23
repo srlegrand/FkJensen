@@ -562,8 +562,13 @@ Painting the interface took about 7 ms a frame at 1920 x 1080 on the same
 ## How a frame is made
 
 1. **What changed.** Lights are compared with the last frame's. A changed
-   light throws away the shading of the clusters inside its old and new
-   reach, and its shadow map if it moved or changed strength. A change of
+   light marks the clusters inside its old and new reach, and throws away
+   its shadow map if it moved or changed strength. The light changed last
+   keeps its own share of each point's shading (diffuse and highlight)
+   beside the sum, so while it is dragged only its share is redone: the
+   old share out, the new one in, one light evaluated a point instead of
+   all of them. The first frame of a drag makes the share. While the
+   camera holds still, grids are not checked against the view again. A change of
    sky, exposure, light reach, shadows or number of lights throws away all
    shading.
 2. **Shadow maps** for lights that have none (`src/shadow.rs`), in parallel.
@@ -633,6 +638,22 @@ three runs, 23/10/2026:
 | high-resolution T-rex: first frame | 6.05 s | 4.32 s |
 | dragging the key light, a frame | 1,306 ms | 437 ms |
 | shading in it | 1,112 ms | 266 ms |
+
+The changed light's own share (patch of 23/10/2026), dragging the key
+light, best of three runs of steps 1 to 5 (the first frame of a drag
+makes the share, so it is the slowest):
+
+| | eight wide | the light's own share |
+|---|---|---|
+| low-resolution T-rex: a frame | 242 ms | 196 ms |
+| shading in it | 146 ms | 95 ms |
+| high-resolution T-rex: a frame | 437 ms | 298 ms |
+| shading in it | 266 ms | 135 ms |
+| shading cache, low-resolution, 1 px apart | 181 MB | 229 MB |
+
+What is left of a drag frame: making the points again (positions,
+normals, texture tiles) to evaluate the one light, the resolve (46 ms)
+and the bounce gather's 30 ms budget.
 
 Occlusion culling (`--no-occlusion` turns it off to compare), turning the
 camera a degree a frame (`--bench-orbit`), high-resolution T-rex, median
@@ -755,8 +776,10 @@ Not measured yet: a Raspberry Pi.
   so a close look far from the subject gets coarse sun shadows; its disc is
   drawn larger than the real one so it reads; no moon, no atmosphere or
   aerial perspective; the light count view leaves it out.
-- A moved light re-shades its points with every light in reach; keeping
-  each light's share apart would let it redo only its own.
+- Only the light changed last keeps a share of its own (a second share
+  would add 24 bytes a point); dragging two lights in turn makes the
+  share again at each change. The points are made again to evaluate it;
+  keeping their positions and normals would cost more memory still.
 - Adaptive refinement (sparse samples where the picture is smooth) and
   front-to-back early stopping: not started.
 - SIMD: shading, shadow maps and the bounce raster are eight wide; the
