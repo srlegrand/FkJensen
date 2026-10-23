@@ -69,6 +69,8 @@ pub struct Stats {
     pub points_shaded: u64,
     /// Shading points the frame used.
     pub points_used: u64,
+    /// Grid points interpolated rather than shaded this frame.
+    pub points_interpolated: u64,
     /// Clusters that had any shading done this frame.
     pub clusters_shaded: usize,
     /// Whether every pixel was resolved, or only those of clusters shaded
@@ -299,6 +301,9 @@ pub struct RenderSettings {
     /// Skip clusters hidden behind what was seen last frame. Off only to
     /// compare.
     pub occlusion: bool,
+    /// Shade every other grid point first and the rest only where the
+    /// light changes (`reyes::shade_adaptive`). Off only to compare.
+    pub adaptive: bool,
 }
 
 /// Shading cache budget when the machine's plan does not set one.
@@ -312,7 +317,7 @@ impl RenderSettings {
     }
 
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true }
+        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true }
     }
 }
 

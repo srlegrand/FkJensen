@@ -359,7 +359,7 @@ pub struct Renderer {
     /// only it keeps a share of its own in the shading cache, so memory
     /// grows by one share a point.
     hot: Vec<usize>,
-    prev_global: Option<(Sky, raster::Sun, f32, bool, bool, bool, usize)>,
+    prev_global: Option<(Sky, raster::Sun, f32, bool, bool, bool, usize, bool)>,
     /// The sun's shadow map, and what it was built for (direction, texels,
     /// scene).
     sun_shadow: Option<SunShadow>,
@@ -525,7 +525,7 @@ impl Renderer {
         let reach: Vec<f32> = lights.iter().map(|l| if settings.light_reach { raster::light_reach(l, cut) } else { f32::INFINITY }).collect();
 
         // What changed since the last frame decides what is thrown away.
-        let global = (settings.sky, settings.sun, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.bounce, settings.shadow_res);
+        let global = (settings.sky, settings.sun, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.bounce, settings.shadow_res, settings.adaptive);
         let global_changed = self.prev_global != Some(global) || self.prev_lights.len() != lights.len();
         // Spheres (old and new position, with reach) of lights that changed,
         // and which light.
@@ -694,6 +694,9 @@ impl Renderer {
         let need = &self.need;
         let ground = !settings.bounce;
         let hot = &self.hot;
+        let exposure = settings.exposure.max(1e-12);
+        let adaptive = settings.adaptive;
+        let interpolated = AtomicU64::new(0);
         let vp = cam.proj * cam.view;
         let (near, size) = (cam.near, (frame.width, frame.height));
         let rate = settings.shading_rate_px.max(0.25) * self.rate_scale;
@@ -854,7 +857,7 @@ impl Renderer {
                 // The points of the vertices `vbits` and grids `tbits` into
                 // a batch, normals turned to the side each was last shaded
                 // from; their places: vertices, then runs of grid points.
-                let gather = |e: &ClusterShade, vbits: u128, tbits: u128, batch: &mut Batch, vdest: &mut Vec<usize>, gdest: &mut Vec<(usize, usize)>| {
+                let gather = |e: &ClusterShade, vbits: u128, tbits: u128, batch: &mut Batch, vdest: &mut Vec<usize>, gdest: &mut Vec<(usize, usize)>, dims: &mut Vec<(usize, usize)>| {
                     let mut bits = vbits;
                     while bits != 0 {
                         let u = bits.trailing_zeros() as usize;
@@ -875,6 +878,7 @@ impl Renderer {
                         let side = if e.back & (1u128 << u) != 0 { -1.0 } else { 1.0 };
                         let (nu, nv) = (1usize << d.lu, 1usize << d.lv);
                         gdest.push((d.offset as usize, (nu + 1) * (nv + 1)));
+                        dims.push((nu, nv));
                         let (s0, su, sv) = d.screen_affine();
                         let (n0, n1, n2) = (scene.normals[i0], scene.normals[i1], scene.normals[i2]);
                         let (c0, c1, c2) = (scene.colors[i0], scene.colors[i1], scene.colors[i2]);
@@ -974,24 +978,30 @@ impl Renderer {
                     lights_now.retain(|&l| l < lights.len());
                     let in_sum: Vec<usize> = in_reach.iter().copied().filter(|l| !lights_now.contains(l)).collect();
                     let mut batch = Batch::default();
-                    let (mut vdest, mut gdest) = (Vec::new(), Vec::new());
-                    gather(e, vtodo, ttodo, &mut batch, &mut vdest, &mut gdest);
-                    let n = batch.len();
-                    let mut dd = vec![Vec3::ZERO; n];
-                    let mut ss = vec![Vec3::ZERO; n];
-                    n_evals += shade_batch(&batch, eye, sky, ground, lights, &in_sum, &reach, &shadows, sun, &mut dd, &mut ss, true);
-                    // Each hot light's share, rounded as kept, added in; one
-                    // that no longer reaches gives nothing.
-                    let mut ld = vec![Vec3::ZERO; n];
-                    let mut ls = vec![Vec3::ZERO; n];
-                    for &l in &lights_now {
-                        let k = e.slot_of(l);
-                        if in_reach.contains(&l) {
-                            n_evals += share_of(&batch, l, &mut ld, &mut ls);
-                        } else {
-                            ld.iter_mut().for_each(|v| *v = Vec3::ZERO);
-                            ls.iter_mut().for_each(|v| *v = Vec3::ZERO);
+                    let (mut vdest, mut gdest, mut dims) = (Vec::new(), Vec::new(), Vec::new());
+                    gather(e, vtodo, ttodo, &mut batch, &mut vdest, &mut gdest, &mut dims);
+                    // The sky, the sun and the lights in the sum, then each
+                    // hot light's share (one that no longer reaches gives
+                    // nothing): shaded where the picture needs it, the rest
+                    // interpolated (`shade_adaptive`).
+                    let shares_in: Vec<bool> = lights_now.iter().map(|l| in_reach.contains(l)).collect();
+                    let mut eval = |b: &Batch, d: &mut [Vec3], s: &mut [Vec3], sd: &mut [Vec<Vec3>], ss: &mut [Vec<Vec3>]| -> u64 {
+                        let mut ev = shade_batch(b, eye, sky, ground, lights, &in_sum, &reach, &shadows, sun, d, s, true);
+                        for (k, &l) in lights_now.iter().enumerate() {
+                            if shares_in[k] {
+                                ev += share_of(b, l, &mut sd[k], &mut ss[k]);
+                            }
                         }
+                        ev
+                    };
+                    let a = shade_adaptive(&batch, vdest.len(), &dims, lights_now.len(), exposure, adaptive, &mut eval);
+                    n_evals += a.evals;
+                    n_shaded += a.shaded as u64;
+                    interpolated.fetch_add((batch.len() - a.shaded) as u64, Ordering::Relaxed);
+                    let (mut dd, mut ss) = (a.d, a.s);
+                    for (li, &l) in lights_now.iter().enumerate() {
+                        let k = e.slot_of(l);
+                        let (ld, ls) = (&a.sd[li], &a.ss[li]);
                         let mut j = 0;
                         for &u in &vdest {
                             let diff = vdiff & (1u128 << u) != 0;
@@ -1015,7 +1025,6 @@ impl Renderer {
                             }
                         }
                     }
-                    n_shaded += n as u64;
                     for (j, &u) in vdest.iter().enumerate() {
                         if vdiff & (1u128 << u) != 0 {
                             e.vdiffuse[u] = dd[j];
@@ -1043,7 +1052,8 @@ impl Renderer {
                 if vlight != 0 || tlight != 0 {
                     let mut batch = Batch::default();
                     let (mut vdest, mut gdest) = (Vec::new(), Vec::new());
-                    gather(e, vlight, tlight, &mut batch, &mut vdest, &mut gdest);
+                    let mut dims = Vec::new();
+                    gather(e, vlight, tlight, &mut batch, &mut vdest, &mut gdest, &mut dims);
                     let n = batch.len();
                     let mut ld = vec![Vec3::ZERO; n];
                     let mut ls = vec![Vec3::ZERO; n];
@@ -1060,12 +1070,18 @@ impl Renderer {
                         }
                         let k = e.slot_of(l);
                         if reaches {
-                            n_evals += share_of(&batch, l, &mut ld, &mut ls);
+                            // Every point: one light's lookup costs less than
+                            // choosing which points to skip.
+                            let a = shade_adaptive(&batch, vdest.len(), &dims, 0, exposure, false, &mut |b: &Batch, d: &mut [Vec3], s: &mut [Vec3], _: &mut [Vec<Vec3>], _: &mut [Vec<Vec3>]| share_of(b, l, d, s));
+                            n_evals += a.evals;
+                            n_shaded += a.shaded as u64;
+                            interpolated.fetch_add((n - a.shaded) as u64, Ordering::Relaxed);
+                            ld = a.d;
+                            ls = a.s;
                         } else {
                             ld.iter_mut().for_each(|v| *v = Vec3::ZERO);
                             ls.iter_mut().for_each(|v| *v = Vec3::ZERO);
                         }
-                        n_shaded += n as u64;
                         let mut j = 0;
                         for &u in &vdest {
                             let [od, os] = e.vshare[k][u];
@@ -1091,6 +1107,7 @@ impl Renderer {
         }
         frame.stats.shade_ms = t_shade.elapsed().as_secs_f32() * 1000.0;
         frame.stats.points_shaded = shaded.into_inner();
+        frame.stats.points_interpolated = interpolated.into_inner();
         frame.stats.points_used = used.into_inner();
         frame.stats.clusters_shaded = clusters_shaded.into_inner() as usize;
         frame.stats.light_evals = evals.into_inner();
@@ -1419,6 +1436,196 @@ impl Batch {
         self.ag.push(albedo.y);
         self.ab.push(albedo.z);
     }
+}
+
+impl Batch {
+    /// The points `idx` of this batch, in that order.
+    fn select(&self, idx: &[u32]) -> Batch {
+        let pick = |v: &Vec<f32>| idx.iter().map(|&i| v[i as usize]).collect();
+        Batch { px: pick(&self.px), py: pick(&self.py), pz: pick(&self.pz), nx: pick(&self.nx), ny: pick(&self.ny), nz: pick(&self.nz), ar: pick(&self.ar), ag: pick(&self.ag), ab: pick(&self.ab) }
+    }
+
+    fn albedo(&self, i: usize) -> Vec3 {
+        Vec3::new(self.ar[i], self.ag[i], self.ab[i])
+    }
+}
+
+/// How far apart, in display units before the tone curve, the corners of
+/// a cell of four grid points may be for the points between them to be
+/// interpolated rather than shaded: about 8 of 255 where it matters most.
+pub const ADAPTIVE_TOLERANCE: f32 = 0.03;
+
+/// What `shade_adaptive` made: for every point of the batch the sum
+/// (diffuse, highlight), and each share; how many points were shaded and
+/// the lights evaluated.
+struct Adaptive {
+    d: Vec<Vec3>,
+    s: Vec<Vec3>,
+    sd: Vec<Vec<Vec3>>,
+    ss: Vec<Vec<Vec3>>,
+    shaded: usize,
+    evals: u64,
+}
+
+/// Shade a cluster's points where the picture needs them. The first
+/// `n_vert` points (vertices) are all shaded; the rest are grids, row by
+/// row, of `dims` (nu, nv) parts. Every other point of each grid (each
+/// way) is shaded first; a cell of four whose light differs by more than
+/// `ADAPTIVE_TOLERANCE` (after `exposure`) has its points between shaded
+/// too, and the rest are interpolated from the cell's corners: the light
+/// on them (diffuse over albedo, so texture tiles keep their detail) and
+/// the highlight. `eval` shades a batch into the sum and each of
+/// `shares` shares. Without `adaptive`, every point is shaded.
+fn shade_adaptive(
+    b: &Batch,
+    n_vert: usize,
+    dims: &[(usize, usize)],
+    shares: usize,
+    exposure: f32,
+    adaptive: bool,
+    eval: &mut dyn FnMut(&Batch, &mut [Vec3], &mut [Vec3], &mut [Vec<Vec3>], &mut [Vec<Vec3>]) -> u64,
+) -> Adaptive {
+    let n = b.len();
+    let mut out = Adaptive { d: vec![Vec3::ZERO; n], s: vec![Vec3::ZERO; n], sd: vec![vec![Vec3::ZERO; n]; shares], ss: vec![vec![Vec3::ZERO; n]; shares], shaded: 0, evals: 0 };
+    let mut run = |idx: &[u32], out: &mut Adaptive| {
+        if idx.is_empty() {
+            return;
+        }
+        let sub = if idx.len() == n { None } else { Some(b.select(idx)) };
+        let sb = sub.as_ref().unwrap_or(b);
+        let m = idx.len();
+        let (mut d, mut s) = (vec![Vec3::ZERO; m], vec![Vec3::ZERO; m]);
+        let (mut sd, mut ss) = (vec![vec![Vec3::ZERO; m]; shares], vec![vec![Vec3::ZERO; m]; shares]);
+        out.evals += eval(sb, &mut d, &mut s, &mut sd, &mut ss);
+        out.shaded += m;
+        for (j, &i) in idx.iter().enumerate() {
+            let i = i as usize;
+            out.d[i] = d[j];
+            out.s[i] = s[j];
+            for k in 0..shares {
+                out.sd[k][i] = sd[k][j];
+                out.ss[k][i] = ss[k][j];
+            }
+        }
+    };
+    if !adaptive {
+        let all: Vec<u32> = (0..n as u32).collect();
+        run(&all, &mut out);
+        return out;
+    }
+    // Pass 1: vertices, and the even points of every grid.
+    let coarse_of = |nu: usize, nv: usize, a: usize, bb: usize| (nu < 2 || a % 2 == 0) && (nv < 2 || bb % 2 == 0);
+    let mut first: Vec<u32> = (0..n_vert as u32).collect();
+    let mut base = n_vert;
+    for &(nu, nv) in dims {
+        for a in 0..=nu {
+            for bb in 0..=nv {
+                if coarse_of(nu, nv, a, bb) {
+                    first.push((base + a * (nv + 1) + bb) as u32);
+                }
+            }
+        }
+        base += (nu + 1) * (nv + 1);
+    }
+    run(&first, &mut out);
+    if first.len() == n {
+        return out;
+    }
+    // The light at each shaded point, for comparing corners: diffuse over
+    // albedo (half the light a mid-grey surface shows) and the highlight.
+    let lum = Vec3::new(0.2126, 0.7152, 0.0722);
+    let mut level = vec![0f32; n];
+    for &i in &first {
+        let i = i as usize;
+        let (mut d, mut s) = (out.d[i], out.s[i]);
+        for k in 0..shares {
+            d += out.sd[k][i];
+            s += out.ss[k][i];
+        }
+        level[i] = ((d / b.albedo(i).max(Vec3::splat(0.02))).dot(lum) * 0.5 + s.dot(lum)) * exposure;
+    }
+    // Pass 2: the points between corners that differ; the others are
+    // interpolated once those are shaded.
+    // 0: shaded in pass 1; 1: to shade; 2: to interpolate from `cell`.
+    let mut what = vec![0u8; n];
+    let mut cell = vec![0u32; n];
+    let mut second: Vec<u32> = Vec::new();
+    let mut cells: Vec<([u32; 4], usize, usize, usize, usize, usize)> = Vec::new();
+    let mut base = n_vert;
+    for &(nu, nv) in dims {
+        let at = |a: usize, bb: usize| base + a * (nv + 1) + bb;
+        let (su, sv) = (if nu < 2 { 1 } else { 2 }, if nv < 2 { 1 } else { 2 });
+        let mut a0 = 0;
+        while a0 < nu {
+            let a1 = (a0 + su).min(nu);
+            let mut b0 = 0;
+            while b0 < nv {
+                let b1 = (b0 + sv).min(nv);
+                let corners = [at(a0, b0), at(a1, b0), at(a0, b1), at(a1, b1)];
+                let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                for &c in &corners {
+                    lo = lo.min(level[c]);
+                    hi = hi.max(level[c]);
+                }
+                let smooth = hi - lo <= ADAPTIVE_TOLERANCE;
+                let ci = cells.len() as u32;
+                cells.push((corners.map(|c| c as u32), a0, a1, b0, b1, nv));
+                for a in a0..=a1 {
+                    for bb in b0..=b1 {
+                        // Corners, and points on an edge the cell before
+                        // took.
+                        if coarse_of(nu, nv, a, bb) || (a == a0 && a0 > 0) || (bb == b0 && b0 > 0) {
+                            continue;
+                        }
+                        let i = at(a, bb);
+                        if smooth {
+                            what[i] = 2;
+                            cell[i] = ci;
+                        } else {
+                            what[i] = 1;
+                            second.push(i as u32);
+                        }
+                    }
+                }
+                b0 = b1;
+            }
+            a0 = a1;
+        }
+        base += (nu + 1) * (nv + 1);
+    }
+    run(&second, &mut out);
+    // The corners' light: diffuse over albedo, once a corner.
+    let mut light: Vec<Vec<Vec3>> = vec![vec![Vec3::ZERO; n]; 1 + shares];
+    for &i in &first {
+        let i = i as usize;
+        let inv = Vec3::ONE / b.albedo(i).max(Vec3::splat(1e-4));
+        light[0][i] = out.d[i] * inv;
+        for k in 0..shares {
+            light[1 + k][i] = out.sd[k][i] * inv;
+        }
+    }
+    for i in 0..n {
+        if what[i] != 2 {
+            continue;
+        }
+        let (cs, a0, a1, b0, b1, nv) = cells[cell[i] as usize];
+        let local = i - (cs[0] as usize - (a0 * (nv + 1) + b0));
+        let (a, bb) = (local / (nv + 1), local % (nv + 1));
+        let fu = (a - a0) as f32 / (a1 - a0).max(1) as f32;
+        let fv = (bb - b0) as f32 / (b1 - b0).max(1) as f32;
+        let w = [(1.0 - fu) * (1.0 - fv), fu * (1.0 - fv), (1.0 - fu) * fv, fu * fv];
+        let cs = cs.map(|c| c as usize);
+        let lerp = |v: &[Vec3]| v[cs[0]] * w[0] + v[cs[1]] * w[1] + v[cs[2]] * w[2] + v[cs[3]] * w[3];
+        // Diffuse as the corners' light times the point's own albedo.
+        let alb = b.albedo(i);
+        out.d[i] = lerp(&light[0]) * alb;
+        out.s[i] = lerp(&out.s);
+        for k in 0..shares {
+            out.sd[k][i] = lerp(&light[1 + k]) * alb;
+            out.ss[k][i] = lerp(&out.ss[k]);
+        }
+    }
+    out
 }
 
 /// `shade_point` for every point of `b`, eight at a time (AVX on the
@@ -1763,7 +1970,8 @@ mod tests {
     fn a_dragged_light_redoes_only_its_share() {
         let (scene, mut lights) = world();
         let (w, h) = (200, 112);
-        let settings = RenderSettings { bounce: false, ..RenderSettings::new(Sky::new(30.0, true)) };
+        // Every point shaded, so the counts compare.
+        let settings = RenderSettings { bounce: false, adaptive: false, ..RenderSettings::new(Sky::new(30.0, true)) };
         let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.85, 0.0), 6.0, 0.07);
         let mut r = Renderer::new();
         let mut frame = Frame::new(w, h);
@@ -1777,6 +1985,31 @@ mod tests {
         let mut fresh = Frame::new(w, h);
         render(&scene, &cam, &lights, &settings, &mut fresh);
         assert!(worst(&frame, &fresh) <= 2, "{}", worst(&frame, &fresh));
+    }
+
+    /// Adaptive shading shades a fraction of the points and gives the
+    /// picture of shading them all, within a few levels of 255 at most
+    /// pixels.
+    #[test]
+    fn adaptive_shading_shades_less_for_the_same_picture() {
+        let (scene, lights) = world();
+        let (w, h) = (240, 135);
+        let cam = cam_at(0.3, w, h, Vec3::new(0.0, 0.85, 0.0), 6.0, 0.07);
+        let on = RenderSettings { bounce: false, ..RenderSettings::new(Sky::new(30.0, true)) };
+        let off = RenderSettings { adaptive: false, ..on };
+        let (mut a, mut b) = (Frame::new(w, h), Frame::new(w, h));
+        render(&scene, &cam, &lights, &on, &mut a);
+        render(&scene, &cam, &lights, &off, &mut b);
+        assert!(a.stats.points_shaded * 2 < b.stats.points_shaded, "{} of {}", a.stats.points_shaded, b.stats.points_shaded);
+        assert!(a.stats.points_interpolated > 0);
+        let mut big = 0;
+        for (x, y) in a.color.iter().zip(&b.color) {
+            let d = [0, 8, 16].iter().map(|sh| (((x >> sh) & 0xff) as i32 - ((y >> sh) & 0xff) as i32).abs()).max().unwrap();
+            if d > 4 {
+                big += 1;
+            }
+        }
+        assert!(big * 200 < w * h, "{big} pixels differ by more than 4");
     }
 
     fn world() -> (Scene, Vec<PointLight>) {

@@ -603,7 +603,13 @@ Painting the interface took about 7 ms a frame at 1920 x 1080 on the same
    under visible pixels are diced and shaded, and only those
    whose shading was not kept: radiance in cd/m² from the sky, then each
    light in reach through its shadow map, Lambert diffuse and a small
-   Blinn-Phong highlight. Diffuse light is kept until a light, the sky or
+   Blinn-Phong highlight. Adaptive shading: every other point of a grid
+   (each way) is shaded first; where the four corners of a cell differ by
+   more than about 8 of 255 the points between are shaded too, and the
+   rest are interpolated, their light from the corners times their own
+   albedo, so texture tiles keep their detail (`--no-adaptive` shades
+   every point, to compare). A dragged light's share is shaded at every
+   point: one lookup costs less than choosing. Diffuse light is kept until a light, the sky or
    the exposure throws it away; the highlight depends on the eye and is
    redone when the camera moves. Shading is two-sided: normals face the
    eye, and a triangle seen from its other side is shaded again.
@@ -638,6 +644,24 @@ three runs, 23/10/2026:
 | high-resolution T-rex: first frame | 6.05 s | 4.32 s |
 | dragging the key light, a frame | 1,306 ms | 437 ms |
 | shading in it | 1,112 ms | 266 ms |
+
+Adaptive shading (`--no-adaptive` turns it off to compare), the same
+machine, best of three runs, or the median of fifteen orbit frames:
+
+| | every point | adaptive |
+|---|---|---|
+| low-resolution T-rex, first frame: points shaded | 4.51 M | 1.39 M (the rest interpolated) |
+| shading in it | 334 ms | 266 ms |
+| turning the camera, a frame | 409 ms | 374 to 380 ms |
+| high-resolution T-rex, first frame: shading | 357 ms | 339 ms |
+| turning the camera, a frame, wide / close | 592 / 651 ms | 569 / 616 ms |
+
+Less than the points suggest: eight-wide shading is cheap next to making
+the points (positions, normals, texture tiles), which are all made, and
+choosing costs too. The high-resolution T-rex's triangles are mostly under
+a few pixels, with grids too small to skip much in. Picture: of 921,600
+pixels, 422 (wide) and 682 (close) differ by more than 2 of 255, at most
+by 20 and 43, along sharp highlights and shadow edges.
 
 The changed light's own share (patch of 23/10/2026), dragging the key
 light, best of three runs of steps 1 to 5 (the first frame of a drag
@@ -780,8 +804,10 @@ Not measured yet: a Raspberry Pi.
   would add 24 bytes a point); dragging two lights in turn makes the
   share again at each change. The points are made again to evaluate it;
   keeping their positions and normals would cost more memory still.
-- Adaptive refinement (sparse samples where the picture is smooth) and
-  front-to-back early stopping: not started.
+- Adaptive shading still makes every point (position, normal, texture
+  tile) before choosing which to shade, and a shadow edge or highlight
+  smaller than two grid steps can fall between the points it shades
+  first and be missed.
 - SIMD: shading, shadow maps and the bounce raster are eight wide; the
   visibility raster, the resolve and setting up the shading points are
   not. The texel loads of a shadow lookup are one lane at a time. On the

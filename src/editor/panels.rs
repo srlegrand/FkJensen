@@ -377,6 +377,9 @@ impl Editor {
             ui.label("Occlusion culling");
             ui.checkbox(&mut self.app.settings.occlusion, "");
             ui.end_row();
+            ui.label("Adaptive shading");
+            ui.checkbox(&mut self.app.settings.adaptive, "");
+            ui.end_row();
             ui.label("Back-face culling");
             ui.checkbox(&mut self.app.settings.cull_backfaces, "");
             ui.end_row();
@@ -430,6 +433,9 @@ impl Editor {
                     row("Hidden, skipped", thousands(s.clusters_occluded));
                 }
                 row("Points shaded", format!("{} of {}", thousands(s.points_shaded as usize), thousands(s.points_used as usize)));
+                if s.points_interpolated > 0 {
+                    row("Interpolated", thousands(s.points_interpolated as usize));
+                }
                 row("Shading cache", format!("{} of {} MB", s.cache_bytes >> 20, self.app.settings.cache_budget >> 20));
                 row("Shadows", format!("{:.0} ms", s.shadow_ms));
                 row("Bounce", if !self.app.settings.bounce { "off".into() } else if s.receivers_pending > 0 { format!("{} receivers to go", thousands(s.receivers_pending)) } else { "done".into() });

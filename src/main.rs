@@ -17,6 +17,7 @@
 //!   fkjensen --view lights             show how many lights each pixel evaluates
 //!   fkjensen --no-reach                evaluate every light everywhere (to compare)
 //!   fkjensen --no-occlusion            draw what is hidden behind what was seen (to compare)
+//!   fkjensen --no-adaptive             shade every grid point (to compare)
 //!   fkjensen --close                   start on the close framing of the subject
 //!   fkjensen --look ex,ey,ez,tx,ty,tz  camera at e looking at t, in metres
 //!   fkjensen --no-shadows              point lights without shadow maps
@@ -1185,6 +1186,7 @@ fn main() {
     let mut view = View::Shaded;
     let mut reach = true;
     let mut occlusion = true;
+    let mut adaptive = true;
     let mut close = false;
     let mut shadows: Option<bool> = None;
     let mut bounce: Option<bool> = None;
@@ -1262,6 +1264,7 @@ fn main() {
             }
             "--no-reach" => reach = false,
             "--no-occlusion" => occlusion = false,
+            "--no-adaptive" => adaptive = false,
             "--close" => close = true,
             "--no-shadows" => shadows = Some(false),
             "--shadows" => shadows = Some(true),
@@ -1327,7 +1330,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1410,6 +1413,7 @@ fn main() {
     }
     app.settings.light_reach = reach;
     app.settings.occlusion = occlusion;
+    app.settings.adaptive = adaptive;
     if let Some(p) = &plan {
         app.settings.shadows = p.shadows;
         app.settings.shadow_res = p.shadow_res;
