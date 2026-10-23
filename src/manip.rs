@@ -2,9 +2,9 @@
 //!
 //! Move has an arrow per axis (X red, Y green, Z blue) and a square at the
 //! centre that moves in the plane facing the eye. Rotate is a ring about
-//! the vertical (models stand on the ground). Scale is a cube at the centre
-//! and an arrow per axis, all scaling the same on every axis (so texture
-//! tiles stay valid). Handles are a fixed size on screen.
+//! each axis, in the same colours. Scale is a cube at the centre and an
+//! arrow per axis, all scaling the same on every axis (so texture tiles
+//! stay valid). Handles are a fixed size on screen; axes are the world's.
 
 use glam::Vec3;
 
@@ -28,8 +28,8 @@ pub enum Handle {
     Axis(usize),
     /// Move: the plane facing the eye. Scale: uniform.
     Centre,
-    /// Rotate about the vertical.
-    Ring,
+    /// Rotate about axis k.
+    Ring(usize),
 }
 
 pub const AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
@@ -57,11 +57,43 @@ fn seg_dist(m: glam::Vec2, a: glam::Vec2, b: glam::Vec2) -> f32 {
     m.distance(a + ab * t)
 }
 
-fn ring_points(pivot: Vec3, r: f32) -> Vec<Vec3> {
-    (0..=64).map(|k| {
-        let a = k as f32 / 64.0 * std::f32::consts::TAU;
-        pivot + Vec3::new(a.cos(), 0.0, a.sin()) * r
+/// The ring about axis `k`: a circle of radius `r` in the plane of the
+/// other two axes.
+fn ring_points(pivot: Vec3, k: usize, r: f32) -> Vec<Vec3> {
+    let (u, v) = (AXES[(k + 1) % 3], AXES[(k + 2) % 3]);
+    (0..=64).map(|i| {
+        let a = i as f32 / 64.0 * std::f32::consts::TAU;
+        pivot + (u * a.cos() + v * a.sin()) * r
     }).collect()
+}
+
+/// Angle of pixel `m` round the pivot on screen, radians (clockwise, y
+/// down).
+pub fn screen_angle(cam: &Camera, frame: &Frame, pivot: Vec3, m: glam::Vec2) -> Option<f32> {
+    let c = screen(cam, frame, pivot)?;
+    let d = m - c;
+    (d.length_squared() > 1e-6).then(|| d.y.atan2(d.x))
+}
+
+/// Where the pointer is round ring `k`, as an angle about its axis: in the
+/// ring's plane when the eye sees that plane well enough (exact, the ring
+/// follows the pointer), else round the pivot on screen (a ring seen edge
+/// on). `on_plane` picks which; keep the same for a whole drag.
+pub fn ring_angle(cam: &Camera, frame: &Frame, pivot: Vec3, k: usize, m: glam::Vec2, on_plane_: bool) -> Option<f32> {
+    if on_plane_ {
+        let q = on_plane(cam, frame, m.x, m.y, pivot, AXES[k])? - pivot;
+        let (u, v) = (AXES[(k + 1) % 3], AXES[(k + 2) % 3]);
+        return Some(q.dot(v).atan2(q.dot(u)));
+    }
+    let a = screen_angle(cam, frame, pivot, m)?;
+    // A positive turn about an axis pointing at the eye is anticlockwise
+    // on screen, so the screen angle (clockwise, y down) goes down.
+    Some(if AXES[k].dot(cam.eye - pivot) > 0.0 { -a } else { a })
+}
+
+/// Whether ring `k` is seen well enough to follow the pointer in its plane.
+pub fn ring_faces_eye(cam: &Camera, pivot: Vec3, k: usize) -> bool {
+    AXES[k].dot((cam.eye - pivot).normalize_or(Vec3::Z)).abs() > 0.25
 }
 
 /// The handle under pixel `m`, if any.
@@ -86,9 +118,15 @@ pub fn pick(cam: &Camera, frame: &Frame, tool: Tool, pivot: Vec3, m: glam::Vec2,
             best.map(|(_, k)| Handle::Axis(k))
         }
         Tool::Rotate => {
-            let pts: Vec<glam::Vec2> = ring_points(pivot, len).into_iter().filter_map(|p| screen(cam, frame, p)).collect();
-            let d = pts.windows(2).map(|w| seg_dist(m, w[0], w[1])).fold(f32::INFINITY, f32::min);
-            (d <= near).then_some(Handle::Ring)
+            let mut best: Option<(f32, usize)> = None;
+            for k in 0..3 {
+                let pts: Vec<glam::Vec2> = ring_points(pivot, k, len).into_iter().filter_map(|p| screen(cam, frame, p)).collect();
+                let d = pts.windows(2).map(|w| seg_dist(m, w[0], w[1])).fold(f32::INFINITY, f32::min);
+                if d <= near && best.is_none_or(|(bd, _)| d < bd) {
+                    best = Some((d, k));
+                }
+            }
+            best.map(|(_, k)| Handle::Ring(k))
         }
     }
 }
@@ -113,10 +151,12 @@ pub fn draw(frame: &mut Frame, cam: &Camera, tool: Tool, pivot: Vec3, hot: Optio
             square(frame, cam, pivot, 6.0 * px, col, tool == Tool::Move);
         }
         Tool::Rotate => {
-            let col = if hot == Some(Handle::Ring) { HOT } else { axis_colour(1) };
-            let pts = ring_points(pivot, len);
-            for w in pts.windows(2) {
-                thick_line(frame, cam, w[0], w[1], col);
+            for k in 0..3 {
+                let col = if hot == Some(Handle::Ring(k)) { HOT } else { axis_colour(k) };
+                let pts = ring_points(pivot, k, len);
+                for w in pts.windows(2) {
+                    thick_line(frame, cam, w[0], w[1], col);
+                }
             }
         }
     }
@@ -217,7 +257,11 @@ mod tests {
             assert_eq!(pick(&c, &f, Tool::Move, p, at(p + AXES[k] * len * 0.7), 1.0), Some(Handle::Axis(k)));
         }
         assert_eq!(pick(&c, &f, Tool::Move, p, at(p), 1.0), Some(Handle::Centre));
-        assert_eq!(pick(&c, &f, Tool::Rotate, p, at(p + Vec3::new(0.0, 0.0, len)), 1.0), Some(Handle::Ring));
+        // Each ring away from where the rings cross.
+        let d = std::f32::consts::FRAC_1_SQRT_2 * len;
+        assert_eq!(pick(&c, &f, Tool::Rotate, p, at(p + Vec3::new(0.0, d, d)), 1.0), Some(Handle::Ring(0)));
+        assert_eq!(pick(&c, &f, Tool::Rotate, p, at(p + Vec3::new(d, 0.0, d)), 1.0), Some(Handle::Ring(1)));
+        assert_eq!(pick(&c, &f, Tool::Rotate, p, at(p + Vec3::new(d, d, 0.0)), 1.0), Some(Handle::Ring(2)));
         assert_eq!(pick(&c, &f, Tool::Move, p, at(p) + glam::Vec2::new(200.0, 150.0), 1.0), None);
         assert_eq!(pick(&c, &f, Tool::Select, p, at(p), 1.0), None);
         // About 90 pixels long on screen.

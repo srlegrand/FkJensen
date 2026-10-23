@@ -1333,7 +1333,7 @@ mod tests {
         let ball: Vec<Vec3> = p.iter().map(|v| *v * 0.3 + Vec3::new(0.0, 0.6, 0.0)).collect();
         scene.push_mesh(&ball, &[], &[Vec3::new(0.8, 0.3, 0.2)], &idx);
         let n = scene.clusters.len();
-        scene.add_object("ball".into(), first..n, Vec3::new(0.0, 0.3, 0.0), 0.0);
+        scene.add_object("ball".into(), first..n, Vec3::new(0.0, 0.3, 0.0), Vec3::ZERO);
         let (w, h) = (200, 112);
         let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.6, 0.0), 4.0, 0.15);
         let mut settings = RenderSettings::new(Sky::new(30.0, true));
@@ -1341,7 +1341,7 @@ mod tests {
         let mut f = Frame::new(w, h);
         r.render(&scene, &cam, &lights, &settings, &mut f);
         let before = f.color.clone();
-        scene.set_object(0, Vec3::new(0.6, 0.3, 0.2), 0.5, 1.4);
+        scene.set_object(0, Vec3::new(0.6, 0.3, 0.2), Vec3::new(0.4, 0.5, -0.3), 1.4);
         r.moved(scene.objects[0].clusters.clone(), true);
         r.render(&scene, &cam, &lights, &settings, &mut f);
         assert_ne!(f.color, before, "the picture changed");

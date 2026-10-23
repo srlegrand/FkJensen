@@ -332,7 +332,7 @@ impl Editor {
     fn add_model(&mut self, mut model: crate::scene::Scene, name: String) {
         let n = model.clusters.len();
         model.objects.clear();
-        model.add_object(name.clone(), 0..n, glam::Vec3::ZERO, 0.0);
+        model.add_object(name.clone(), 0..n, glam::Vec3::ZERO, glam::Vec3::ZERO);
         let tris = model.triangle_count();
         let first = self.app.scene.objects.len();
         self.app.scene.append(model);
@@ -764,7 +764,7 @@ mod tests {
         let Selection::Object(g) = ed.app.selection else { panic!() };
         assert_eq!(ed.app.scene.objects[0].parent, Some(g));
         let before = ed.app.scene.objects[0].pivot;
-        ed.app.scene.set_object(g, glam::Vec3::new(1.0, 0.0, 0.0), 0.0, 1.0);
+        ed.app.scene.set_object(g, glam::Vec3::new(1.0, 0.0, 0.0), glam::Vec3::ZERO, 1.0);
         assert!((ed.app.scene.objects[0].pivot - before - glam::Vec3::X).length() < 1e-5);
         let path = std::env::temp_dir().join(format!("fkj-editor-{}.fkj", std::process::id()));
         ed.save(path.clone());

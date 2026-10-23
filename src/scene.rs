@@ -179,14 +179,26 @@ pub struct Object {
     /// The point it turns and scales about: the middle of its base when
     /// placed.
     pub pivot: Vec3,
-    /// Turn about the vertical, radians, and uniform scale, since placed.
-    pub yaw: f32,
+    /// Rotation since placed, radians about X, Y and Z, applied in that
+    /// order (Maya's xyz), and uniform scale since placed.
+    pub rotation: Vec3,
     pub scale: f32,
     /// Bounds of its finest level's vertices.
     pub lo: Vec3,
     pub hi: Vec3,
     /// The group it is in, if any (an index into `Scene::objects`).
     pub parent: Option<usize>,
+}
+
+/// The rotation of Euler angles `r` (radians), X first, then Y, then Z.
+pub fn euler_quat(r: Vec3) -> glam::Quat {
+    glam::Quat::from_euler(glam::EulerRot::ZYX, r.z, r.y, r.x)
+}
+
+/// Euler angles (radians, X then Y then Z) of a rotation.
+pub fn quat_euler(q: glam::Quat) -> Vec3 {
+    let (z, y, x) = q.to_euler(glam::EulerRot::ZYX);
+    Vec3::new(x, y, z)
 }
 
 impl Scene {
@@ -296,9 +308,9 @@ impl Scene {
     }
 
     /// Make clusters `clusters` an object turning about `pivot`, already
-    /// turned by `yaw`.
-    pub fn add_object(&mut self, name: String, clusters: std::ops::Range<usize>, pivot: Vec3, yaw: f32) -> usize {
-        self.objects.push(Object { name, clusters, pivot, yaw, scale: 1.0, lo: Vec3::ZERO, hi: Vec3::ZERO, parent: None });
+    /// turned by `rotation` (Euler angles, radians).
+    pub fn add_object(&mut self, name: String, clusters: std::ops::Range<usize>, pivot: Vec3, rotation: Vec3) -> usize {
+        self.objects.push(Object { name, clusters, pivot, rotation, scale: 1.0, lo: Vec3::ZERO, hi: Vec3::ZERO, parent: None });
         let i = self.objects.len() - 1;
         self.refresh_bounds(i);
         i
@@ -307,7 +319,7 @@ impl Scene {
     /// Make an empty group at `pivot`.
     pub fn add_group(&mut self, name: String, pivot: Vec3) -> usize {
         let n = self.clusters.len();
-        self.objects.push(Object { name, clusters: n..n, pivot, yaw: 0.0, scale: 1.0, lo: pivot, hi: pivot, parent: None });
+        self.objects.push(Object { name, clusters: n..n, pivot, rotation: Vec3::ZERO, scale: 1.0, lo: pivot, hi: pivot, parent: None });
         self.objects.len() - 1
     }
 
@@ -394,39 +406,39 @@ impl Scene {
             .unwrap_or((self.objects[i].lo, self.objects[i].hi))
     }
 
-    /// Place object `i` at `pivot`, turned to `yaw` and scaled to `scale`
-    /// (absolute, from how it was first placed): its vertices, normals,
-    /// clusters and levels of detail move with it. Turning about the
-    /// vertical and scaling the same on every axis keep each triangle's
-    /// corners in order, so its texture tile stays valid.
-    /// Everything under it moves with it, about its pivot.
-    pub fn set_object(&mut self, i: usize, pivot: Vec3, yaw: f32, scale: f32) {
+    /// Place object `i` at `pivot`, turned to `rotation` (Euler angles,
+    /// radians) and scaled to `scale`, all absolute, from how it was first
+    /// placed: its vertices, normals, clusters and levels of detail move
+    /// with it. A rotation and a uniform scale keep each triangle's corners
+    /// in order (no mirroring), so its texture tile stays valid. Everything
+    /// under it moves with it, about its pivot.
+    pub fn set_object(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: f32) {
         let o = self.objects[i].clone();
         let scale = scale.max(1e-4);
-        let (dyaw, k) = (yaw - o.yaw, scale / o.scale);
-        if pivot == o.pivot && dyaw == 0.0 && k == 1.0 {
+        let k = scale / o.scale;
+        if pivot == o.pivot && rotation == o.rotation && k == 1.0 {
             return;
         }
-        let q = glam::Quat::from_rotation_y(dyaw);
+        let q = euler_quat(rotation) * euler_quat(o.rotation).inverse();
         let map = |p: Vec3| q * ((p - o.pivot) * k) + pivot;
         for j in self.descendants(i) {
             let d = self.objects[j].clone();
-            self.place_one(j, map(d.pivot), d.yaw + dyaw, d.scale * k);
+            self.place_one(j, map(d.pivot), quat_euler(q * euler_quat(d.rotation)), d.scale * k);
         }
-        self.place_one(i, pivot, yaw, scale);
+        self.place_one(i, pivot, rotation, scale);
     }
 
     /// `set_object` for object `i` alone.
-    fn place_one(&mut self, i: usize, pivot: Vec3, yaw: f32, scale: f32) {
+    fn place_one(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: f32) {
         use rayon::prelude::*;
         let o = self.objects[i].clone();
-        let (dyaw, k) = (yaw - o.yaw, scale / o.scale);
-        let q = glam::Quat::from_rotation_y(dyaw);
+        let k = scale / o.scale;
+        let q = euler_quat(rotation) * euler_quat(o.rotation).inverse();
         let map = |p: Vec3| q * ((p - o.pivot) * k) + pivot;
         if o.clusters.is_empty() {
             let ob = &mut self.objects[i];
             ob.pivot = pivot;
-            ob.yaw = yaw;
+            ob.rotation = rotation;
             ob.scale = scale;
             self.refresh_bounds(i);
             return;
@@ -444,7 +456,7 @@ impl Scene {
         }
         let ob = &mut self.objects[i];
         ob.pivot = pivot;
-        ob.yaw = yaw;
+        ob.rotation = rotation;
         ob.scale = scale;
         self.refresh_bounds(i);
         let (lo, hi) = (self.objects[i].lo, self.objects[i].hi);
@@ -774,10 +786,10 @@ pub mod tests {
         let first = s.clusters.len();
         let lifted: Vec<Vec3> = p.iter().map(|v| *v + Vec3::Y).collect();
         s.push_mesh(&lifted, &[], &[], &idx);
-        s.add_object("ball".into(), first..s.clusters.len(), Vec3::ZERO, 0.0);
+        s.add_object("ball".into(), first..s.clusters.len(), Vec3::ZERO, Vec3::ZERO);
         let before = s.positions.clone();
         let (yaw, k, to) = (0.7f32, 2.0f32, Vec3::new(3.0, 0.0, -2.0));
-        s.set_object(0, to, yaw, k);
+        s.set_object(0, to, Vec3::new(0.0, yaw, 0.0), k);
         let q = glam::Quat::from_rotation_y(yaw);
         let vbase = s.clusters[first].first_vertex as usize;
         for v in vbase..s.positions.len() {
@@ -791,7 +803,7 @@ pub mod tests {
             }
         }
         // And back, from the absolute placement.
-        s.set_object(0, Vec3::ZERO, 0.0, 1.0);
+        s.set_object(0, Vec3::ZERO, Vec3::ZERO, 1.0);
         for v in vbase..s.positions.len() {
             assert!(s.positions[v].distance(before[v]) < 1e-4);
         }
@@ -807,10 +819,10 @@ pub mod tests {
         let mut s = Scene::new();
         let a0 = s.clusters.len();
         s.push_mesh(&p.iter().map(|v| *v * 0.5 + Vec3::new(2.0, 0.5, 0.0)).collect::<Vec<_>>(), &[], &[], &idx);
-        let a = s.add_object("a".into(), a0..s.clusters.len(), Vec3::new(2.0, 0.0, 0.0), 0.0);
+        let a = s.add_object("a".into(), a0..s.clusters.len(), Vec3::new(2.0, 0.0, 0.0), Vec3::ZERO);
         let b0 = s.clusters.len();
         s.push_mesh(&p.iter().map(|v| *v * 0.5 + Vec3::new(-2.0, 0.5, 0.0)).collect::<Vec<_>>(), &[], &[], &idx);
-        let b = s.add_object("b".into(), b0..s.clusters.len(), Vec3::new(-2.0, 0.0, 0.0), 0.0);
+        let b = s.add_object("b".into(), b0..s.clusters.len(), Vec3::new(-2.0, 0.0, 0.0), Vec3::ZERO);
         let g = s.add_group("g".into(), Vec3::ZERO);
         let top = s.add_group("top".into(), Vec3::ZERO);
         assert!(s.set_parent(a, Some(g)) && s.set_parent(b, Some(g)) && s.set_parent(g, Some(top)));
@@ -820,18 +832,61 @@ pub mod tests {
         let (lo, hi) = s.object_bounds(top);
         assert!((lo.x + 2.5).abs() < 0.01 && (hi.x - 2.5).abs() < 0.01, "{lo} {hi}");
         // A half turn and twice the size about the origin: a goes to x = -4.
-        s.set_object(top, Vec3::new(0.0, 0.0, 1.0), std::f32::consts::PI, 2.0);
+        s.set_object(top, Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, std::f32::consts::PI, 0.0), 2.0);
         let oa = &s.objects[a];
         assert!(oa.pivot.distance(Vec3::new(-4.0, 0.0, 1.0)) < 1e-4, "{}", oa.pivot);
-        assert!((oa.scale - 2.0).abs() < 1e-5 && (oa.yaw - std::f32::consts::PI).abs() < 1e-5);
+        assert!((oa.scale - 2.0).abs() < 1e-5 && euler_quat(oa.rotation).angle_between(glam::Quat::from_rotation_y(std::f32::consts::PI)) < 1e-4);
         let (lo, hi) = s.object_bounds(a);
         assert!(((lo + hi) * 0.5).distance(Vec3::new(-4.0, 1.0, 1.0)) < 0.02, "{lo} {hi}");
         assert_eq!(s.moving_clusters(top).len(), 2);
         // Out of the group: moving the group leaves it.
         assert!(s.set_parent(a, None));
         let before = s.objects[a].pivot;
-        s.set_object(top, Vec3::ZERO, 0.0, 1.0);
+        s.set_object(top, Vec3::ZERO, Vec3::ZERO, 1.0);
         assert_eq!(s.objects[a].pivot, before);
+    }
+
+    /// Euler angles turn X first, then Y, then Z, as Maya's xyz order, and
+    /// come back from the rotation they make.
+    #[test]
+    fn euler_angles_follow_maya_order() {
+        let h = std::f32::consts::FRAC_PI_2;
+        // About Y a quarter turn: X goes to -Z.
+        assert!((euler_quat(Vec3::new(0.0, h, 0.0)) * Vec3::X).distance(Vec3::NEG_Z) < 1e-5);
+        // X then Y: Y goes to Z, then to X.
+        assert!((euler_quat(Vec3::new(h, h, 0.0)) * Vec3::Y).distance(Vec3::X) < 1e-5);
+        let r = Vec3::new(0.3, -0.7, 1.1);
+        assert!(quat_euler(euler_quat(r)).distance(r) < 1e-5);
+    }
+
+    /// Turned about any axis, an object's vertices, normals and bounds
+    /// follow, and turning it back restores it.
+    #[test]
+    fn objects_turn_about_any_axis() {
+        let (p, idx) = uv_sphere(16);
+        let mut s = Scene::new();
+        let lifted: Vec<Vec3> = p.iter().map(|v| *v * Vec3::new(2.0, 0.5, 0.5) + Vec3::Y).collect();
+        s.push_mesh(&lifted, &[], &[], &idx);
+        let o = s.add_object("long".into(), 0..s.clusters.len(), Vec3::ZERO, Vec3::ZERO);
+        let before = s.positions.clone();
+        let r = Vec3::new(0.0, 0.0, std::f32::consts::FRAC_PI_2);
+        s.set_object(o, Vec3::ZERO, r, 1.0);
+        let q = euler_quat(r);
+        for (a, b) in before.iter().zip(&s.positions) {
+            assert!((q * *a).distance(*b) < 1e-4);
+        }
+        // Stood on end: tall now, not long.
+        let (lo, hi) = s.object_bounds(o);
+        assert!(hi.y - lo.y > 3.9 && hi.x - lo.x < 1.1, "{lo} {hi}");
+        for c in &s.clusters {
+            for v in c.first_vertex..c.first_vertex + c.vertex_count {
+                assert!(s.positions[v as usize].distance(c.centre) <= c.radius + 1e-4);
+            }
+        }
+        s.set_object(o, Vec3::ZERO, Vec3::ZERO, 1.0);
+        for (a, b) in before.iter().zip(&s.positions) {
+            assert!(a.distance(*b) < 1e-4);
+        }
     }
 
     #[test]

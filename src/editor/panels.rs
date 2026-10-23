@@ -179,7 +179,7 @@ impl Editor {
         });
         ui.add_space(4.0);
         let o = self.app.scene.objects[i].clone();
-        let (mut p, mut yaw, mut k) = (o.pivot, o.yaw.to_degrees(), o.scale);
+        let (mut p, mut r, mut k) = (o.pivot, o.rotation * (180.0 / std::f32::consts::PI), o.scale);
         let speed = (self.app.scene.focus_radius() as f64 * 0.004).max(0.0005);
         let mut changed = false;
         egui::CollapsingHeader::new("Transform").default_open(true).show(ui, |ui| {
@@ -189,17 +189,19 @@ impl Editor {
                     changed |= ui.add(egui::DragValue::new(v).speed(speed).max_decimals(3)).changed();
                 }
                 ui.end_row();
-                ui.label("Rotate Y");
-                changed |= ui.add(egui::DragValue::new(&mut yaw).speed(0.5).max_decimals(2).suffix("°")).changed();
+                ui.label("Rotate");
+                for v in [&mut r.x, &mut r.y, &mut r.z] {
+                    changed |= ui.add(egui::DragValue::new(v).speed(0.5).max_decimals(2).suffix("°")).changed();
+                }
                 ui.end_row();
                 ui.label("Scale");
                 changed |= ui.add(egui::DragValue::new(&mut k).speed(0.005).range(0.001..=1000.0).max_decimals(3)).changed();
                 ui.end_row();
             });
-            ui.weak("Turns about the vertical and scales the same on every axis, so the texture tiles stay valid.");
+            ui.weak("Rotates X, then Y, then Z. Scales the same on every axis, so the texture tiles stay valid.");
         });
         if changed {
-            self.app.scene.set_object(i, p, yaw.to_radians(), k);
+            self.app.scene.set_object(i, p, r * (std::f32::consts::PI / 180.0), k);
             for r in self.app.scene.moving_clusters(i) {
                 self.app.renderer.moved(r, false);
             }

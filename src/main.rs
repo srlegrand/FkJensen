@@ -107,7 +107,7 @@ Controls
   Q / W / E / R          select / move / rotate / scale manipulator
   drag an arrow          move along that axis (X red, Y green, Z blue)
   drag the centre        move facing the camera (move), scale (scale)
-  drag the ring          turn about the vertical (rotate)
+  drag a ring            turn about that axis (rotate; X red, Y green, Z blue)
   F                      frame the selection (the subject when none)
   A                      frame the subject from afar
 
@@ -168,7 +168,8 @@ struct ManipDrag {
     tool: manip::Tool,
     handle: manip::Handle,
     pivot: Vec3,
-    yaw: f32,
+    /// Euler angles, radians.
+    rotation: Vec3,
     scale: f32,
     /// Where the pointer took the handle: along the axis, on the plane, the
     /// angle on the ground plane, or the pointer's x.
@@ -394,27 +395,28 @@ impl App {
         let cam = self.render_camera();
         let len = manip::handle_length(&cam, self.frame.height, pivot);
         let (x, y) = self.mouse;
-        let (yaw, scale) = match self.selection {
-            Selection::Object(i) => (self.scene.objects[i].yaw, self.scene.objects[i].scale),
-            _ => (0.0, 1.0),
+        let (rotation, scale) = match self.selection {
+            Selection::Object(i) => (self.scene.objects[i].rotation, self.scene.objects[i].scale),
+            _ => (Vec3::ZERO, 1.0),
         };
         let grab = match (tool, handle) {
             (_, manip::Handle::Axis(k)) => Vec3::splat(manip::along_axis(&cam, &self.frame, x, y, pivot, manip::AXES[k]).unwrap_or(0.0)),
             (manip::Tool::Move, manip::Handle::Centre) => manip::on_plane(&cam, &self.frame, x, y, pivot, (pivot - cam.eye).normalize_or(Vec3::Z)).unwrap_or(pivot),
-            (_, manip::Handle::Ring) => {
-                let q = manip::on_plane(&cam, &self.frame, x, y, pivot, Vec3::Y).unwrap_or(pivot + Vec3::X) - pivot;
-                Vec3::splat(q.z.atan2(q.x))
+            (_, manip::Handle::Ring(k)) => {
+                // x: the angle taken; y: 1 when followed in the ring's plane.
+                let flat = manip::ring_faces_eye(&cam, pivot, k);
+                Vec3::new(manip::ring_angle(&cam, &self.frame, pivot, k, glam::Vec2::new(x, y), flat).unwrap_or(0.0), flat as u8 as f32, 0.0)
             }
             _ => Vec3::splat(x),
         };
-        self.manip = Some(ManipDrag { target: self.selection, tool, handle, pivot, yaw, scale, grab, len });
+        self.manip = Some(ManipDrag { target: self.selection, tool, handle, pivot, rotation, scale, grab, len });
     }
 
     fn update_manip(&mut self) {
         let Some(m) = &self.manip else { return };
         let cam = self.render_camera();
         let (x, y) = self.mouse;
-        let (mut pivot, mut yaw, mut scale) = (m.pivot, m.yaw, m.scale);
+        let (mut pivot, mut rotation, mut scale) = (m.pivot, m.rotation, m.scale);
         match (m.tool, m.handle) {
             (manip::Tool::Move, manip::Handle::Axis(k)) => {
                 if let Some(t) = manip::along_axis(&cam, &self.frame, x, y, m.pivot, manip::AXES[k]) {
@@ -426,10 +428,11 @@ impl App {
                     pivot = m.pivot + (q - m.grab);
                 }
             }
-            (manip::Tool::Rotate, _) => {
-                if let Some(q) = manip::on_plane(&cam, &self.frame, x, y, m.pivot, Vec3::Y) {
-                    let q = q - m.pivot;
-                    yaw = m.yaw - (q.z.atan2(q.x) - m.grab.x);
+            (manip::Tool::Rotate, manip::Handle::Ring(k)) => {
+                if let Some(a) = manip::ring_angle(&cam, &self.frame, m.pivot, k, glam::Vec2::new(x, y), m.grab.y > 0.5) {
+                    let turn = a - m.grab.x;
+                    let q = glam::Quat::from_axis_angle(manip::AXES[k], turn) * scene::euler_quat(m.rotation);
+                    rotation = scene::quat_euler(q);
                 }
             }
             (manip::Tool::Scale, manip::Handle::Axis(k)) => {
@@ -442,7 +445,7 @@ impl App {
         }
         match m.target {
             Selection::Object(i) => {
-                self.scene.set_object(i, pivot, yaw, scale);
+                self.scene.set_object(i, pivot, rotation, scale);
                 for r in self.scene.moving_clusters(i) {
                     self.renderer.moved(r, false);
                 }
@@ -926,7 +929,7 @@ fn prepare_opened(scene: &mut Scene, path: &Path) {
         let (lo, hi) = (scene.bounds_min, scene.bounds_max);
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let n = scene.clusters.len();
-        scene.add_object(name, 0..n, Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5), 0.0);
+        scene.add_object(name, 0..n, Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5), Vec3::ZERO);
     }
     if scene.focus.is_none() {
         scene.focus = (0..scene.objects.len()).filter(|&i| !scene.objects[i].clusters.is_empty()).map(|i| scene.object_bounds(i)).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
@@ -1122,7 +1125,7 @@ fn add_models(scene: &mut Scene, highres: bool) -> Option<(Vec3, Vec3)> {
                 m.place(yaw.to_radians(), 1.0, at);
                 let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let n = m.clusters.len();
-                m.add_object(name, 0..n, at, yaw.to_radians());
+                m.add_object(name, 0..n, at, Vec3::new(0.0, yaw.to_radians(), 0.0));
                 let (lo, hi) = (m.bounds_min, m.bounds_max);
                 bounds = Some(match bounds {
                     Some((a, b)) => (a.min(lo), b.max(hi)),
@@ -1705,7 +1708,7 @@ mod tests {
         let ball: Vec<Vec3> = p.iter().map(|v| *v * 0.5 + Vec3::new(0.0, 0.5, 0.0)).collect();
         scene.push_mesh(&ball, &[], &[], &idx);
         let n = scene.clusters.len();
-        scene.add_object("ball".into(), first..n, Vec3::ZERO, 0.0);
+        scene.add_object("ball".into(), first..n, Vec3::ZERO, Vec3::ZERO);
         scene.focus = Some((Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 1.0, 1.0)));
         let mut app = App::new(scene, "ball".into());
         app.cam.look_from(Vec3::new(2.0, 2.5, 4.0), Vec3::new(0.0, 0.4, 0.0));
@@ -1767,15 +1770,33 @@ mod tests {
         app.key(KeyCode::KeyE, true);
         app.render();
         let len = manip::handle_length(&app.render_camera(), app.frame.height, Vec3::ZERO);
-        let (rx, ry) = screen_of(&app, Vec3::new(len, 0.0, 0.0));
+        // Take the Y ring at 45 degrees (where no other ring is) and carry
+        // it a quarter turn round.
+        let ring = |a: f32| Vec3::new(a.cos(), 0.0, a.sin()) * len;
+        let q45 = std::f32::consts::FRAC_PI_4;
+        let (rx, ry) = screen_of(&app, ring(q45));
         app.on_cursor(rx, ry);
-        assert_eq!(app.hot, Some(manip::Handle::Ring));
+        assert_eq!(app.hot, Some(manip::Handle::Ring(1)));
         app.on_button(0, true);
-        let (sx, sy) = screen_of(&app, Vec3::new(0.0, 0.0, -len));
+        let (sx, sy) = screen_of(&app, ring(q45 - std::f32::consts::FRAC_PI_2));
         app.on_cursor(sx, sy);
         app.on_button(0, false);
-        let yaw = app.scene.objects[0].yaw;
-        assert!((yaw - std::f32::consts::FRAC_PI_2).abs() < 0.1, "{yaw}");
+        let r = app.scene.objects[0].rotation;
+        let turned = scene::euler_quat(r) * Vec3::X;
+        assert!(turned.distance(Vec3::NEG_Z) < 0.1, "{r} turns X to {turned}");
+        // The Z ring tips it over: X goes up.
+        app.scene.set_object(0, Vec3::ZERO, Vec3::ZERO, 1.0);
+        app.render();
+        let ringz = |a: f32| Vec3::new(a.cos(), a.sin(), 0.0) * len;
+        let (rx, ry) = screen_of(&app, ringz(-q45));
+        app.on_cursor(rx, ry);
+        assert_eq!(app.hot, Some(manip::Handle::Ring(2)));
+        app.on_button(0, true);
+        let (sx, sy) = screen_of(&app, ringz(q45));
+        app.on_cursor(sx, sy);
+        app.on_button(0, false);
+        let turned = scene::euler_quat(app.scene.objects[0].rotation) * Vec3::X;
+        assert!(turned.distance(Vec3::Y) < 0.15, "X turned to {turned}");
         app.key(KeyCode::KeyR, true);
         app.render();
         let (cx, cy) = screen_of(&app, Vec3::ZERO);

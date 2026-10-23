@@ -426,7 +426,7 @@ of each pass in milliseconds.
     Q / W / E / R          select / move / rotate / scale manipulator
     drag an arrow          move along that axis (X red, Y green, Z blue)
     drag the centre        move facing the camera (move), scale (scale)
-    drag the ring          turn about the vertical (rotate)
+    drag a ring            turn about that axis (rotate; X red, Y green, Z blue)
     F                      frame the selection (the subject when none)
     A                      frame the subject from afar
 
@@ -473,9 +473,10 @@ selects the light and starts dragging it. A rig holds 64 lights at most.
 Selecting and moving work as in Maya. Clicking a model selects it (a box
 round it, its manipulator at its pivot, the middle of its base): W shows
 arrows along X, Y and Z and a square that moves it facing the camera, E a
-ring that turns it about the vertical, R a uniform scale (a model only
-turns about the vertical and scales the same on every axis, so its texture
-tiles stay valid). Q hides the manipulator. A light selected with the move
+ring about each axis (world axes), R a uniform scale (a model scales the
+same on every axis, and a turn never mirrors it, so its texture tiles stay
+valid). A ring follows the pointer in its own plane, or round the pivot
+on screen when it is seen nearly edge on. Q hides the manipulator. A light selected with the move
 manipulator gets the arrows too. While a model is dragged its vertices are
 rewritten, its shading dropped, everything else lit again and the shadow
 maps made again each frame; bounce light is made again when it is let go.
@@ -505,7 +506,8 @@ with egui, on the CPU like everything else: egui's triangles are filled by
   "Objects" to take it out. A group moves, turns and scales everything
   under it about its pivot.
 - **Attribute editor** on the right, for what is selected: an object's
-  name, translate, rotate about the vertical, uniform scale, triangles,
+  name, translate, rotate about X, Y and Z (degrees, X first, then Y,
+  then Z, as Maya's xyz order), uniform scale, triangles,
   levels of detail and size; a light's position, lumens and colour; the
   sun's time and brightness; the sky's illuminance, both contrasts and the
   exposure; the render settings (micropolygon spacing, resolution, shadows,
