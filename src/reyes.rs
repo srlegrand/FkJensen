@@ -522,7 +522,7 @@ impl Renderer {
     pub fn render(&mut self, scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &RenderSettings, frame: &mut Frame) {
         let n_lights = lights.len().min(64);
         let lights = &lights[..n_lights];
-        let key = (scene.positions.as_ptr() as usize, scene.positions.len(), scene.clusters.len());
+        let key = (scene.qpos.as_ptr() as usize, scene.qpos.len(), scene.clusters.len());
         if key != self.scene_key {
             *self = Self::new();
             self.scene_key = key;
@@ -823,9 +823,8 @@ impl Renderer {
                 while bits != 0 {
                     let u = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    let t = (c.first_tri as usize + u) * 3;
-                    let idx = [scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize];
-                    let corners = idx.map(|i| scene.positions[i]);
+                    let idx = scene.tri(c, c.first_tri + u as u32);
+                    let corners = idx.map(|i| scene.pos(c, i));
                     let cur = match e.state[u] {
                         UNDICED | ON_VERTICES => None,
                         i => Some(i as usize),
@@ -952,7 +951,7 @@ impl Renderer {
                         bits &= bits - 1;
                         let v = fv + u;
                         let side = if e.vback & (1u128 << u) != 0 { -1.0 } else { 1.0 };
-                        batch.push(scene.positions[v], scene.normals[v] * side, scene.colors[v]);
+                        batch.push(scene.pos(c, v), scene.normal(v) * side, scene.color(v));
                         vdest.push(u);
                     }
                     let mut bits = tbits;
@@ -960,16 +959,15 @@ impl Renderer {
                         let u = bits.trailing_zeros() as usize;
                         bits &= bits - 1;
                         let d = e.grids[e.state[u] as usize];
-                        let t = (c.first_tri as usize + u) * 3;
-                        let (i0, i1, i2) = (scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize);
-                        let (p0, p1, p2) = (scene.positions[i0], scene.positions[i1], scene.positions[i2]);
+                        let [i0, i1, i2] = scene.tri(c, c.first_tri + u as u32);
+                        let (p0, p1, p2) = (scene.pos(c, i0), scene.pos(c, i1), scene.pos(c, i2));
                         let side = if e.back & (1u128 << u) != 0 { -1.0 } else { 1.0 };
                         let (nu, nv) = (1usize << d.lu, 1usize << d.lv);
                         gdest.push((d.offset as usize, (nu + 1) * (nv + 1)));
                         dims.push((nu, nv));
                         let (s0, su, sv) = d.screen_affine();
-                        let (n0, n1, n2) = (scene.normals[i0], scene.normals[i1], scene.normals[i2]);
-                        let (c0, c1, c2) = (scene.colors[i0], scene.colors[i1], scene.colors[i2]);
+                        let (n0, n1, n2) = (scene.normal(i0), scene.normal(i1), scene.normal(i2));
+                        let (c0, c1, c2) = (scene.color(i0), scene.color(i1), scene.color(i2));
                         // Eight points of a row at a time.
                         use crate::simd::F;
                         let steps = F::from([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
@@ -1022,7 +1020,7 @@ impl Renderer {
                         let u = bits.trailing_zeros() as usize;
                         bits &= bits - 1;
                         let v = fv + u;
-                        let back = scene.normals[v].dot(eye - scene.positions[v]) < 0.0;
+                        let back = scene.normal(v).dot(eye - scene.pos(c, v)) < 0.0;
                         let bit = 1u128 << u;
                         if e.vdone & bit == 0 || ((e.vback & bit != 0) != back) {
                             vdiff |= bit;
@@ -1034,10 +1032,9 @@ impl Renderer {
                     while bits != 0 {
                         let u = bits.trailing_zeros() as usize;
                         bits &= bits - 1;
-                        let t = (c.first_tri as usize + u) * 3;
-                        let (i0, i1, i2) = (scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize);
-                        let (p0, p1, p2) = (scene.positions[i0], scene.positions[i1], scene.positions[i2]);
-                        let fnrm = scene.normals[i0] + scene.normals[i1] + scene.normals[i2];
+                        let [i0, i1, i2] = scene.tri(c, c.first_tri + u as u32);
+                        let (p0, p1, p2) = (scene.pos(c, i0), scene.pos(c, i1), scene.pos(c, i2));
+                        let fnrm = scene.normal(i0) + scene.normal(i1) + scene.normal(i2);
                         let back = fnrm.dot(eye - (p0 + p1 + p2) / 3.0) < 0.0;
                         let bit = 1u128 << u;
                         if e.done & bit == 0 || ((e.back & bit != 0) != back) {
@@ -1286,14 +1283,13 @@ impl Renderer {
                 if let Some(b) = bounce {
                     // Bounce light, from the cluster's spherical harmonics,
                     // with the normal turned to the eye.
-                    let t = s.tri as usize * 3;
-                    let (i0, i1, i2) = (scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize);
-                    let p = scene.positions[i0] * w[0] + scene.positions[i1] * w[1] + scene.positions[i2] * w[2];
-                    let mut n = (scene.normals[i0] * w[0] + scene.normals[i1] * w[1] + scene.normals[i2] * w[2]).normalize_or(Vec3::Y);
+                    let [i0, i1, i2] = scene.tri(c, s.tri);
+                    let p = scene.pos(c, i0) * w[0] + scene.pos(c, i1) * w[1] + scene.pos(c, i2) * w[2];
+                    let mut n = (scene.normal(i0) * w[0] + scene.normal(i1) * w[1] + scene.normal(i2) * w[2]).normalize_or(Vec3::Y);
                     if n.dot(eye - p) < 0.0 {
                         n = -n;
                     }
-                    let albedo = scene.colors[i0] * w[0] + scene.colors[i1] * w[1] + scene.colors[i2] * w[2];
+                    let albedo = scene.color(i0) * w[0] + scene.color(i1) * w[1] + scene.color(i2) * w[2];
                     radiance += albedo * b.irradiance_at(scene, s.cluster as usize, s.tri, w, n) * std::f32::consts::FRAC_1_PI;
                 }
                 row[x] = raster::pack(raster::tonemap(radiance * exposure));
@@ -1364,10 +1360,10 @@ fn lookup_part(scene: &Scene, c: &crate::scene::Cluster, e: &ClusterShade, tri: 
         return Vec3::ZERO;
     }
     if state == ON_VERTICES {
-        let t = tri as usize * 3;
+        let l = scene.tris[tri as usize];
         let mut r = Vec3::ZERO;
         for k in 0..3 {
-            let v = (scene.indices[t + k] - c.first_vertex) as usize;
+            let v = l[k] as usize;
             r += match part {
                 Part::All => e.vdiffuse[v] + e.vspec[v],
                 Part::Highlight => e.vspec[v],
@@ -2253,15 +2249,18 @@ mod tests {
         // Looking down from the side, so the floor under the card shows.
         let cam = cam_at(0.0, w, h, Vec3::ZERO, 3.0, 1.0);
         let on = RenderSettings::new(Sky::new(1.0, false));
+        // Every point shaded: adaptive shading refines where the shadow
+        // makes an edge, so a point there can come out a level above its
+        // interpolated self without the shadow.
         let mut a = Frame::new(w, h);
-        render(&scene, &cam, &lights, &RenderSettings { exposure: 0.01, ..on }, &mut a);
+        render(&scene, &cam, &lights, &RenderSettings { exposure: 0.01, adaptive: false, ..on }, &mut a);
         let mut b = Frame::new(w, h);
-        render(&scene, &cam, &lights, &RenderSettings { exposure: 0.01, shadows: false, ..RenderSettings::new(Sky::new(1.0, false)) }, &mut b);
+        render(&scene, &cam, &lights, &RenderSettings { exposure: 0.01, shadows: false, adaptive: false, ..on }, &mut b);
         // Pixels where the floor shows in both and differs: under the card's shadow.
         let darker = a.color.iter().zip(&b.color).filter(|(x, y)| (**x & 0xff) + 20 < (**y & 0xff)).count();
         assert!(darker > 50, "{darker} pixels darker with shadows");
-        let brighter = a.color.iter().zip(&b.color).filter(|(x, y)| (**x & 0xff) > (**y & 0xff)).count();
-        assert_eq!(brighter, 0);
+        let brighter: Vec<(usize, u32, u32)> = a.color.iter().zip(&b.color).enumerate().filter(|(_, (x, y))| (**x & 0xff) > (**y & 0xff)).map(|(i, (x, y))| (i, *x, *y)).collect();
+        assert!(brighter.is_empty(), "{brighter:x?}");
     }
 
     /// A textured quad is shaded from its tiles, not its vertex colours.

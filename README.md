@@ -285,7 +285,8 @@ parts whose open edges never move. The high-resolution file grows from
 texture's own detail until a level's error passes twice a texel, and the
 fine levels are all limited by the texture, not the error. The tiles stay
 in the file and are read for what is seen; in memory the program peaks at
-about 2 GB with it (2.6 GB before levels). Git LFS stores the file whole:
+about 1.2 GB with it (2 GB before geometry was held quantised, 2.6 GB
+before levels). Git LFS stores the file whole:
 its storage and bandwidth count against the account's LFS quota.
 
 Decoded at full size, without mips, those textures alone are 71 MB of RGB.
@@ -672,6 +673,27 @@ a few pixels, with grids too small to skip much in. Picture: of 921,600
 pixels, 422 (wide) and 682 (close) differ by more than 2 of 255, at most
 by 20 and 43, along sharp highlights and shadow edges.
 
+Geometry held as the file stores it (16-bit positions in each cluster's
+box, 16-bit octahedral normals, 8-bit sRGB colours, byte corners), the
+same machine, `--png` at 1280 x 720, peak resident memory, and best of
+three runs of `--bench-drag`:
+
+| | f32 in memory | quantised |
+|---|---|---|
+| high-resolution T-rex: peak memory | 2,008 MB | 1,237 MB |
+| geometry (25.5 M vertices, 25.0 M triangles) | 1,162 MB | 388 MB |
+| reading the file | 1.49 s | 0.88 s |
+| dragging the key light, a frame | 318 to 331 ms | 327 to 337 ms |
+| resolve in it | 49 to 50 ms | 54 to 57 ms |
+| low-resolution T-rex: peak memory | 517 MB | 517 MB |
+
+Frame time is the same within noise; the resolve decodes three normals a
+pixel for the bounce light and is 5 ms slower. The T-rex and the car draw
+exactly as before (the file's values are kept, not decoded and stored
+again); the ground and the mountains, made in code, are now quantised
+too, and differ by 1 of 255 in places, at most 87 of 255 at 15 pixels
+without bounce light.
+
 Moving the high-resolution T-rex 10 cm five times (`--bench-move`), one
 run each, steps 1 to 5:
 
@@ -867,11 +889,11 @@ Not measured yet: a Raspberry Pi.
 - The shading cache holds 118 MB for that view (186 MB before even
   dicing). Only the shading cache has a budget: geometry, shadow maps
   and surfels are as large as the scene makes them. With the
-  high-resolution T-rex the program needs
-  about 2.6 GB (each frame's setup records alone are about 1 GB), and with the low-resolution one it still does not fit: geometry is decoded to f32 at load and every visible triangle
-  gets a setup record each frame, so it does not fit a 256 MB Raspberry
-  Pi 1. Quantised geometry in memory, cluster level of detail and
-  per-bucket setup are what it needs.
+  high-resolution T-rex the program peaks at about 1.2 GB, and with the
+  low-resolution one at about 520 MB, most of it the caches' budgets
+  and the bounce light's surfels; every visible triangle gets a setup
+  record each frame. It does not fit a 256 MB Raspberry Pi 1 yet;
+  per-bucket setup and caches sized for it are what it needs.
 - Each triangle above two pixels has its own grid, covering twice its
   area; neighbours share no points. Light that changes faster than the
   micropolygons (a lamp 10 cm off a surface diced at 3 cm) leaves a seam

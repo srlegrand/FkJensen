@@ -28,7 +28,7 @@ use glam::{Mat4, Vec3, Vec4};
 
 use std::sync::Arc;
 
-use crate::scene::{Cluster, PointLight, Scene};
+use crate::scene::{oct_encode, Cluster, PointLight, Scene};
 use crate::texture::{level_offset, Source, TexEntry};
 
 pub const MAGIC: [u8; 4] = *b"FKJ\0";
@@ -56,38 +56,6 @@ pub struct InstanceGroup {
 const CLUSTER_BYTES: usize = 64;
 
 // ---------------------------------------------------------------- encoding
-
-fn oct_encode(n: Vec3) -> [u16; 2] {
-    let n = n.normalize_or(Vec3::Y);
-    let l1 = n.x.abs() + n.y.abs() + n.z.abs();
-    let (mut x, mut y) = (n.x / l1, n.y / l1);
-    if n.z < 0.0 {
-        let (ox, oy) = (x, y);
-        x = (1.0 - oy.abs()) * ox.signum();
-        y = (1.0 - ox.abs()) * oy.signum();
-    }
-    let q = |v: f32| ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0).round() as u16;
-    [q(x), q(y)]
-}
-
-fn oct_decode(e: [u16; 2]) -> Vec3 {
-    let x = e[0] as f32 / 65535.0 * 2.0 - 1.0;
-    let y = e[1] as f32 / 65535.0 * 2.0 - 1.0;
-    let z = 1.0 - x.abs() - y.abs();
-    let (x, y) = if z < 0.0 { ((1.0 - y.abs()) * x.signum(), (1.0 - x.abs()) * y.signum()) } else { (x, y) };
-    Vec3::new(x, y, z).normalize_or(Vec3::Y)
-}
-
-fn linear_to_srgb8(v: f32) -> u8 {
-    let v = v.clamp(0.0, 1.0);
-    let s = if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
-    (s * 255.0).round() as u8
-}
-
-fn srgb8_to_linear(v: u8) -> f32 {
-    let s = v as f32 / 255.0;
-    if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
-}
 
 struct W(Vec<u8>);
 
@@ -144,30 +112,22 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
     // MESH
     let mut m = W(Vec::new());
     m.u32(scene.clusters.len() as u32);
-    m.u32(scene.positions.len() as u32);
+    m.u32(scene.vertex_count() as u32);
     m.u32(scene.triangle_count() as u32);
     m.u32(0);
     m.v3(scene.bounds_min);
     m.v3(scene.bounds_max);
-    let mut quant: Vec<(Vec3, Vec3)> = Vec::with_capacity(scene.clusters.len());
+    // Geometry is held as the file stores it (`scene.rs`): written as is.
     for c in &scene.clusters {
-        let vs = &scene.positions[c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize];
-        let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
-        for p in vs {
-            lo = lo.min(*p);
-            hi = hi.max(*p);
-        }
-        let step = (hi - lo) / 65535.0;
-        quant.push((lo, step));
+        let (lo, step) = (c.qlo, c.qstep);
         m.u32(c.first_vertex);
         m.u16(c.vertex_count as u16);
         m.u16(c.tri_count as u16);
         m.u32(c.first_tri);
         m.u32(0);
         m.v3(c.centre);
-        // Grow the sphere by the quantisation error so it still holds the
-        // decoded positions.
-        m.f32(c.radius + step.length() * 0.5);
+        // Its sphere already holds the quantised positions.
+        m.f32(c.radius);
         m.v3(lo);
         m.v3(step);
         let q = |v: f32| (v.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8;
@@ -178,31 +138,23 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
         // The 8-bit axis can be off by about 0.6 degrees: widen the cone.
         m.f32(if c.cone_cos > 0.0 { (c.cone_cos.acos() + 0.012).cos() } else { -1.0 });
     }
-    for n in &scene.normals {
-        let e = oct_encode(*n);
+    for e in &scene.qnrm {
         m.u16(e[0]);
         m.u16(e[1]);
     }
-    for c in &scene.colors {
-        m.u8(linear_to_srgb8(c.x));
-        m.u8(linear_to_srgb8(c.y));
-        m.u8(linear_to_srgb8(c.z));
+    for c in &scene.qcol {
+        m.0.extend_from_slice(c);
         m.u8(255);
     }
-    for (c, (lo, step)) in scene.clusters.iter().zip(&quant) {
-        for p in &scene.positions[c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize] {
-            for k in 0..3 {
-                let v = if step[k] > 0.0 { ((p[k] - lo[k]) / step[k]).round().clamp(0.0, 65535.0) as u16 } else { 0 };
-                m.u16(v);
+    for c in &scene.clusters {
+        for q in &scene.qpos[c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize] {
+            for v in q {
+                m.u16(*v);
             }
         }
     }
     for c in &scene.clusters {
-        for t in c.first_tri..c.first_tri + c.tri_count {
-            for k in 0..3 {
-                m.u8((scene.indices[t as usize * 3 + k] - c.first_vertex) as u8);
-            }
-        }
+        m.0.extend_from_slice(scene.tris[c.first_tri as usize..(c.first_tri + c.tri_count) as usize].as_flattened());
     }
     section(out, TAG_MESH, 1, &m.0)?;
 
@@ -542,10 +494,9 @@ fn read_mesh(b: &[u8], scene: &mut Scene) -> Result<(), String> {
     if b.len() - r.at < need {
         return Err("MESH section is shorter than its counts say".into());
     }
-    let vbase = scene.positions.len() as u32;
+    let vbase = scene.vertex_count() as u32;
     let tbase = scene.triangle_count() as u32;
 
-    let mut quant = Vec::with_capacity(n_clusters);
     scene.clusters.reserve(n_clusters);
     for _ in 0..n_clusters {
         let first_vertex = r.u32()?;
@@ -563,7 +514,6 @@ fn read_mesh(b: &[u8], scene: &mut Scene) -> Result<(), String> {
         if first_vertex as usize + vertex_count as usize > n_verts || first_tri as usize + tri_count as usize > n_tris {
             return Err("cluster points outside the mesh".into());
         }
-        quant.push((lo, step));
         scene.clusters.push(Cluster {
             first_vertex: vbase + first_vertex,
             vertex_count,
@@ -573,39 +523,38 @@ fn read_mesh(b: &[u8], scene: &mut Scene) -> Result<(), String> {
             radius,
             cone_axis: ax.normalize_or(Vec3::Y),
             cone_cos,
+            qlo: lo,
+            qstep: step,
             ..Default::default()
         });
     }
-    scene.normals.reserve(n_verts);
+    // Held as stored: copied, not decoded.
+    scene.qnrm.reserve(n_verts);
     for _ in 0..n_verts {
-        scene.normals.push(oct_decode([r.u16()?, r.u16()?]));
+        scene.qnrm.push([r.u16()?, r.u16()?]);
     }
-    let lut: Vec<f32> = (0..=255u8).map(srgb8_to_linear).collect();
-    scene.colors.reserve(n_verts);
+    scene.qcol.reserve(n_verts);
     for _ in 0..n_verts {
         let c = r.take(4)?;
-        scene.colors.push(Vec3::new(lut[c[0] as usize], lut[c[1] as usize], lut[c[2] as usize]));
+        scene.qcol.push([c[0], c[1], c[2]]);
     }
     // Positions are stored cluster by cluster; clusters cover the vertex
     // range in order.
-    scene.positions.resize(vbase as usize + n_verts, Vec3::ZERO);
+    scene.qpos.resize(vbase as usize + n_verts, [0; 3]);
     let clusters = &scene.clusters[scene.clusters.len() - n_clusters..];
-    for (c, (lo, step)) in clusters.iter().zip(&quant) {
+    for c in clusters {
         for v in c.first_vertex..c.first_vertex + c.vertex_count {
-            let q = Vec3::new(r.u16()? as f32, r.u16()? as f32, r.u16()? as f32);
-            scene.positions[v as usize] = *lo + q * *step;
+            scene.qpos[v as usize] = [r.u16()?, r.u16()?, r.u16()?];
         }
     }
-    scene.indices.resize((tbase as usize + n_tris) * 3, 0);
+    scene.tris.resize(tbase as usize + n_tris, [0; 3]);
     for c in clusters {
         for t in c.first_tri..c.first_tri + c.tri_count {
-            for k in 0..3 {
-                let l = r.u8()? as u32;
-                if l >= c.vertex_count {
-                    return Err("triangle index outside its cluster".into());
-                }
-                scene.indices[t as usize * 3 + k] = c.first_vertex + l;
+            let l = [r.u8()?, r.u8()?, r.u8()?];
+            if l.iter().any(|&l| l as u32 >= c.vertex_count) {
+                return Err("triangle index outside its cluster".into());
             }
+            scene.tris[t as usize] = l;
         }
     }
     scene.bounds_min = scene.bounds_min.min(bmin);
@@ -638,29 +587,25 @@ fn expand_instances(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Resu
             let scale = m.x_axis.truncate().length().max(m.y_axis.truncate().length()).max(m.z_axis.truncate().length());
             for ci in first..first + count {
                 let c = scene.clusters[ci];
-                let vbase = scene.positions.len() as u32;
+                let vbase = scene.vertex_count() as u32;
                 let tbase = scene.triangle_count() as u32;
                 let vr = c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize;
-                for v in vr.clone() {
-                    let p = m.transform_point3(scene.positions[v]);
-                    let nn = nm.transform_vector3(scene.normals[v]).normalize_or(Vec3::Y);
-                    let col = scene.colors[v];
-                    scene.positions.push(p);
-                    scene.normals.push(nn);
-                    scene.colors.push(col);
-                    scene.bounds_min = scene.bounds_min.min(p);
-                    scene.bounds_max = scene.bounds_max.max(p);
-                }
-                for t in c.first_tri as usize * 3..(c.first_tri + c.tri_count) as usize * 3 {
-                    let i = scene.indices[t] - c.first_vertex + vbase;
-                    scene.indices.push(i);
+                let ps: Vec<Vec3> = scene.cluster_pos(&c).map(|p| m.transform_point3(p)).collect();
+                let (qlo, qstep) = crate::scene::quant_box(&ps);
+                for (v, p) in vr.clone().zip(&ps) {
+                    let nn = nm.transform_vector3(scene.normal(v)).normalize_or(Vec3::Y);
+                    let col = scene.qcol[v];
+                    scene.qpos.push(crate::scene::quantise(*p, qlo, qstep));
+                    scene.qnrm.push(oct_encode(nn));
+                    scene.qcol.push(col);
+                    scene.bounds_min = scene.bounds_min.min(*p);
+                    scene.bounds_max = scene.bounds_max.max(*p);
                 }
                 // A mirroring transform flips the winding; keep front faces front.
-                if m.determinant() < 0.0 {
-                    let start = tbase as usize * 3;
-                    for tri in scene.indices[start..].chunks_exact_mut(3) {
-                        tri.swap(1, 2);
-                    }
+                let flip = m.determinant() < 0.0;
+                for t in c.first_tri..c.first_tri + c.tri_count {
+                    let l = scene.tris[t as usize];
+                    scene.tris.push(if flip { [l[0], l[2], l[1]] } else { l });
                 }
                 if !scene.textures.entries.is_empty() {
                     let e = scene.textures.entry(ci);
@@ -686,9 +631,15 @@ fn expand_instances(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Resu
                     } else {
                         -1.0
                     },
+                    qlo,
+                    qstep,
                     ..c
                 });
-                scene.clusters.last_mut().unwrap().move_lod(|p| m.transform_point3(p), scale);
+                let last = scene.clusters.last_mut().unwrap();
+                last.move_lod(|p| m.transform_point3(p), scale);
+                // Hold the copy's quantised positions.
+                let r = ps.iter().map(|p| crate::scene::dequantise(crate::scene::quantise(*p, qlo, qstep), qlo, qstep).distance(last.centre)).fold(0.0, f32::max);
+                last.radius = last.radius.max(r);
             }
         }
     }
@@ -779,6 +730,7 @@ fn read_lights(b: &[u8], scene: &mut Scene) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene::oct_decode;
     use crate::scene::tests::uv_sphere;
 
     fn sample() -> Scene {
@@ -790,27 +742,22 @@ mod tests {
         s
     }
 
+    /// Geometry is held as the file stores it, so a round trip is exact.
     #[test]
-    fn round_trip_keeps_geometry_within_quantisation() {
+    fn round_trip_keeps_geometry_exactly() {
         let a = sample();
         let bytes = write(&a, &[]);
         let (b, rep) = read(&bytes).unwrap();
         assert!(rep.skipped.is_empty());
-        assert_eq!(a.indices, b.indices);
+        assert_eq!(a.indices(), b.indices());
         assert_eq!(a.clusters.len(), b.clusters.len());
         assert_eq!(a.lights, b.lights);
-        for (pa, pb) in a.positions.iter().zip(&b.positions) {
-            assert!(pa.distance(*pb) < 2e-5, "{pa} vs {pb}");
-        }
-        for (na, nb) in a.normals.iter().zip(&b.normals) {
-            assert!(na.dot(*nb) > 0.99999);
-        }
-        for (ca, cb) in a.colors.iter().zip(&b.colors) {
-            assert!((*ca - *cb).abs().max_element() < 0.01);
-        }
+        assert_eq!(a.positions(), b.positions());
+        assert_eq!(a.normals(), b.normals());
+        assert_eq!(a.colors(), b.colors());
         for c in &b.clusters {
             for v in c.first_vertex..c.first_vertex + c.vertex_count {
-                assert!(b.positions[v as usize].distance(c.centre) <= c.radius);
+                assert!(b.positions()[v as usize].distance(c.centre) <= c.radius);
             }
         }
     }
@@ -858,21 +805,21 @@ mod tests {
         let (b, _) = read(&bytes).unwrap();
         assert_eq!(b.triangle_count(), a.triangle_count() * 3);
         assert_eq!(b.clusters.len(), a.clusters.len() * 3);
-        let k = a.positions.len();
+        let k = a.positions().len();
         for (i, m) in moves.iter().enumerate() {
             for v in 0..k {
-                let want = m.transform_point3(b.positions[v]);
-                assert!(b.positions[k * (i + 1) + v].distance(want) < 1e-5);
+                let want = m.transform_point3(b.positions()[v]);
+                assert!(b.positions()[k * (i + 1) + v].distance(want) < 1e-5);
             }
         }
         assert!(b.bounds_max.x > 5.5 && b.bounds_min.z < -3.5);
         for c in &b.clusters {
             for v in c.first_vertex..c.first_vertex + c.vertex_count {
-                assert!(b.positions[v as usize].distance(c.centre) <= c.radius + 1e-5);
+                assert!(b.positions()[v as usize].distance(c.centre) <= c.radius + 1e-5);
             }
             for t in c.first_tri..c.first_tri + c.tri_count {
                 for j in 0..3 {
-                    let v = b.indices[t as usize * 3 + j];
+                    let v = b.indices()[t as usize * 3 + j];
                     assert!(v >= c.first_vertex && v < c.first_vertex + c.vertex_count);
                 }
             }

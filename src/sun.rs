@@ -151,9 +151,9 @@ impl SunShadow {
                                     continue;
                                 }
                                 for t in c.first_tri..c.first_tri + c.tri_count {
-                                    let i = t as usize * 3;
+                                    let ps = scene.tri_pos(c, t);
                                     let v = [0, 1, 2].map(|k| {
-                                        let p = scene.positions[scene.indices[i + k] as usize] - centre;
+                                        let p = ps[k] - centre;
                                         Vec4::new((p.dot(right) / half * 0.5 + 0.5) * res as f32, (p.dot(up) / half * 0.5 + 0.5) * res as f32, p.dot(d), 0.0)
                                     });
                                     n += fill_max(&mut buf, res, v[0], v[1], v[2], [0.0, 0.0, f32::INFINITY, f32::INFINITY]) as u64;
@@ -294,9 +294,9 @@ impl SunShadow {
             for i in hit {
                 let c = &scene.clusters[i];
                 for t in c.first_tri..c.first_tri + c.tri_count {
-                    let k3 = t as usize * 3;
+                    let ps = scene.tri_pos(c, t);
                     let v = [0, 1, 2].map(|k| {
-                        let p = scene.positions[scene.indices[k3 + k] as usize];
+                        let p = ps[k];
                         let (x, y) = to_tex(p);
                         Vec4::new(x, y, (p - centre).dot(d), 0.0)
                     });

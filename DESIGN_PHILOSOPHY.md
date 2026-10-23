@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 23/10/2026: geometry is held in memory as the file stores it: 16-bit positions in each cluster's box, 16-bit octahedral normals, 8-bit sRGB colours, one byte a corner; 13 bytes a vertex and 3 a triangle instead of 36 and 12. Loading copies instead of decoding; a vertex is decoded where it is read. The high-resolution T-rex set peaks at 1,237 MB instead of 2,008 MB, frame times unchanged.
 - 23/10/2026: moving an object no longer throws away every shadow map and all shading: each map clears and draws again a rectangle round where it was and is, and only the points whose shadow could have changed are shaded again. Moving the high-resolution T-rex went from 682 to 745 ms a frame to 535 to 675 ms on 2 cores.
 - 23/10/2026: adaptive shading: every other grid point first, the rest only where the four corners differ, interpolated elsewhere (light times each point's own albedo). A third of the points shaded; 4 to 20% less shading time, since making the points now costs more than shading them.
 - 23/10/2026: the light changed last keeps its own share of the shading cache, so dragging it redoes one light's share a point, not every light; grids are not checked again while the camera is still. A drag frame with the high-resolution T-rex went from 437 ms to 298 ms on 2 cores.

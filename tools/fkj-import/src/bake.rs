@@ -271,7 +271,7 @@ mod tests {
         let b = s2.textures.block(0, c.tri_count as usize, 5).unwrap();
         for t in 0..c.tri_count as usize {
             let i = (c.first_tri as usize + t) * 3;
-            let corners = [s2.positions[s2.indices[i] as usize], s2.positions[s2.indices[i + 1] as usize], s2.positions[s2.indices[i + 2] as usize]];
+            let corners = [s2.positions()[s2.indices()[i] as usize], s2.positions()[s2.indices()[i + 1] as usize], s2.positions()[s2.indices()[i + 2] as usize]];
             let n = 32;
             for (gi, gj) in [(0usize, 0usize), (8, 4), (20, 3), (2, 25)] {
                 if gi + gj > n {

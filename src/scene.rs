@@ -5,8 +5,12 @@
 //! `CLUSTER_TRIS` triangles. Each cluster owns a contiguous run of vertices
 //! and of triangles, and carries a bounding sphere and a normal cone, so the
 //! renderer can drop a whole cluster that is off screen or faces away before
-//! touching its vertices. This is the layout the `.fkj` file stores
-//! (`src/fkj.rs`); loading decodes it straight into these arrays.
+//! touching its vertices. Geometry is kept as the `.fkj` file stores it
+//! (`src/fkj.rs`): positions 16 bits per axis inside their cluster's box,
+//! normals as 16-bit octahedral pairs, colours as 8-bit sRGB, corners as a
+//! byte into their cluster's vertices; 13 bytes a vertex and 3 a triangle
+//! where f32 took 36 and 12. Loading copies them; reading a vertex decodes
+//! it (`Scene::pos`, `normal`, `color`, `tri`).
 
 
 // Building clusters (`push_mesh`) is used by the tests and the baking tool;
@@ -17,6 +21,69 @@ use glam::Vec3;
 
 /// Most vertices in one cluster. Local indices fit a byte.
 pub const CLUSTER_VERTS: usize = 64;
+
+/// A unit vector as two 16-bit octahedral coordinates (Cigolle et al.,
+/// "A Survey of Efficient Representations for Independent Unit Vectors",
+/// 2014): within about 0.003 degrees.
+pub fn oct_encode(n: Vec3) -> [u16; 2] {
+    let n = n.normalize_or(Vec3::Y);
+    let l1 = n.x.abs() + n.y.abs() + n.z.abs();
+    let (mut x, mut y) = (n.x / l1, n.y / l1);
+    if n.z < 0.0 {
+        let (ox, oy) = (x, y);
+        x = (1.0 - oy.abs()) * ox.signum();
+        y = (1.0 - ox.abs()) * oy.signum();
+    }
+    let q = |v: f32| ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0).round() as u16;
+    [q(x), q(y)]
+}
+
+#[inline]
+pub fn oct_decode(e: [u16; 2]) -> Vec3 {
+    let x = e[0] as f32 / 65535.0 * 2.0 - 1.0;
+    let y = e[1] as f32 / 65535.0 * 2.0 - 1.0;
+    let z = 1.0 - x.abs() - y.abs();
+    let (x, y) = if z < 0.0 { ((1.0 - y.abs()) * x.signum(), (1.0 - x.abs()) * y.signum()) } else { (x, y) };
+    Vec3::new(x, y, z).normalize_or(Vec3::Y)
+}
+
+pub fn linear_to_srgb8(v: f32) -> u8 {
+    let v = v.clamp(0.0, 1.0);
+    let s = if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+    (s * 255.0).round() as u8
+}
+
+pub fn srgb8_to_linear(v: u8) -> f32 {
+    let s = v as f32 / 255.0;
+    if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+}
+
+/// `srgb8_to_linear` of every byte.
+static SRGB: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| std::array::from_fn(|i| srgb8_to_linear(i as u8)));
+
+/// A cluster's quantisation box for `ps`: its corner and the step of one
+/// unit of a 16-bit coordinate.
+pub fn quant_box(ps: &[Vec3]) -> (Vec3, Vec3) {
+    let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+    for p in ps {
+        lo = lo.min(*p);
+        hi = hi.max(*p);
+    }
+    if ps.is_empty() {
+        return (Vec3::ZERO, Vec3::ZERO);
+    }
+    (lo, (hi - lo) / 65535.0)
+}
+
+#[inline]
+pub fn quantise(p: Vec3, lo: Vec3, step: Vec3) -> [u16; 3] {
+    std::array::from_fn(|k| if step[k] > 0.0 { ((p[k] - lo[k]) / step[k]).round().clamp(0.0, 65535.0) as u16 } else { 0 })
+}
+
+#[inline]
+pub fn dequantise(q: [u16; 3], lo: Vec3, step: Vec3) -> Vec3 {
+    lo + Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32) * step
+}
 /// Most triangles in one cluster.
 pub const CLUSTER_TRIS: usize = 124;
 
@@ -79,6 +146,9 @@ pub struct Cluster {
     pub parent_error: f32,
     pub parent_centre: Vec3,
     pub parent_radius: f32,
+    /// Its vertices' quantisation box: a position is `qlo + q * qstep`.
+    pub qlo: Vec3,
+    pub qstep: Vec3,
 }
 
 impl Default for Cluster {
@@ -99,6 +169,8 @@ impl Default for Cluster {
             parent_error: f32::INFINITY,
             parent_centre: Vec3::ZERO,
             parent_radius: 0.0,
+            qlo: Vec3::ZERO,
+            qstep: Vec3::ZERO,
         }
     }
 }
@@ -142,15 +214,16 @@ pub fn perspective_scale(eye: Vec3, px_per_unit: f32, near: f32) -> impl Fn(Vec3
 
 #[derive(Default)]
 pub struct Scene {
-    /// World-space positions, one per vertex.
-    pub positions: Vec<Vec3>,
-    /// World-space unit normals, one per vertex.
-    pub normals: Vec<Vec3>,
-    /// Linear RGB albedo, one per vertex.
-    pub colors: Vec<Vec3>,
-    /// Three global vertex indices per triangle. A triangle only references
-    /// vertices of its own cluster.
-    pub indices: Vec<u32>,
+    /// World-space positions, one per vertex, 16 bits per axis inside its
+    /// cluster's box (`Cluster::qlo`, `qstep`); read with `pos`.
+    pub qpos: Vec<[u16; 3]>,
+    /// World-space unit normals, octahedral; read with `normal`.
+    pub qnrm: Vec<[u16; 2]>,
+    /// Albedo, 8-bit sRGB; read (linear) with `color`.
+    pub qcol: Vec<[u8; 3]>,
+    /// Each triangle's corners, as indices into its cluster's vertices.
+    /// A triangle only references vertices of its own cluster.
+    pub tris: Vec<[u8; 3]>,
     pub clusters: Vec<Cluster>,
     /// Bounds of all positions.
     pub bounds_min: Vec3,
@@ -211,7 +284,141 @@ impl Scene {
     }
 
     pub fn triangle_count(&self) -> usize {
-        self.indices.len() / 3
+        self.tris.len()
+    }
+
+    pub fn vertex_count(&self) -> usize {
+        self.qpos.len()
+    }
+
+    /// Bytes the geometry takes.
+    pub fn geometry_bytes(&self) -> usize {
+        self.qpos.len() * 6 + self.qnrm.len() * 4 + self.qcol.len() * 3 + self.tris.len() * 3 + self.clusters.len() * std::mem::size_of::<Cluster>()
+    }
+
+    /// Position of vertex `v` of cluster `c`.
+    #[inline]
+    pub fn pos(&self, c: &Cluster, v: usize) -> Vec3 {
+        dequantise(self.qpos[v], c.qlo, c.qstep)
+    }
+
+    #[inline]
+    pub fn normal(&self, v: usize) -> Vec3 {
+        oct_decode(self.qnrm[v])
+    }
+
+    /// Linear RGB albedo.
+    #[inline]
+    pub fn color(&self, v: usize) -> Vec3 {
+        let c = self.qcol[v];
+        let l = &*SRGB;
+        Vec3::new(l[c[0] as usize], l[c[1] as usize], l[c[2] as usize])
+    }
+
+    /// The scene vertices of triangle `t` of cluster `c`.
+    #[inline]
+    pub fn tri(&self, c: &Cluster, t: u32) -> [usize; 3] {
+        let f = c.first_vertex as usize;
+        self.tris[t as usize].map(|l| f + l as usize)
+    }
+
+    /// The corner positions of triangle `t` of cluster `c`.
+    #[inline]
+    pub fn tri_pos(&self, c: &Cluster, t: u32) -> [Vec3; 3] {
+        self.tri(c, t).map(|v| self.pos(c, v))
+    }
+
+    /// Cluster `c`'s vertex positions, in order.
+    #[inline]
+    pub fn cluster_pos<'a>(&'a self, c: &'a Cluster) -> impl Iterator<Item = Vec3> + 'a {
+        self.qpos[c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize].iter().map(|q| dequantise(*q, c.qlo, c.qstep))
+    }
+
+    /// Every vertex position, decoded, in order (for tests and tools).
+    pub fn positions(&self) -> Vec<Vec3> {
+        let mut out = vec![Vec3::ZERO; self.qpos.len()];
+        for c in &self.clusters {
+            for (k, p) in self.cluster_pos(c).enumerate() {
+                out[c.first_vertex as usize + k] = p;
+            }
+        }
+        out
+    }
+
+    /// Every normal, decoded, in order.
+    pub fn normals(&self) -> Vec<Vec3> {
+        (0..self.qnrm.len()).map(|v| self.normal(v)).collect()
+    }
+
+    /// Every colour, decoded, in order.
+    pub fn colors(&self) -> Vec<Vec3> {
+        (0..self.qcol.len()).map(|v| self.color(v)).collect()
+    }
+
+    /// Three scene vertex indices per triangle (for tests and tools).
+    pub fn indices(&self) -> Vec<u32> {
+        let mut out = vec![0; self.tris.len() * 3];
+        for c in &self.clusters {
+            for t in c.first_tri..c.first_tri + c.tri_count {
+                for (k, v) in self.tri(c, t).into_iter().enumerate() {
+                    out[t as usize * 3 + k] = v as u32;
+                }
+            }
+        }
+        out
+    }
+
+    /// Grow each sphere of clusters `range` to hold its decoded vertices.
+    fn fit_spheres(&mut self, range: std::ops::Range<usize>) {
+        use rayon::prelude::*;
+        let qpos = &self.qpos;
+        self.clusters[range].par_iter_mut().for_each(|c| {
+            let fv = c.first_vertex as usize;
+            let r = qpos[fv..fv + c.vertex_count as usize].iter().map(|q| dequantise(*q, c.qlo, c.qstep).distance(c.centre)).fold(0.0, f32::max);
+            c.radius = c.radius.max(r);
+        });
+    }
+
+    /// Append one cluster's vertices, quantised; returns its box.
+    fn push_vertices(&mut self, ps: &[Vec3], ns: &[Vec3], cs: &[Vec3]) -> (Vec3, Vec3) {
+        let (lo, step) = quant_box(ps);
+        self.qpos.extend(ps.iter().map(|p| quantise(*p, lo, step)));
+        self.qnrm.extend(ns.iter().map(|n| oct_encode(*n)));
+        self.qcol.extend(cs.iter().map(|c| [c.x, c.y, c.z].map(linear_to_srgb8)));
+        (lo, step)
+    }
+
+    /// Move every vertex of clusters `range` by `f` and turn every normal
+    /// by `q`, quantising each cluster again in its new box.
+    pub fn map_vertices(&mut self, range: std::ops::Range<usize>, f: impl Fn(Vec3) -> Vec3 + Sync, q: Option<glam::Quat>) {
+        use rayon::prelude::*;
+        let (Some(first), Some(last)) = (self.clusters.get(range.start).copied(), range.end.checked_sub(1).and_then(|e| self.clusters.get(e)).copied()) else { return };
+        let fv = first.first_vertex as usize;
+        let end = (last.first_vertex + last.vertex_count) as usize;
+        // Split the vertex arrays into each cluster's run, in parallel.
+        let mut pos_runs: Vec<&mut [[u16; 3]]> = Vec::with_capacity(range.len());
+        let mut rest = &mut self.qpos[fv..end];
+        let mut at = fv;
+        for c in &self.clusters[range.clone()] {
+            let skip = c.first_vertex as usize - at;
+            let (_, r) = rest.split_at_mut(skip);
+            let (run, r) = r.split_at_mut(c.vertex_count as usize);
+            pos_runs.push(run);
+            rest = r;
+            at = (c.first_vertex + c.vertex_count) as usize;
+        }
+        self.clusters[range].par_iter_mut().zip(pos_runs).for_each(|(c, run)| {
+            let ps: Vec<Vec3> = run.iter().map(|q| f(dequantise(*q, c.qlo, c.qstep))).collect();
+            let (lo, step) = quant_box(&ps);
+            for (q, p) in run.iter_mut().zip(&ps) {
+                *q = quantise(*p, lo, step);
+            }
+            c.qlo = lo;
+            c.qstep = step;
+        });
+        if let Some(q) = q {
+            self.qnrm[fv..end].par_iter_mut().for_each(|n| *n = oct_encode(q * oct_decode(*n)));
+        }
     }
 
     pub fn centre(&self) -> Vec3 {
@@ -238,13 +445,12 @@ impl Scene {
 
     /// Move every vertex, cluster and light by `d`.
     pub fn translate(&mut self, d: Vec3) {
-        for p in &mut self.positions {
-            *p += d;
-        }
+        self.map_vertices(0..self.clusters.len(), |p| p + d, None);
         for c in &mut self.clusters {
             c.centre += d;
             c.move_lod(|p| p + d, 1.0);
         }
+        self.fit_spheres(0..self.clusters.len());
         for l in &mut self.lights {
             l.position += d;
         }
@@ -262,25 +468,23 @@ impl Scene {
     /// stays valid.
     pub fn place(&mut self, yaw: f32, scale: f32, d: Vec3) {
         let q = glam::Quat::from_rotation_y(yaw);
-        for p in &mut self.positions {
-            *p = q * (*p * scale) + d;
-        }
-        for n in &mut self.normals {
-            *n = q * *n;
-        }
+        self.map_vertices(0..self.clusters.len(), |p| q * (p * scale) + d, Some(q));
         for c in &mut self.clusters {
             c.centre = q * (c.centre * scale) + d;
             c.radius *= scale;
             c.cone_axis = q * c.cone_axis;
             c.move_lod(|p| q * (p * scale) + d, scale);
         }
+        self.fit_spheres(0..self.clusters.len());
         for l in &mut self.lights {
             l.position = q * (l.position * scale) + d;
         }
         let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
-        for p in &self.positions {
-            lo = lo.min(*p);
-            hi = hi.max(*p);
+        for c in &self.clusters {
+            for p in self.cluster_pos(c) {
+                lo = lo.min(p);
+                hi = hi.max(p);
+            }
         }
         self.bounds_min = lo;
         self.bounds_max = hi;
@@ -295,12 +499,12 @@ impl Scene {
         if !other.textures.is_empty() || !self.textures.is_empty() {
             self.textures.append(&other.textures, cbase, other_clusters);
         }
-        let vbase = self.positions.len() as u32;
+        let vbase = self.qpos.len() as u32;
         let tbase = self.triangle_count() as u32;
-        self.positions.extend(other.positions);
-        self.normals.extend(other.normals);
-        self.colors.extend(other.colors);
-        self.indices.extend(other.indices.iter().map(|i| i + vbase));
+        self.qpos.extend(other.qpos);
+        self.qnrm.extend(other.qnrm);
+        self.qcol.extend(other.qcol);
+        self.tris.extend(other.tris);
         self.clusters.extend(other.clusters.iter().map(|c| Cluster { first_vertex: c.first_vertex + vbase, first_tri: c.first_tri + tbase, ..*c }));
         self.bounds_min = self.bounds_min.min(other.bounds_min);
         self.bounds_max = self.bounds_max.max(other.bounds_max);
@@ -379,9 +583,9 @@ impl Scene {
             .filter(|c| c.lod_level == finest)
             .map(|c| {
                 let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
-                for p in &self.positions[c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize] {
-                    lo = lo.min(*p);
-                    hi = hi.max(*p);
+                for p in self.cluster_pos(c) {
+                    lo = lo.min(p);
+                    hi = hi.max(p);
                 }
                 (lo, hi)
             })
@@ -430,7 +634,6 @@ impl Scene {
 
     /// `set_object` for object `i` alone.
     fn place_one(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: f32) {
-        use rayon::prelude::*;
         let o = self.objects[i].clone();
         let k = scale / o.scale;
         let q = euler_quat(rotation) * euler_quat(o.rotation).inverse();
@@ -443,17 +646,14 @@ impl Scene {
             self.refresh_bounds(i);
             return;
         }
-        let cs = &self.clusters[o.clusters.clone()];
-        let (Some(first), Some(last)) = (cs.first(), cs.last()) else { return };
-        let verts = first.first_vertex as usize..(last.first_vertex + last.vertex_count) as usize;
-        self.positions[verts.clone()].par_iter_mut().for_each(|p| *p = map(*p));
-        self.normals[verts].par_iter_mut().for_each(|n| *n = q * *n);
+        self.map_vertices(o.clusters.clone(), map, Some(q));
         for c in &mut self.clusters[o.clusters.clone()] {
             c.centre = map(c.centre);
             c.radius *= k;
             c.cone_axis = q * c.cone_axis;
             c.move_lod(map, k);
         }
+        self.fit_spheres(o.clusters.clone());
         let ob = &mut self.objects[i];
         ob.pivot = pivot;
         ob.rotation = rotation;
@@ -497,22 +697,19 @@ impl Scene {
         };
 
         for c in build_clusters(positions, tri_indices) {
-            let first_vertex = self.positions.len() as u32;
-            let first_tri = (self.indices.len() / 3) as u32;
-            for &v in &c.vertices {
-                self.positions.push(positions[v as usize]);
-                self.normals.push(normals[v as usize]);
-                self.colors.push(colors[v as usize]);
-            }
-            for t in &c.local_tris {
-                self.indices.extend(t.iter().map(|&l| first_vertex + l as u32));
-            }
+            let first_vertex = self.qpos.len() as u32;
+            let first_tri = self.tris.len() as u32;
+            let pick = |a: &[Vec3]| c.vertices.iter().map(|&v| a[v as usize]).collect::<Vec<_>>();
+            let (qlo, qstep) = self.push_vertices(&pick(positions), &pick(&normals), &pick(&colors));
+            self.tris.extend_from_slice(&c.local_tris);
             source.extend_from_slice(&c.source_tris);
             let mut cl = Cluster {
                 first_vertex,
                 vertex_count: c.vertices.len() as u32,
                 first_tri,
                 tri_count: c.local_tris.len() as u32,
+                qlo,
+                qstep,
                 ..Default::default()
             };
             self.finish_cluster(&mut cl);
@@ -527,26 +724,30 @@ impl Scene {
     pub fn push_lod_mesh(&mut self, positions: &[Vec3], normals: &[Vec3], colors: &[Vec3], clusters: &[crate::lod::LodCluster]) -> Vec<[u32; 3]> {
         let mut corners = Vec::new();
         for lc in clusters {
-            let first_vertex = self.positions.len() as u32;
-            let first_tri = (self.indices.len() / 3) as u32;
-            let mut local: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            let first_vertex = self.qpos.len() as u32;
+            let first_tri = self.tris.len() as u32;
+            let mut local: std::collections::HashMap<u32, u8> = std::collections::HashMap::new();
+            let mut verts: Vec<u32> = Vec::new();
             for t in &lc.tris {
-                for &v in t {
-                    let l = *local.entry(v).or_insert_with(|| {
-                        self.positions.push(positions[v as usize]);
-                        self.normals.push(normals[v as usize]);
-                        self.colors.push(colors[v as usize]);
-                        self.positions.len() as u32 - 1
-                    });
-                    self.indices.push(l);
-                }
+                let l = t.map(|v| {
+                    *local.entry(v).or_insert_with(|| {
+                        verts.push(v);
+                        (verts.len() - 1) as u8
+                    })
+                });
+                self.tris.push(l);
                 corners.push(*t);
             }
+            assert!(verts.len() <= CLUSTER_VERTS, "a level-of-detail cluster has more than {CLUSTER_VERTS} vertices");
+            let pick = |a: &[Vec3]| verts.iter().map(|&v| a[v as usize]).collect::<Vec<_>>();
+            let (qlo, qstep) = self.push_vertices(&pick(positions), &pick(normals), &pick(colors));
             let mut cl = Cluster {
                 first_vertex,
-                vertex_count: self.positions.len() as u32 - first_vertex,
+                vertex_count: verts.len() as u32,
                 first_tri,
                 tri_count: lc.tris.len() as u32,
+                qlo,
+                qstep,
                 lod_level: lc.level,
                 lod_error: lc.error,
                 lod_centre: lc.sphere.0,
@@ -565,9 +766,9 @@ impl Scene {
     /// Fill a cluster's sphere and cone from its vertices and triangles, and
     /// grow the scene bounds.
     pub fn finish_cluster(&mut self, cl: &mut Cluster) {
-        let vs = &self.positions[cl.first_vertex as usize..(cl.first_vertex + cl.vertex_count) as usize];
+        let vs: Vec<Vec3> = self.cluster_pos(cl).collect();
         let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
-        for p in vs {
+        for p in &vs {
             lo = lo.min(*p);
             hi = hi.max(*p);
         }
@@ -579,12 +780,7 @@ impl Scene {
         let mut face_normals = Vec::with_capacity(cl.tri_count as usize);
         let mut axis = Vec3::ZERO;
         for t in cl.first_tri..cl.first_tri + cl.tri_count {
-            let i = t as usize * 3;
-            let (a, b, c) = (
-                self.positions[self.indices[i] as usize],
-                self.positions[self.indices[i + 1] as usize],
-                self.positions[self.indices[i + 2] as usize],
-            );
+            let [a, b, c] = self.tri_pos(cl, t);
             let f = (b - a).cross(c - a);
             if f.length_squared() > 0.0 {
                 let f = f.normalize();
@@ -739,6 +935,56 @@ pub mod tests {
         (p, idx)
     }
 
+    /// Positions decode to within half a step of their cluster's box,
+    /// normals within 0.003 degrees, colours to the nearest 8-bit sRGB
+    /// value; 13 bytes a vertex and 3 a triangle.
+    #[test]
+    fn geometry_is_held_quantised() {
+        let (p, idx) = uv_sphere(32);
+        let colors: Vec<Vec3> = p.iter().map(|v| (*v * 0.5 + Vec3::splat(0.5)).powf(2.2)).collect();
+        let normals: Vec<Vec3> = p.iter().map(|v| v.normalize()).collect();
+        let mut s = Scene::new();
+        let source = s.push_mesh_mapped(&p, &normals, &colors, &idx);
+        // Each scene vertex came from the source vertex at the same corner.
+        let mut src_of = std::collections::HashMap::new();
+        let ind = s.indices();
+        for (t, &st) in source.iter().enumerate() {
+            for k in 0..3 {
+                src_of.insert(ind[t * 3 + k], idx[st as usize * 3 + k]);
+            }
+        }
+        for c in &s.clusters {
+            for v in c.first_vertex..c.first_vertex + c.vertex_count {
+                let q = src_of[&v] as usize;
+                assert!((s.pos(c, v as usize) - p[q]).abs().cmple(c.qstep * 0.5 + Vec3::splat(1e-6)).all());
+                assert!(s.normal(v as usize).dot(normals[q]) > 0.999_999);
+                assert!((s.color(v as usize) - colors[q]).abs().max_element() < 0.01);
+                assert!(s.pos(c, v as usize).distance(c.centre) <= c.radius);
+            }
+        }
+        let n = s.vertex_count() * 13 + s.triangle_count() * 3;
+        assert_eq!(s.geometry_bytes(), n + s.clusters.len() * std::mem::size_of::<Cluster>());
+    }
+
+    /// Moving an object quantises it again in its new boxes: a move and its
+    /// way back leave it within a step of where it was.
+    #[test]
+    fn moving_and_back_stays_within_a_step() {
+        let (p, idx) = uv_sphere(24);
+        let mut s = Scene::new();
+        s.push_mesh(&p, &[], &[], &idx);
+        let o = s.add_object("ball".into(), 0..s.clusters.len(), Vec3::ZERO, Vec3::ZERO);
+        let before = s.positions();
+        for _ in 0..20 {
+            s.set_object(o, Vec3::new(3.0, 1.0, -2.0), Vec3::new(0.3, 1.1, -0.7), 1.7);
+            s.set_object(o, Vec3::ZERO, Vec3::ZERO, 1.0);
+        }
+        let step = s.clusters.iter().map(|c| c.qstep.length()).fold(0.0, f32::max);
+        for (a, b) in before.iter().zip(s.positions()) {
+            assert!(a.distance(b) < 20.0 * step + 1e-5, "{a} {b}");
+        }
+    }
+
     #[test]
     fn clusters_respect_limits_and_keep_every_triangle() {
         let (p, idx) = uv_sphere(96);
@@ -751,13 +997,13 @@ pub mod tests {
             assert!(c.tri_count as usize <= CLUSTER_TRIS);
             for t in c.first_tri..c.first_tri + c.tri_count {
                 for k in 0..3 {
-                    let v = s.indices[t as usize * 3 + k];
+                    let v = s.indices()[t as usize * 3 + k];
                     assert!(v >= c.first_vertex && v < c.first_vertex + c.vertex_count, "triangle leaves its cluster");
                 }
                 // Same triangle as a set of source positions, to check none is lost or doubled.
                 let key: Vec<[i32; 3]> = (0..3)
                     .map(|k| {
-                        let q = s.positions[s.indices[t as usize * 3 + k] as usize] * 1e4;
+                        let q = s.positions()[s.indices()[t as usize * 3 + k] as usize] * 1e4;
                         [q.x as i32, q.y as i32, q.z as i32]
                     })
                     .collect();
@@ -766,7 +1012,7 @@ pub mod tests {
                 assert!(seen.insert(key));
             }
             for v in c.first_vertex..c.first_vertex + c.vertex_count {
-                assert!(s.positions[v as usize].distance(c.centre) <= c.radius + 1e-5);
+                assert!(s.positions()[v as usize].distance(c.centre) <= c.radius + 1e-5);
             }
         }
         assert_eq!(seen.len(), idx.len() / 3);
@@ -782,30 +1028,30 @@ pub mod tests {
         let (p, idx) = uv_sphere(32);
         let mut s = Scene::new();
         s.push_mesh(&[Vec3::new(-50.0, 0.0, -50.0), Vec3::new(50.0, 0.0, -50.0), Vec3::new(0.0, 0.0, 50.0)], &[], &[], &[0, 1, 2]);
-        let ground = s.positions.clone();
+        let ground = s.positions().clone();
         let first = s.clusters.len();
         let lifted: Vec<Vec3> = p.iter().map(|v| *v + Vec3::Y).collect();
         s.push_mesh(&lifted, &[], &[], &idx);
         s.add_object("ball".into(), first..s.clusters.len(), Vec3::ZERO, Vec3::ZERO);
-        let before = s.positions.clone();
+        let before = s.positions().clone();
         let (yaw, k, to) = (0.7f32, 2.0f32, Vec3::new(3.0, 0.0, -2.0));
         s.set_object(0, to, Vec3::new(0.0, yaw, 0.0), k);
         let q = glam::Quat::from_rotation_y(yaw);
         let vbase = s.clusters[first].first_vertex as usize;
-        for v in vbase..s.positions.len() {
+        for v in vbase..s.positions().len() {
             let want = q * (before[v] * k) + to;
-            assert!(s.positions[v].distance(want) < 1e-4);
+            assert!(s.positions()[v].distance(want) < 1e-4);
         }
-        assert_eq!(&s.positions[..ground.len()], &ground[..], "the ground stays put");
+        assert_eq!(&s.positions()[..ground.len()], &ground[..], "the ground stays put");
         for c in &s.clusters[first..] {
             for v in c.first_vertex..c.first_vertex + c.vertex_count {
-                assert!(s.positions[v as usize].distance(c.centre) <= c.radius + 1e-4);
+                assert!(s.positions()[v as usize].distance(c.centre) <= c.radius + 1e-4);
             }
         }
         // And back, from the absolute placement.
         s.set_object(0, Vec3::ZERO, Vec3::ZERO, 1.0);
-        for v in vbase..s.positions.len() {
-            assert!(s.positions[v].distance(before[v]) < 1e-4);
+        for v in vbase..s.positions().len() {
+            assert!(s.positions()[v].distance(before[v]) < 1e-4);
         }
         assert_eq!(s.object_of(first), Some(0));
         assert_eq!(s.object_of(0), None);
@@ -868,11 +1114,11 @@ pub mod tests {
         let lifted: Vec<Vec3> = p.iter().map(|v| *v * Vec3::new(2.0, 0.5, 0.5) + Vec3::Y).collect();
         s.push_mesh(&lifted, &[], &[], &idx);
         let o = s.add_object("long".into(), 0..s.clusters.len(), Vec3::ZERO, Vec3::ZERO);
-        let before = s.positions.clone();
+        let before = s.positions().clone();
         let r = Vec3::new(0.0, 0.0, std::f32::consts::FRAC_PI_2);
         s.set_object(o, Vec3::ZERO, r, 1.0);
         let q = euler_quat(r);
-        for (a, b) in before.iter().zip(&s.positions) {
+        for (a, b) in before.iter().zip(&s.positions()) {
             assert!((q * *a).distance(*b) < 1e-4);
         }
         // Stood on end: tall now, not long.
@@ -880,11 +1126,11 @@ pub mod tests {
         assert!(hi.y - lo.y > 3.9 && hi.x - lo.x < 1.1, "{lo} {hi}");
         for c in &s.clusters {
             for v in c.first_vertex..c.first_vertex + c.vertex_count {
-                assert!(s.positions[v as usize].distance(c.centre) <= c.radius + 1e-4);
+                assert!(s.positions()[v as usize].distance(c.centre) <= c.radius + 1e-4);
             }
         }
         s.set_object(o, Vec3::ZERO, Vec3::ZERO, 1.0);
-        for (a, b) in before.iter().zip(&s.positions) {
+        for (a, b) in before.iter().zip(&s.positions()) {
             assert!(a.distance(*b) < 1e-4);
         }
     }
@@ -916,7 +1162,7 @@ pub mod tests {
         for c in &s.clusters {
             for t in c.first_tri..c.first_tri + c.tri_count {
                 let i = t as usize * 3;
-                let (a, b, cc) = (s.positions[s.indices[i] as usize], s.positions[s.indices[i + 1] as usize], s.positions[s.indices[i + 2] as usize]);
+                let (a, b, cc) = (s.positions()[s.indices()[i] as usize], s.positions()[s.indices()[i + 1] as usize], s.positions()[s.indices()[i + 2] as usize]);
                 let f = (b - a).cross(cc - a);
                 if f.length_squared() > 0.0 {
                     assert!(f.normalize().dot(c.cone_axis) >= c.cone_cos - 1e-5);

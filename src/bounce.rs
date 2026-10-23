@@ -198,19 +198,18 @@ pub struct Bounce {
 impl Bounce {
     pub fn new(scene: &Scene) -> Bounce {
         let mut surfels = Vec::new();
-        let tri = |t: usize| {
-            let i = t * 3;
-            let (a, b, c) = (scene.indices[i] as usize, scene.indices[i + 1] as usize, scene.indices[i + 2] as usize);
-            let (pa, pb, pc) = (scene.positions[a], scene.positions[b], scene.positions[c]);
+        let tri = |cl: &crate::scene::Cluster, t: usize| {
+            let [a, b, c] = scene.tri(cl, t as u32);
+            let (pa, pb, pc) = (scene.pos(cl, a), scene.pos(cl, b), scene.pos(cl, c));
             let f = (pb - pa).cross(pc - pa);
-            ((pa + pb + pc) / 3.0, f * 0.5, (scene.colors[a] + scene.colors[b] + scene.colors[c]) / 3.0)
+            ((pa + pb + pc) / 3.0, f * 0.5, (scene.color(a) + scene.color(b) + scene.color(c)) / 3.0)
         };
         // Every cluster's surface binned by the axis it faces most: its
         // receivers, and, for small clusters, its surfels.
         let bins_of = |c: &crate::scene::Cluster| {
             let mut bins = [(Vec3::ZERO, Vec3::ZERO, 0f32, Vec3::ZERO); 6];
             for t in c.first_tri..c.first_tri + c.tri_count {
-                let (cen, an, alb) = tri(t as usize);
+                let (cen, an, alb) = tri(c, t as usize);
                 let area = an.length();
                 if area <= 0.0 {
                     continue;
@@ -233,7 +232,7 @@ impl Bounce {
                 // Bin the cluster's triangles by the axis they face most.
                 let mut bins = [(Vec3::ZERO, Vec3::ZERO, 0f32, Vec3::ZERO); 6];
                 for t in c.first_tri..c.first_tri + c.tri_count {
-                    let (cen, an, alb) = tri(t as usize);
+                    let (cen, an, alb) = tri(c, t as usize);
                     let area = an.length();
                     if area <= 0.0 {
                         continue;
@@ -262,7 +261,7 @@ impl Bounce {
                 }
             } else {
                 for t in c.first_tri..c.first_tri + c.tri_count {
-                    let (cen, an, alb) = tri(t as usize);
+                    let (cen, an, alb) = tri(c, t as usize);
                     let area = an.length();
                     if area > 0.0 {
                         surfels.push(Surfel { position: cen, normal: an / area, area, albedo: alb, cluster: ci as u32 });
@@ -279,15 +278,14 @@ impl Bounce {
         let mut receivers: Vec<(Vec3, Vec3)> = Vec::new();
         let mut first_receiver = Vec::with_capacity(scene.clusters.len() + 1);
         let mut per_vertex = Vec::with_capacity(scene.clusters.len());
-        let mut vertex_receiver = vec![u32::MAX; scene.positions.len()];
+        let mut vertex_receiver = vec![u32::MAX; scene.vertex_count()];
         for (bins, c) in acc.iter().zip(&scene.clusters) {
             first_receiver.push(receivers.len() as u32);
             // Large triangles (a floor, a wall, a table top) get a receiver
             // per vertex; a cluster of small ones (a model) gets one.
             let area: f32 = (c.first_tri..c.first_tri + c.tri_count)
                 .map(|t| {
-                    let i = t as usize * 3;
-                    let (a, b, cc) = (scene.positions[scene.indices[i] as usize], scene.positions[scene.indices[i + 1] as usize], scene.positions[scene.indices[i + 2] as usize]);
+                    let [a, b, cc] = scene.tri_pos(c, t);
                     (b - a).cross(cc - a).length() * 0.5
                 })
                 .sum::<f32>()
@@ -299,8 +297,8 @@ impl Bounce {
                 // neighbouring quads) share a receiver.
                 let start = receivers.len();
                 for v in c.first_vertex..c.first_vertex + c.vertex_count {
-                    let n = scene.normals[v as usize];
-                    let p = scene.positions[v as usize] + n * nudge(c.radius);
+                    let n = scene.normal(v as usize);
+                    let p = scene.pos(c, v as usize) + n * nudge(c.radius);
                     let found = (start..receivers.len()).find(|&r| receivers[r].0 == p && receivers[r].1 == n);
                     vertex_receiver[v as usize] = match found {
                         Some(r) => r as u32,
@@ -348,10 +346,10 @@ impl Bounce {
     /// facing is closest.
     pub fn irradiance_at(&self, scene: &Scene, ci: usize, tri: u32, w: [f32; 3], n: Vec3) -> Vec3 {
         if self.per_vertex[ci] {
-            let t = tri as usize * 3;
+            let vs = scene.tri(&scene.clusters[ci], tri);
             let mut e = Vec3::ZERO;
             for k in 0..3 {
-                let r = self.vertex_receiver[scene.indices[t + k] as usize] as usize;
+                let r = self.vertex_receiver[vs[k]] as usize;
                 e += sh_irradiance(&self.sh[r], n) * w[k];
             }
             return e;

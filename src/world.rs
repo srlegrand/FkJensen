@@ -250,7 +250,7 @@ mod tests {
         assert!(far > 100, "{far} mountain clusters");
         // Nothing stands on the plane but what main.rs places there.
         assert!(s.clusters.iter().filter(|c| c.centre.length() < 100.0).all(|c| c.centre.y < 0.5));
-        let peak = s.positions.iter().map(|p| p.y).fold(0.0, f32::max);
+        let peak = s.positions().iter().map(|p| p.y).fold(0.0, f32::max);
         assert!(peak > 1200.0 && peak < 2500.0, "peak {peak}");
     }
 

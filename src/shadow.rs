@@ -265,14 +265,12 @@ fn draw_face_into(buf: &mut [f32], scene: &Scene, clusters: &[usize], pos: Vec3,
         if planes.iter().any(|n| n.dot(qc) < -c.radius) || qc.dot(a) < -c.radius {
             continue;
         }
-        let fv = c.first_vertex as usize;
-        for (k, p) in scene.positions[fv..fv + c.vertex_count as usize].iter().enumerate() {
-            let q = *p - pos;
+        for (k, p) in scene.cluster_pos(c).enumerate() {
+            let q = p - pos;
             clip[k] = Vec4::new(q.dot(r), q.dot(u), 0.0, q.dot(a));
         }
         for tri in c.first_tri..c.first_tri + c.tri_count {
-            let t = tri as usize * 3;
-            let v = [clip[scene.indices[t] as usize - fv], clip[scene.indices[t + 1] as usize - fv], clip[scene.indices[t + 2] as usize - fv]];
+            let v = scene.tris[tri as usize].map(|l| clip[l as usize]);
             if (v[0].w < NEAR && v[1].w < NEAR && v[2].w < NEAR)
                 || (v[0].x > v[0].w && v[1].x > v[1].w && v[2].x > v[2].w)
                 || (v[0].x < -v[0].w && v[1].x < -v[1].w && v[2].x < -v[2].w)
@@ -383,15 +381,12 @@ mod tests {
         let mut m = CubeShadow::build(&s, light, 10.0, 128);
         // The card is the second cluster: slide it 0.6 m along x.
         let c = 1;
-        let (fv, n) = (s.clusters[c].first_vertex as usize, s.clusters[c].vertex_count as usize);
         let bounds = |s: &Scene| {
-            let ps = &s.positions[fv..fv + n];
+            let ps: Vec<Vec3> = s.cluster_pos(&s.clusters[c]).collect();
             (ps.iter().fold(Vec3::INFINITY, |a, p| a.min(*p)), ps.iter().fold(Vec3::NEG_INFINITY, |a, p| a.max(*p)))
         };
         let from = bounds(&s);
-        for p in &mut s.positions[fv..fv + n] {
-            p.x += 0.6;
-        }
+        s.map_vertices(c..c + 1, |p| p + Vec3::X * 0.6, None);
         s.clusters[c].centre.x += 0.6;
         let to = bounds(&s);
         m.redraw(&s, &[from, to], 10.0);

@@ -709,18 +709,15 @@ fn draw_clusters(scene: &Scene, list: &[u32], vp: Mat4, near: f32, cull: bool, w
             let mut clip = [Vec4::ZERO; crate::scene::CLUSTER_VERTS];
             for &cluster in chunk {
                 let c = &scene.clusters[cluster as usize];
-                let fv = c.first_vertex as usize;
-                for (k, p) in scene.positions[fv..fv + c.vertex_count as usize].iter().enumerate() {
+                for (k, p) in scene.cluster_pos(c).enumerate() {
                     clip[k] = vp * p.extend(1.0);
                 }
                 // Longest triangle edge on screen, for the dicing level.
                 let mut edge_px = 0f32;
                 let to_px = |p: Vec4| Vec2::new((p.x / p.w * 0.5 + 0.5) * width as f32, (0.5 - p.y / p.w * 0.5) * height as f32);
                 for tri in c.first_tri..c.first_tri + c.tri_count {
-                    let t = tri as usize * 3;
-                    let p0 = clip[scene.indices[t] as usize - fv];
-                    let p1 = clip[scene.indices[t + 1] as usize - fv];
-                    let p2 = clip[scene.indices[t + 2] as usize - fv];
+                    let l = scene.tris[tri as usize];
+                    let (p0, p1, p2) = (clip[l[0] as usize], clip[l[1] as usize], clip[l[2] as usize]);
                     // Trivial rejects against the frustum in clip space.
                     if (p0.w < near && p1.w < near && p2.w < near)
                         || (p0.x > p0.w && p1.x > p1.w && p2.x > p2.w)
@@ -960,10 +957,10 @@ pub fn unproject(frame: &Frame, scene: &Scene, x: usize, y: usize) -> Option<(Ve
     let w0 = b[0] * s.bary[0][0] + b[1] * s.bary[1][0] + b[2] * s.bary[2][0];
     let w1 = b[0] * s.bary[0][1] + b[1] * s.bary[1][1] + b[2] * s.bary[2][1];
     let w2 = b[0] * s.bary[0][2] + b[1] * s.bary[1][2] + b[2] * s.bary[2][2];
-    let t = s.tri as usize * 3;
-    let (i0, i1, i2) = (scene.indices[t] as usize, scene.indices[t + 1] as usize, scene.indices[t + 2] as usize);
-    let p = scene.positions[i0] * w0 + scene.positions[i1] * w1 + scene.positions[i2] * w2;
-    let n = (scene.normals[i0] * w0 + scene.normals[i1] * w1 + scene.normals[i2] * w2).normalize_or(Vec3::Y);
+    let c = &scene.clusters[s.cluster as usize];
+    let [i0, i1, i2] = scene.tri(c, s.tri);
+    let p = scene.pos(c, i0) * w0 + scene.pos(c, i1) * w1 + scene.pos(c, i2) * w2;
+    let n = (scene.normal(i0) * w0 + scene.normal(i1) * w1 + scene.normal(i2) * w2).normalize_or(Vec3::Y);
     Some((p, n))
 }
 

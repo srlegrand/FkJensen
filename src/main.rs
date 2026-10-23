@@ -1086,7 +1086,7 @@ fn load_file(path: &Path) -> Result<Scene, String> {
         "{name}: read in {:.2} s: {} triangles, {} vertices, {} clusters ({} with texture tiles, left in the file), {} lights",
         t.elapsed().as_secs_f64(),
         scene.triangle_count(),
-        scene.positions.len(),
+        scene.vertex_count(),
         scene.clusters.len(),
         tiled,
         scene.lights.len()

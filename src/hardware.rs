@@ -108,15 +108,15 @@ const STILL_S: f64 = 2.0;
 /// Largest automatic `--png` size.
 const PNG_MAX: (usize, usize) = (1280, 720);
 /// Memory the built-in set needs with the high-resolution T-rex, all
-/// features on, at 1280 x 720 (measured peak 2,523 MB on x86-64,
-/// 21/10/2026), with margin.
-const HIGHRES_MEMORY: u64 = 3200 << 20;
+/// features on, at 1280 x 720 (measured peak 1,237 MB on x86-64 with
+/// geometry held quantised, 23/10/2026), with margin.
+const HIGHRES_MEMORY: u64 = 1700 << 20;
 /// What the built-in set takes before the two caches: peaks measured with
 /// `--png`, rounded up. With the high-resolution T-rex and its levels of
-/// detail, 1,983 MB (23/10/2026, 2 cores of a Xeon at 2.1 GHz; 2,603 MB
-/// without levels on 22/10/2026 on an i5-8250U); with the low-resolution
-/// one, 492 MB. The caches' budgets come out of what is left.
-const HIGHRES_PEAK: u64 = 2100 << 20;
+/// detail, 1,237 MB with geometry held quantised (2,008 MB before, both
+/// 23/10/2026, 2 cores of a Xeon at 2.1 GHz); with the low-resolution
+/// one, 517 MB. The caches' budgets come out of what is left.
+const HIGHRES_PEAK: u64 = 1300 << 20;
 const LOWRES_PEAK: u64 = 512 << 20;
 /// Bytes read and written per triangle each time visibility runs: vertex
 /// positions and the setup record. The high-resolution T-rex has 10.8 M

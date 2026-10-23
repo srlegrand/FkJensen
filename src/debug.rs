@@ -181,14 +181,14 @@ fn hit(ctx: &Ctx, frame: &Frame, x: usize, y: usize) -> Option<Hit> {
     let s = &frame.setups[id as usize];
     let w = weights(s, x as f32 + 0.5, y as f32 + 0.5);
     let sc = ctx.scene;
-    let t = s.tri as usize * 3;
-    let (i0, i1, i2) = (sc.indices[t] as usize, sc.indices[t + 1] as usize, sc.indices[t + 2] as usize);
-    let p = sc.positions[i0] * w[0] + sc.positions[i1] * w[1] + sc.positions[i2] * w[2];
-    let mut n = (sc.normals[i0] * w[0] + sc.normals[i1] * w[1] + sc.normals[i2] * w[2]).normalize_or(Vec3::Y);
+    let c = &sc.clusters[s.cluster as usize];
+    let [i0, i1, i2] = sc.tri(c, s.tri);
+    let p = sc.pos(c, i0) * w[0] + sc.pos(c, i1) * w[1] + sc.pos(c, i2) * w[2];
+    let mut n = (sc.normal(i0) * w[0] + sc.normal(i1) * w[1] + sc.normal(i2) * w[2]).normalize_or(Vec3::Y);
     if n.dot(ctx.cam.eye - p) < 0.0 {
         n = -n;
     }
-    let vcol = sc.colors[i0] * w[0] + sc.colors[i1] * w[1] + sc.colors[i2] * w[2];
+    let vcol = sc.color(i0) * w[0] + sc.color(i1) * w[1] + sc.color(i2) * w[2];
     Some(Hit { cluster: s.cluster as usize, tri: s.tri, w, p, n, vcol })
 }
 
