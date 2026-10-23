@@ -18,6 +18,8 @@
 //!   fkjensen --no-reach                evaluate every light everywhere (to compare)
 //!   fkjensen --no-occlusion            draw what is hidden behind what was seen (to compare)
 //!   fkjensen --no-adaptive             shade every grid point (to compare)
+//!   fkjensen --relight-on-move         light everything again when an object moves (to compare)
+//!   fkjensen --png out.png --bench-move  then move the first model five times, timing each frame
 //!   fkjensen --close                   start on the close framing of the subject
 //!   fkjensen --look ex,ey,ez,tx,ty,tz  camera at e looking at t, in metres
 //!   fkjensen --no-shadows              point lights without shadow maps
@@ -448,12 +450,7 @@ impl App {
             _ => {}
         }
         match m.target {
-            Selection::Object(i) => {
-                self.scene.set_object(i, pivot, rotation, scale);
-                for r in self.scene.moving_clusters(i) {
-                    self.renderer.moved(r, false);
-                }
-            }
+            Selection::Object(i) => self.move_object(i, pivot, rotation, scale),
             Selection::Light(i) => {
                 if let Some(l) = self.rig.lights.get_mut(i) {
                     l.position = pivot;
@@ -463,14 +460,30 @@ impl App {
         }
     }
 
+    /// Place object `i` (and what is under it), telling the renderer where
+    /// it was and where it is, so only what that changes is redone.
+    fn move_object(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: f32) {
+        let from = self.scene.object_bounds(i);
+        self.scene.set_object(i, pivot, rotation, scale);
+        let to = self.scene.object_bounds(i);
+        for r in self.scene.moving_clusters(i) {
+            self.renderer.moved(r, from, to, false);
+        }
+    }
+
+    /// Object `i` stopped moving: bounce light is made again.
+    fn object_settled(&mut self, i: usize) {
+        let b = self.scene.object_bounds(i);
+        for r in self.scene.moving_clusters(i) {
+            self.renderer.moved(r, b, b, true);
+        }
+    }
+
     /// The pointer let go of a manipulator.
     fn end_manip(&mut self) {
         if let Some(m) = self.manip.take() {
             if let Selection::Object(i) = m.target {
-                // Bounce light is made again now the object has settled.
-                for r in self.scene.moving_clusters(i) {
-                    self.renderer.moved(r, true);
-                }
+                self.object_settled(i);
             }
         }
     }
@@ -1187,6 +1200,8 @@ fn main() {
     let mut reach = true;
     let mut occlusion = true;
     let mut adaptive = true;
+    let mut incremental_moves = true;
+    let mut bench_move = false;
     let mut close = false;
     let mut shadows: Option<bool> = None;
     let mut bounce: Option<bool> = None;
@@ -1265,6 +1280,8 @@ fn main() {
             "--no-reach" => reach = false,
             "--no-occlusion" => occlusion = false,
             "--no-adaptive" => adaptive = false,
+            "--relight-on-move" => incremental_moves = false,
+            "--bench-move" => bench_move = true,
             "--close" => close = true,
             "--no-shadows" => shadows = Some(false),
             "--shadows" => shadows = Some(true),
@@ -1330,7 +1347,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--relight-on-move] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1414,6 +1431,7 @@ fn main() {
     app.settings.light_reach = reach;
     app.settings.occlusion = occlusion;
     app.settings.adaptive = adaptive;
+    app.settings.incremental_moves = incremental_moves;
     if let Some(p) = &plan {
         app.settings.shadows = p.shadows;
         app.settings.shadow_res = p.shadow_res;
@@ -1609,6 +1627,38 @@ fn main() {
             let drag_out = out.replace(".png", "_dragged.png");
             if save_png(&app.frame, &drag_out).is_ok() {
                 eprintln!("wrote {drag_out}");
+            }
+        }
+        if bench_move && !app.scene.objects.is_empty() {
+            // Move the first model 10 cm at a time, as a drag would.
+            app.settings.bounce_budget_ms = Some(30.0);
+            for step in 1..=5 {
+                let o = app.scene.objects[0].clone();
+                app.move_object(0, o.pivot + Vec3::new(0.1, 0.0, 0.0), o.rotation, o.scale);
+                let t = Instant::now();
+                app.render();
+                let s = app.frame.stats;
+                eprintln!(
+                    "move step {step}: {:.1} ms: shadows {:.1} ms ({} maps drawn again in part or whole, {} triangles), {} clusters lit again, visibility {:.1} ms, shade {:.1} ms ({} points), gather {:.1} ms, resolve {:.1} ms",
+                    t.elapsed().as_secs_f32() * 1000.0,
+                    s.shadow_ms,
+                    s.shadow_maps_built,
+                    s.shadow_tris,
+                    s.clusters_relit,
+                    s.setup_ms + s.bin_ms + s.raster_ms,
+                    s.shade_ms,
+                    s.points_shaded,
+                    s.gather_ms,
+                    s.resolve_ms
+                );
+            }
+            app.object_settled(0);
+            let t = Instant::now();
+            app.render();
+            eprintln!("let go: {:.1} ms (bounce light made again)", t.elapsed().as_secs_f32() * 1000.0);
+            let move_out = out.replace(".png", "_moved.png");
+            if save_png(&app.frame, &move_out).is_ok() {
+                eprintln!("wrote {move_out}");
             }
         }
         if bench_orbit {

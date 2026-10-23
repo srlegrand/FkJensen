@@ -418,6 +418,10 @@ With the T-rex and the car, 1280 x 720, everything on: 2,523 MB
 | everything on | 473 MB |
 - `--bench-drag` (with `--png`) then moves the first light 10 cm five times,
   as a drag would, and times each frame.
+- `--bench-move` (with `--png`) moves the first model 10 cm along X five
+  times, as a drag would, times each frame, lets go, and writes
+  `<out>_moved.png`. `--relight-on-move` throws away every shadow map and
+  all shading when an object moves instead, to compare.
 
 The window title shows the frame rate, the selected light's lumens,
 position and reach, the sky, whether visibility was kept from the last
@@ -570,7 +574,12 @@ Painting the interface took about 7 ms a frame at 1920 x 1080 on the same
    all of them. The first frame of a drag makes the share. While the
    camera holds still, grids are not checked against the view again. A change of
    sky, exposure, light reach, shadows or number of lights throws away all
-   shading.
+   shading. A moved object keeps every shadow map: each light and sun
+   cascade that reaches where it was or is clears one rectangle round both
+   places and draws again only the clusters that cover it. Only the
+   moved object and the shading points whose shadow cone (towards a point
+   light) or cylinder (towards the sun) crosses its old or new box are
+   shaded again. Letting go makes the bounce light again.
 2. **Shadow maps** for lights that have none (`src/shadow.rs`), in parallel.
    Then **surfels** inside a changed light's reach are lit again, and the
    bounce receivers that change could reach are thrown away.
@@ -662,6 +671,22 @@ choosing costs too. The high-resolution T-rex's triangles are mostly under
 a few pixels, with grids too small to skip much in. Picture: of 921,600
 pixels, 422 (wide) and 682 (close) differ by more than 2 of 255, at most
 by 20 and 43, along sharp highlights and shadow edges.
+
+Moving the high-resolution T-rex 10 cm five times (`--bench-move`), one
+run each, steps 1 to 5:
+
+| | everything relit | where it was and is |
+|---|---|---|
+| a frame | 682 to 745 ms | 535 to 675 ms |
+| shadow maps | 80 to 88 ms (1.05 M triangles) | 115 to 148 ms (0.96 M triangles) |
+| shading | 269 to 313 ms (1.41 M points) | 170 to 259 ms (0.93 M points) |
+
+The T-rex fills most of what its lights see, so a rectangle round it
+holds almost every triangle a map has; drawing part of a map costs more
+than drawing it all, with clearing and choosing. A small object gains
+more. Without bounce light both pictures are the same; with it, 171 of
+921,600 pixels differ, by up to 30 of 255, from the bounce light caught
+up at different times.
 
 The changed light's own share (patch of 23/10/2026), dragging the key
 light, best of three runs of steps 1 to 5 (the first frame of a drag
@@ -812,6 +837,11 @@ Not measured yet: a Raspberry Pi.
   visibility raster, the resolve and setting up the shading points are
   not. The texel loads of a shadow lookup are one lane at a time. On the
   Raspberry Pi 1 (no NEON) the eight lanes are plain arrays.
+- Moving an object: shadow maps are drawn again in a rectangle round both
+  its old and new place, so a large object (the T-rex) costs about as
+  many triangles as a full map; the moved object itself is shaded again
+  whole; bounce light is made again only on letting go, so it lags while
+  dragging.
 - Vertex splatting.
 - Occlusion culling tests bounding spheres against the farthest depth of
   4 x 4 blocks, so a block on an outline (the T-rex against the sky)

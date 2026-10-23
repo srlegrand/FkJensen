@@ -165,14 +165,95 @@ impl CubeShadow {
         out
     }
 
+    /// Draw the map again where the boxes `moved` fall on it (where an
+    /// object was and is), with everything inside `reach` that covers
+    /// those texels. Returns the triangles drawn.
+    pub fn redraw(&mut self, scene: &Scene, moved: &[(Vec3, Vec3)], reach: f32) -> u64 {
+        let (pos, res) = (self.position, self.res);
+        let lod_scale = crate::scene::perspective_scale(pos, res as f32 * 0.5, 1e-3);
+        let near_clusters: Vec<usize> = (0..scene.clusters.len())
+            .into_par_iter()
+            .filter(|&i| {
+                let c = &scene.clusters[i];
+                c.centre.distance(pos) <= c.radius + reach && c.lod_drawn(1.0, &lod_scale)
+            })
+            .collect();
+        let tris: u64 = self
+            .inv_depth
+            .par_chunks_mut(res * res)
+            .enumerate()
+            .map(|(f, face)| {
+                // One rect round every box on this face, drawn once.
+                let rect = moved.iter().filter_map(|&(lo, hi)| face_rect(pos, f, res, lo, hi)).reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]);
+                let Some(rect) = rect else { return 0 };
+                for y in rect[1]..=rect[3] {
+                    face[y * res + rect[0]..=y * res + rect[2]].fill(0.0);
+                }
+                let over = |o: &[usize; 4]| o[0] <= rect[2] && o[2] >= rect[0] && o[1] <= rect[3] && o[3] >= rect[1];
+                let hit: Vec<usize> = near_clusters
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        let c = &scene.clusters[i];
+                        face_rect(pos, f, res, c.centre - Vec3::splat(c.radius), c.centre + Vec3::splat(c.radius)).is_some_and(|o| over(&o))
+                    })
+                    .collect();
+                draw_face_into(face, scene, &hit, pos, f, res, rect)
+            })
+            .sum();
+        tris
+    }
+
     pub fn bytes(&self) -> usize {
         self.inv_depth.len() * 4
     }
 }
 
 fn draw_face(scene: &Scene, clusters: &[usize], pos: Vec3, f: usize, res: usize) -> (Vec<f32>, u64) {
-    let (a, r, u) = FACES[f];
     let mut buf = vec![0f32; res * res];
+    let tris = draw_face_into(&mut buf, scene, clusters, pos, f, res, [0, 0, res - 1, res - 1]);
+    (buf, tris)
+}
+
+/// The texels of face `f` a box covers, as seen from `pos`: x0, y0, x1,
+/// y1 inclusive; the whole face when the box reaches the light; None when
+/// it is not on this face.
+fn face_rect(pos: Vec3, f: usize, res: usize, lo: Vec3, hi: Vec3) -> Option<[usize; 4]> {
+    let (a, r, u) = FACES[f];
+    let rs = res as f32;
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut behind = 0;
+    for k in 0..8 {
+        let p = Vec3::new(if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z });
+        let q = p - pos;
+        let w = q.dot(a);
+        if w <= NEAR {
+            behind += 1;
+            continue;
+        }
+        let (sx, sy) = ((q.dot(r) / w * 0.5 + 0.5) * rs, (q.dot(u) / w * 0.5 + 0.5) * rs);
+        x0 = x0.min(sx);
+        y0 = y0.min(sy);
+        x1 = x1.max(sx);
+        y1 = y1.max(sy);
+    }
+    if behind == 8 {
+        return None;
+    }
+    if behind > 0 {
+        return Some([0, 0, res - 1, res - 1]);
+    }
+    if x1 < 0.0 || y1 < 0.0 || x0 >= rs || y0 >= rs {
+        return None;
+    }
+    let c = |v: f32| (v.max(0.0) as usize).min(res - 1);
+    Some([c(x0.floor()), c(y0.floor()), c(x1.ceil()), c(y1.ceil())])
+}
+
+/// Draw `clusters` into face `f` of `buf`, only the texels in `rect`
+/// (x0, y0, x1, y1 inclusive). Returns the triangles drawn.
+fn draw_face_into(buf: &mut [f32], scene: &Scene, clusters: &[usize], pos: Vec3, f: usize, res: usize, rect: [usize; 4]) -> u64 {
+    let (a, r, u) = FACES[f];
     let mut tris = 0u64;
     let s2 = std::f32::consts::FRAC_1_SQRT_2;
     let planes = [(a - r) * s2, (a + r) * s2, (a - u) * s2, (a + u) * s2];
@@ -214,15 +295,15 @@ fn draw_face(scene: &Scene, clusters: &[usize], pos: Vec3, f: usize, res: usize)
                 }
             }
             for k in 1..poly.len().saturating_sub(1) {
-                fill(&mut buf, res, poly[0], poly[k], poly[k + 1]);
+                fill(buf, res, poly[0], poly[k], poly[k + 1], rect);
             }
         }
     }
-    (buf, tris)
+    tris
 }
 
 /// Rasterise one triangle into a face, keeping the largest 1/w.
-fn fill(buf: &mut [f32], res: usize, a: Vec4, b: Vec4, c: Vec4) {
+fn fill(buf: &mut [f32], res: usize, a: Vec4, b: Vec4, c: Vec4, clip: [usize; 4]) {
     let rs = res as f32;
     let to = |p: Vec4| (((p.x / p.w) * 0.5 + 0.5) * rs, ((p.y / p.w) * 0.5 + 0.5) * rs, 1.0 / p.w);
     let (ax, ay, az) = to(a);
@@ -232,10 +313,10 @@ fn fill(buf: &mut [f32], res: usize, a: Vec4, b: Vec4, c: Vec4) {
     if area == 0.0 || !area.is_finite() {
         return;
     }
-    let x0 = ax.min(bx).min(cx).floor().max(0.0) as usize;
-    let y0 = ay.min(by).min(cy).floor().max(0.0) as usize;
-    let x1 = (ax.max(bx).max(cx).ceil().min(rs - 1.0)).max(0.0) as usize;
-    let y1 = (ay.max(by).max(cy).ceil().min(rs - 1.0)).max(0.0) as usize;
+    let x0 = (ax.min(bx).min(cx).floor().max(0.0) as usize).max(clip[0]);
+    let y0 = (ay.min(by).min(cy).floor().max(0.0) as usize).max(clip[1]);
+    let x1 = ((ax.max(bx).max(cx).ceil().min(rs - 1.0)).max(0.0) as usize).min(clip[2]);
+    let y1 = ((ay.max(by).max(cy).ceil().min(rs - 1.0)).max(0.0) as usize).min(clip[3]);
     if x0 > x1 || y0 > y1 {
         return;
     }
@@ -291,6 +372,32 @@ mod tests {
                 assert_eq!(got[j], m.lit(chunk[j].0, chunk[j].1), "{:?}", chunk[j]);
             }
         }
+    }
+
+    /// Moving the card and drawing the map again where it was and is
+    /// gives the map of a fresh build.
+    #[test]
+    fn redrawing_where_something_moved_matches_a_fresh_map() {
+        let mut s = blocker_scene();
+        let light = Vec3::new(0.0, 1.5, 0.0);
+        let mut m = CubeShadow::build(&s, light, 10.0, 128);
+        // The card is the second cluster: slide it 0.6 m along x.
+        let c = 1;
+        let (fv, n) = (s.clusters[c].first_vertex as usize, s.clusters[c].vertex_count as usize);
+        let bounds = |s: &Scene| {
+            let ps = &s.positions[fv..fv + n];
+            (ps.iter().fold(Vec3::INFINITY, |a, p| a.min(*p)), ps.iter().fold(Vec3::NEG_INFINITY, |a, p| a.max(*p)))
+        };
+        let from = bounds(&s);
+        for p in &mut s.positions[fv..fv + n] {
+            p.x += 0.6;
+        }
+        s.clusters[c].centre.x += 0.6;
+        let to = bounds(&s);
+        m.redraw(&s, &[from, to], 10.0);
+        let fresh = CubeShadow::build(&s, light, 10.0, 128);
+        assert_eq!(m.inv_depth, fresh.inv_depth);
+        assert_eq!(m.lit(Vec3::new(0.0, 0.0, 0.0), Vec3::Y), 1.0, "where it was is lit");
     }
 
     #[test]

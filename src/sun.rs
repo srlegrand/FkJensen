@@ -156,7 +156,7 @@ impl SunShadow {
                                         let p = scene.positions[scene.indices[i + k] as usize] - centre;
                                         Vec4::new((p.dot(right) / half * 0.5 + 0.5) * res as f32, (p.dot(up) / half * 0.5 + 0.5) * res as f32, p.dot(d), 0.0)
                                     });
-                                    n += fill_max(&mut buf, res, v[0], v[1], v[2]) as u64;
+                                    n += fill_max(&mut buf, res, v[0], v[1], v[2], [0.0, 0.0, f32::INFINITY, f32::INFINITY]) as u64;
                                 }
                             }
                             (buf, n)
@@ -250,23 +250,81 @@ impl SunShadow {
         out
     }
 
+    /// Draw the cascades again where the boxes `moved` fall on them (where
+    /// an object was and is), with everything that covers those texels.
+    /// Returns the triangles drawn.
+    pub fn redraw(&mut self, scene: &Scene, moved: &[(Vec3, Vec3)]) -> u64 {
+        let (right, up, d) = (self.right, self.up, self.dir);
+        let mut tris = 0;
+        for cas in &mut self.cascades {
+            let (centre, half, res) = (cas.centre, cas.half, cas.res);
+            let texel = 2.0 * half / res as f32;
+            let to_tex = |p: Vec3| {
+                let q = p - centre;
+                ((q.dot(right) / half * 0.5 + 0.5) * res as f32, (q.dot(up) / half * 0.5 + 0.5) * res as f32)
+            };
+            // A sphere's texels, as a rect.
+            let rect_of = |c: Vec3, r: f32| {
+                let (x, y) = to_tex(c);
+                let k = r / texel;
+                [x - k, y - k, x + k, y + k]
+            };
+            // One rect round every box, drawn once.
+            let Some(r) = moved.iter().map(|&(lo, hi)| rect_of((lo + hi) * 0.5, (hi - lo).length() * 0.5)).reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]) else { continue };
+            let rect = [r[0].floor().max(0.0), r[1].floor().max(0.0), r[2].ceil().min(res as f32 - 1.0), r[3].ceil().min(res as f32 - 1.0)];
+            if rect[0] > rect[2] || rect[1] > rect[3] {
+                continue;
+            }
+            for y in rect[1] as usize..=rect[3] as usize {
+                cas.height[y * res + rect[0] as usize..=y * res + rect[2] as usize].fill(f32::NEG_INFINITY);
+            }
+            // What covers the rect, found in parallel, drawn in order.
+            let hit: Vec<usize> = (0..scene.clusters.len())
+                .into_par_iter()
+                .filter(|&i| {
+                    let c = &scene.clusters[i];
+                    if !c.lod_drawn(texel, |_, _| 1.0) || c.radius * 2.0 < texel * 0.5 {
+                        return false;
+                    }
+                    let o = rect_of(c.centre, c.radius);
+                    !(o[0] > rect[2] + 1.0 || o[2] < rect[0] - 1.0 || o[1] > rect[3] + 1.0 || o[3] < rect[1] - 1.0)
+                })
+                .collect();
+            let height = &mut cas.height;
+            for i in hit {
+                let c = &scene.clusters[i];
+                for t in c.first_tri..c.first_tri + c.tri_count {
+                    let k3 = t as usize * 3;
+                    let v = [0, 1, 2].map(|k| {
+                        let p = scene.positions[scene.indices[k3 + k] as usize];
+                        let (x, y) = to_tex(p);
+                        Vec4::new(x, y, (p - centre).dot(d), 0.0)
+                    });
+                    tris += fill_max(height, res, v[0], v[1], v[2], rect) as u64;
+                }
+            }
+        }
+        tris
+    }
+
     pub fn bytes(&self) -> usize {
         self.cascades.iter().map(|c| c.height.len() * 4).sum()
     }
 }
 
 /// Rasterise a triangle (x, y in texels, z the height) keeping the largest
-/// height; whether it touched any texel.
-fn fill_max(buf: &mut [f32], res: usize, a: Vec4, b: Vec4, c: Vec4) -> bool {
+/// height, inside `clip` (x0, y0, x1, y1 inclusive); whether it touched
+/// any texel.
+fn fill_max(buf: &mut [f32], res: usize, a: Vec4, b: Vec4, c: Vec4, clip: [f32; 4]) -> bool {
     let rs = res as f32;
     let area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
     if area == 0.0 || !area.is_finite() {
         return false;
     }
-    let x0 = a.x.min(b.x).min(c.x).floor().max(0.0);
-    let y0 = a.y.min(b.y).min(c.y).floor().max(0.0);
-    let x1 = a.x.max(b.x).max(c.x).ceil().min(rs - 1.0);
-    let y1 = a.y.max(b.y).max(c.y).ceil().min(rs - 1.0);
+    let x0 = a.x.min(b.x).min(c.x).floor().max(0.0).max(clip[0]);
+    let y0 = a.y.min(b.y).min(c.y).floor().max(0.0).max(clip[1]);
+    let x1 = a.x.max(b.x).max(c.x).ceil().min(rs - 1.0).min(clip[2]);
+    let y1 = a.y.max(b.y).max(c.y).ceil().min(rs - 1.0).min(clip[3]);
     if x0 > x1 || y0 > y1 {
         return false;
     }

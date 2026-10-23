@@ -201,10 +201,7 @@ impl Editor {
             ui.weak("Rotates X, then Y, then Z. Scales the same on every axis, so the texture tiles stay valid.");
         });
         if changed {
-            self.app.scene.set_object(i, p, r * (std::f32::consts::PI / 180.0), k);
-            for r in self.app.scene.moving_clusters(i) {
-                self.app.renderer.moved(r, false);
-            }
+            self.app.move_object(i, p, r * (std::f32::consts::PI / 180.0), k);
             self.pending_bounce = Some(i);
         }
         let (lo, hi) = self.app.scene.object_bounds(i);
@@ -379,6 +376,9 @@ impl Editor {
             ui.end_row();
             ui.label("Adaptive shading");
             ui.checkbox(&mut self.app.settings.adaptive, "");
+            ui.end_row();
+            ui.label("Moves relight their shadows only");
+            ui.checkbox(&mut self.app.settings.incremental_moves, "");
             ui.end_row();
             ui.label("Back-face culling");
             ui.checkbox(&mut self.app.settings.cull_backfaces, "");

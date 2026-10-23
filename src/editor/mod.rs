@@ -139,9 +139,7 @@ impl Editor {
         self.app.count_frame(dt);
         if self.pending_bounce.is_some() && !ctx.egui_is_using_pointer() {
             if let Some(i) = self.pending_bounce.take() {
-                for r in self.app.scene.moving_clusters(i) {
-                    self.app.renderer.moved(r, true);
-                }
+                self.app.object_settled(i);
             }
         }
         if let Some(im) = &mut self.importer {

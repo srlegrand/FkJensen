@@ -101,6 +101,8 @@ pub struct Stats {
     /// clusters then found hidden behind them and skipped.
     pub clusters_first: usize,
     pub clusters_occluded: usize,
+    /// Clusters shaded again because an object's shadow moved over them.
+    pub clusters_relit: usize,
 }
 
 /// A triangle after projection: screen positions, 1/w, and each corner's
@@ -304,6 +306,10 @@ pub struct RenderSettings {
     /// Shade every other grid point first and the rest only where the
     /// light changes (`reyes::shade_adaptive`). Off only to compare.
     pub adaptive: bool,
+    /// When an object moves, draw shadow maps again only where it was and
+    /// is, and shade again only what is in its shadows. Off only to
+    /// compare: everything is lit again.
+    pub incremental_moves: bool,
 }
 
 /// Shading cache budget when the machine's plan does not set one.
@@ -317,7 +323,7 @@ impl RenderSettings {
     }
 
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true }
+        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true }
     }
 }
 

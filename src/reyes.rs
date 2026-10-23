@@ -355,6 +355,8 @@ pub struct Renderer {
     shadows: Vec<Option<CubeShadow>>,
     prev_lights: Vec<PointLight>,
     prev_reach: Vec<f32>,
+    /// Boxes objects were moved from and to since the last frame.
+    moves: Vec<(Vec3, Vec3)>,
     /// The light changed last (`HOT_LIGHTS` at most, most recent first):
     /// only it keeps a share of its own in the shading cache, so memory
     /// grows by one share a point.
@@ -449,6 +451,7 @@ impl Renderer {
             prev_lights: Vec::new(),
             prev_reach: Vec::new(),
             hot: Vec::new(),
+            moves: Vec::new(),
             prev_global: None,
             sun_shadow: None,
             sun_key: None,
@@ -484,18 +487,30 @@ impl Renderer {
     /// have changed), and the shadow maps and visibility are made again.
     /// Bounce light is made again too when `bounce`; while an object is
     /// being dragged it is left, and redone when the drag ends.
-    pub fn moved(&mut self, moved: std::ops::Range<usize>, bounce: bool) {
+    /// Clusters `moved` were moved from the box `from` to the box `to`.
+    /// Their shading goes; next frame the shadow maps are drawn again
+    /// where either box falls on them, and the clusters in the shadow
+    /// either box casts from a light or the sun are shaded again (the
+    /// rest is kept). `bounce`: make bounce light again too (once the
+    /// object settles). The same box twice is the object settling.
+    pub fn moved(&mut self, moved: std::ops::Range<usize>, from: (Vec3, Vec3), to: (Vec3, Vec3), bounce: bool) {
+        if bounce {
+            self.bounce = None;
+        }
+        if from == to {
+            return;
+        }
         for c in moved {
             if let Some(e) = self.cache.get_mut(c) {
                 *e = ClusterShade::empty();
             }
         }
-        self.prev_global = None;
-        self.sun_key = None;
-        self.vis_key = None;
-        if bounce {
-            self.bounce = None;
+        for b in [from, to] {
+            if !self.moves.contains(&b) {
+                self.moves.push(b);
+            }
         }
+        self.vis_key = None;
     }
 
     pub fn memory(&self) -> usize {
@@ -526,7 +541,8 @@ impl Renderer {
 
         // What changed since the last frame decides what is thrown away.
         let global = (settings.sky, settings.sun, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.bounce, settings.shadow_res, settings.adaptive);
-        let global_changed = self.prev_global != Some(global) || self.prev_lights.len() != lights.len();
+        // Without incremental moves (to compare), a move relights all.
+        let global_changed = self.prev_global != Some(global) || self.prev_lights.len() != lights.len() || (!settings.incremental_moves && !self.moves.is_empty());
         // Spheres (old and new position, with reach) of lights that changed,
         // and which light.
         let mut spheres: Vec<(Vec3, f32)> = Vec::new();
@@ -569,8 +585,78 @@ impl Renderer {
         self.prev_lights = lights.to_vec();
         self.prev_reach = reach.clone();
 
-        // Shadow maps for lights that have none.
+        // Moved objects: shadow maps drawn again where they were and are,
+        // and the clusters in the shadows they cast shaded again.
         let ts = std::time::Instant::now();
+        let moves = std::mem::take(&mut self.moves);
+        if !moves.is_empty() && global_changed {
+            // Everything is made again anyway; the sun's map too.
+            self.sun_key = None;
+        }
+        if !moves.is_empty() && !global_changed {
+            let spheres_m: Vec<(Vec3, f32)> = moves.iter().map(|(lo, hi)| ((*lo + *hi) * 0.5, (*hi - *lo).length() * 0.5)).collect();
+            let sun_dir = settings.sun.dir;
+            let sun_up = settings.shadows && settings.sun.up();
+            for (i, l) in lights.iter().enumerate() {
+                let touched: Vec<(Vec3, Vec3)> = moves.iter().zip(&spheres_m).filter(|(_, (c, r))| c.distance(l.position) <= r + reach[i]).map(|(b, _)| *b).collect();
+                if touched.is_empty() {
+                    continue;
+                }
+                if let Some(Some(m)) = self.shadows.get_mut(i) {
+                    let r = if reach[i].is_finite() { reach[i] } else { scene.radius() * 4.0 + l.position.distance(scene.centre()) };
+                    frame.stats.shadow_tris += m.redraw(scene, &touched, r);
+                    frame.stats.shadow_maps_built += 1;
+                }
+            }
+            if sun_up {
+                if let Some(m) = self.sun_shadow.as_mut() {
+                    frame.stats.shadow_tris += m.redraw(scene, &moves);
+                    frame.stats.shadow_maps_built += 1;
+                }
+            }
+            // Who is in a moved box's shadow, before or after.
+            let in_shadow = |c: &crate::scene::Cluster| -> bool {
+                spheres_m.iter().any(|&(b, rb)| {
+                    let near = c.centre.distance(b) <= c.radius + rb;
+                    if near {
+                        return true;
+                    }
+                    let from_light = lights.iter().enumerate().any(|(i, l)| {
+                        if l.position.distance(c.centre) > c.radius + reach[i] {
+                            return false;
+                        }
+                        let (to_b, to_c) = (b - l.position, c.centre - l.position);
+                        let (db, dc) = (to_b.length(), to_c.length());
+                        if db <= rb || dc <= c.radius {
+                            return true;
+                        }
+                        if dc + c.radius < db - rb {
+                            return false;
+                        }
+                        let ang = to_b.dot(to_c) / (db * dc);
+                        let spread = (rb / db).min(1.0).asin() + (c.radius / dc).min(1.0).asin();
+                        ang.clamp(-1.0, 1.0).acos() <= spread
+                    });
+                    let from_sun = sun_up && {
+                        let q = c.centre - b;
+                        let along = q.dot(sun_dir);
+                        along <= rb + c.radius && (q - sun_dir * along).length() <= rb + c.radius
+                    };
+                    from_light || from_sun
+                })
+            };
+            let forgot = AtomicU64::new(0);
+            self.cache.par_iter_mut().zip(scene.clusters.par_iter()).for_each(|(e, c)| {
+                if in_shadow(c) {
+                    e.forget_light();
+                    forgot.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            frame.stats.clusters_relit = forgot.into_inner() as usize;
+            full_resolve = true;
+        }
+
+        // Shadow maps for lights that have none.
         if settings.shadows {
             let missing: Vec<usize> = (0..lights.len()).filter(|&i| self.shadows[i].is_none()).collect();
             let built: Vec<(usize, CubeShadow)> = missing
@@ -582,7 +668,7 @@ impl Renderer {
                     (i, CubeShadow::build(scene, lights[i].position, r, settings.shadow_res))
                 })
                 .collect();
-            frame.stats.shadow_maps_built = built.len();
+            frame.stats.shadow_maps_built += built.len();
             for (i, m) in built {
                 frame.stats.shadow_tris += m.tris;
                 self.shadows[i] = Some(m);
@@ -615,8 +701,10 @@ impl Renderer {
         let shadows: Vec<Option<&CubeShadow>> = (0..lights.len()).map(|i| if settings.shadows { self.shadows[i].as_ref() } else { None }).collect();
         let sky = settings.sky;
         if settings.bounce {
+            let new_cloud = self.bounce.is_none();
             let b = self.bounce.get_or_insert_with(|| Bounce::new(scene));
-            let all = global_changed;
+            // A new surfel cloud (an object moved) is lit whole.
+            let all = global_changed || new_cloud;
             if all || !spheres.is_empty() {
                 let lit = AtomicU64::new(0);
                 // The brightest change, as an intensity (cd): how far the
@@ -2138,8 +2226,10 @@ mod tests {
         let mut f = Frame::new(w, h);
         r.render(&scene, &cam, &lights, &settings, &mut f);
         let before = f.color.clone();
+        let from = scene.object_bounds(0);
         scene.set_object(0, Vec3::new(0.6, 0.3, 0.2), Vec3::new(0.4, 0.5, -0.3), 1.4);
-        r.moved(scene.objects[0].clusters.clone(), true);
+        let to = scene.object_bounds(0);
+        r.moved(scene.objects[0].clusters.clone(), from, to, true);
         r.render(&scene, &cam, &lights, &settings, &mut f);
         assert_ne!(f.color, before, "the picture changed");
         let mut fresh = Frame::new(w, h);
