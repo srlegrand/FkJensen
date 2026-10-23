@@ -139,9 +139,23 @@ object within two spacings, weighted by distance and facing, and the sky
 and ground terms are multiplied by it. Discs nearer than a few spacings
 and low over a sample's horizon are left out, and a near disc is held to
 half its distance across: as discs they would cover far more than the
-bump of skin they stand for. Occlusion by other objects (the ground under
-the T-rex) is not in it yet. `--no-sky-occlusion` turns it off, to
-compare; `--debug-view sky-share` shows the share.
+bump of skin they stand for.
+
+Occlusion between objects is worked out as the frame is shaded, since
+objects move: a point near another object (within that object's bounding
+radius past its bounding sphere, fading out over the second half) has the
+sky that object's sample discs hide from it taken away, disc by disc near
+and in groups farther off, only discs facing the point counting, so that
+the far side of a leg is not counted again behind its near side (Bunnell,
+"Dynamic Ambient Occlusion and Indirect Lighting", 2005). It is
+directional: each disc takes the sky's radiance in its own direction. The
+ground under the T-rex and round its feet gets darker, and the car beside
+it would too. Objects need samples for this, not transfer, so a model
+without `SAMP` still darkens what is near it. Only points that are shaded
+look their share up; those interpolated between them take it with their
+light. Moving an object shades again what is within its reach as well as
+its shadows. `--no-sky-occlusion` turns both off, to compare;
+`--debug-view sky-share` shows the share.
 
 ### Light reach
 
@@ -381,7 +395,7 @@ build leaves them out.
 | `surfels` | the surfel cloud as lit discs |
 | `receivers` | bounce receivers: gathered or waiting |
 | `samples` | each object's surface samples, one colour each |
-| `sky-share` | each point's share of the sky, from its object's sky transfer |
+| `sky-share` | each point's share of the sky: its object's sky transfer, times what other objects hide |
 | `micro-raster` | the 6 x 8 x 8 cube raster of the receiver under the cursor, x4, and what its spherical harmonics give back |
 
 ## Without a display server
@@ -906,13 +920,20 @@ Not measured yet: a Raspberry Pi.
   visibility raster, the resolve and setting up the shading points are
   not. The texel loads of a shadow lookup are one lane at a time. On the
   Raspberry Pi 1 (no NEON) the eight lanes are plain arrays.
-- Sky occlusion: only an object's own shape; other objects (the T-rex
-  over the ground) and the ground and mountains take nothing yet. The
-  share comes from samples about 2 cm apart, so a crease narrower than a
-  few centimetres (between scales, under a claw) is not darkened. A model
-  imported before 23/10/2026 has no transfer until `fkj-import --sky` is
-  run on it. Each shading point looks its share up, which made the first
-  frame's shading of the high-resolution set 474 to 553 ms (2 cores).
+- Sky occlusion: the ground and the mountains take no sky from anything
+  (they have no samples), and only objects with samples take sky from
+  others. Between objects each disc's share is added up, so where two
+  parts of an object overlap as seen from a point they are counted twice
+  (held to all of the sky); groups of discs switch to their parts at a
+  set ratio of size to distance, which leaves faint rings on the ground
+  round the feet. The share comes from samples about 2 cm apart, so a
+  crease narrower than a few centimetres (between scales, under a claw) is
+  not darkened. A model imported before 23/10/2026 has no transfer until
+  `fkj-import --sky` is run on it. Cost on 2 cores, the high-resolution
+  set, best of three: first frame shading 362 to 423 ms, a key light drag
+  frame 341 to 344 ms (shares kept), turning the camera 549 to 655 ms a
+  frame (median), moving the T-rex 552 to 640 ms a step to 706 to 793 ms
+  (the shares are made again each step).
 - Moving an object: shadow maps are drawn again in a rectangle round both
   its old and new place, so a large object (the T-rex) costs about as
   many triangles as a full map; the moved object itself is shaded again

@@ -124,6 +124,9 @@ const RES: usize = 8;
 /// this.
 const FAR: f32 = 0.2;
 const LEAF: usize = 4;
+/// For occlusion between objects, a group is taken whole when its radius
+/// over its distance is below this: soft, so coarser.
+const CROSS_FAR: f32 = 0.5;
 
 /// The six cube faces: (axis, right, up).
 const FACES: [(Vec3, Vec3, Vec3); 6] = [
@@ -358,6 +361,64 @@ impl Occluders {
         cov
     }
 
+    /// The sky and the ground's light that this model's discs hide from a
+    /// point of another object (or of the ground) at `p` facing `n`, each
+    /// as irradiance up to the scale of `radiance` (sky, ground). Only
+    /// discs facing the point count, so that the far side of the model is
+    /// not counted again behind its near side (Bunnell, 2005).
+    pub fn hidden(&self, p: Vec3, n: Vec3, radiance: impl Fn(Vec3) -> [f32; 2]) -> [f32; 2] {
+        let mut out = [0f32; 2];
+        if self.nodes.is_empty() {
+            return out;
+        }
+        let mut add = |q: Vec3, proj: f32, d2: f32| {
+            let d = d2.sqrt().max(1e-9);
+            let dir = (q - p) / d;
+            let cos = n.dot(dir);
+            if cos <= 0.0 || proj <= 0.0 {
+                return;
+            }
+            // Solid angle, kept finite as a disc comes near (Bunnell).
+            let omega = (proj / (d2 + proj / std::f32::consts::PI)).min(2.0 * std::f32::consts::PI);
+            let r = radiance(dir);
+            out[0] += r[0] * cos * omega;
+            out[1] += r[1] * cos * omega;
+        };
+        let mut stack: Vec<u32> = vec![0];
+        while let Some(i) = stack.pop() {
+            let nd = &self.nodes[i as usize];
+            // Wholly below the point's horizon.
+            if n.dot(nd.centre - p) < -nd.radius || nd.area <= 0.0 {
+                continue;
+            }
+            let to = nd.centre - p;
+            let d2 = to.length_squared();
+            if !nd.leaf && d2 > 0.0 && nd.radius * nd.radius < CROSS_FAR * CROSS_FAR * d2 {
+                // The side it shows the point: at least a quarter of its
+                // area, as a closed shape does.
+                let proj = (-nd.n_sum.dot(to) / d2.sqrt()).max(nd.area * 0.25).min(nd.area);
+                add(nd.centre, proj, d2);
+                continue;
+            }
+            if !nd.leaf {
+                stack.push(nd.a);
+                stack.push(nd.b);
+                continue;
+            }
+            for k in nd.a..nd.a + nd.b {
+                let dc = &self.discs[k as usize];
+                let v = p - dc.p;
+                let d2 = v.length_squared();
+                let facing = dc.n.dot(v);
+                if facing <= 0.0 {
+                    continue;
+                }
+                add(dc.p, dc.area * facing / d2.sqrt().max(1e-9), d2);
+            }
+        }
+        out
+    }
+
     /// The nine numbers of sample `me`: the open part of its raster,
     /// cosine weighted. Corrected so that an open sample gives exactly
     /// `open_transfer` (the raster's own error at no occlusion taken out).
@@ -397,15 +458,7 @@ pub fn compute(samples: &mut [Sample]) {
 /// one half, an even sphere blended with an even upper half; above, a lobe
 /// overhead that narrows. And the ground's: an even lower half.
 pub fn sky_coefficients(contrast: f32) -> ([f32; 9], [f32; 9]) {
-    let c = contrast.clamp(0.0, 1.0);
-    let k = 1.0 + 6.0 * (c - 0.5);
-    let radiance = |d: Vec3| -> f32 {
-        if c <= 0.5 {
-            (1.0 - 2.0 * c) + 2.0 * c * (d.y > 0.0) as u8 as f32
-        } else {
-            d.y.max(0.0).powf(k - 1.0) * (d.y > 0.0) as u8 as f32
-        }
-    };
+    let radiance = sky_radiance(contrast);
     let n = 4096;
     let (mut s, mut g) = ([0f32; 9], [0f32; 9]);
     let w = 4.0 * std::f32::consts::PI / n as f32;
@@ -422,6 +475,21 @@ pub fn sky_coefficients(contrast: f32) -> ([f32; 9], [f32; 9]) {
         }
     }
     (s, g)
+}
+
+/// The sky's radiance by direction for `sky_coefficients`, up to a scale.
+pub fn sky_radiance(contrast: f32) -> impl Fn(Vec3) -> f32 + Copy {
+    let c = contrast.clamp(0.0, 1.0);
+    let k = 1.0 + 6.0 * (c - 0.5);
+    move |d: Vec3| -> f32 {
+        if c <= 0.5 {
+            (1.0 - 2.0 * c) + 2.0 * c * (d.y > 0.0) as u8 as f32
+        } else if d.y > 0.0 {
+            d.y.powf(k - 1.0)
+        } else {
+            0.0
+        }
+    }
 }
 
 /// A sample's share of the sky and of the ground's light, 0 to 1, for
@@ -453,7 +521,22 @@ pub struct SkyShare {
     /// Open-addressed table of cells: key, first and count in `order`.
     table: Vec<(u64, u32, u32)>,
     order: Vec<u32>,
+    /// Per object with samples: its discs, and the sphere round them.
+    occluders: Vec<Option<(Occluders, Vec3, f32)>>,
+    /// Per cluster, the other objects near enough to hide some of its sky:
+    /// `near[near_at[c]..near_at[c + 1]]`.
+    near_at: Vec<u32>,
+    near: Vec<u32>,
+    /// Sky and ground coefficients, and the sky's radiance.
+    l: ([f32; 9], [f32; 9]),
+    contrast: f32,
 }
+
+/// How far past its bounding sphere an object hides sky from others, as a
+/// share of that sphere's radius; its effect fades out over the second
+/// half of that.
+pub const INFLUENCE: f32 = 1.0;
+
 
 #[inline]
 fn cell_key(x: i32, y: i32, z: i32) -> u64 {
@@ -501,7 +584,50 @@ impl SkyShare {
             }
             table[h] = r;
         }
-        SkyShare { share, cluster_object, radius, sample_object, cell, table, order }
+        // Every object with samples hides sky from what is near it.
+        let occluders: Vec<Option<(Occluders, Vec3, f32)>> = {
+            use rayon::prelude::*;
+            scene
+                .objects
+                .par_iter()
+                .map(|o| {
+                    let r = scene.samples_in(o.clusters.clone());
+                    if r.is_empty() {
+                        return None;
+                    }
+                    let ss = &samples[r];
+                    let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+                    for x in ss {
+                        lo = lo.min(x.position);
+                        hi = hi.max(x.position);
+                    }
+                    let c = (lo + hi) * 0.5;
+                    let rad = ss.iter().map(|x| x.position.distance(c)).fold(0.0, f32::max);
+                    Some((Occluders::new(ss), c, rad))
+                })
+                .collect()
+        };
+        let mut near_at = Vec::with_capacity(scene.clusters.len() + 1);
+        let mut near = Vec::new();
+        let owner = {
+            let mut v = vec![u32::MAX; scene.clusters.len()];
+            for (i, o) in scene.objects.iter().enumerate() {
+                v[o.clusters.clone()].fill(i as u32);
+            }
+            v
+        };
+        for (ci, c) in scene.clusters.iter().enumerate() {
+            near_at.push(near.len() as u32);
+            for (j, oc) in occluders.iter().enumerate() {
+                if let Some((_, oc, or)) = oc {
+                    if j as u32 != owner[ci] && c.centre.distance(*oc) <= c.radius + or * (1.0 + INFLUENCE) {
+                        near.push(j as u32);
+                    }
+                }
+            }
+        }
+        near_at.push(near.len() as u32);
+        SkyShare { share, cluster_object, radius, sample_object, cell, table, order, occluders, near_at, near, l, contrast }
     }
 
     #[inline]
@@ -520,16 +646,56 @@ impl SkyShare {
         }
     }
 
-    /// Whether points of cluster `ci` take a share from samples.
+    /// Whether points of cluster `ci` take a share from samples: their
+    /// own object's, or other objects' near them.
     #[inline]
     pub fn covers(&self, ci: usize) -> bool {
-        self.cluster_object.get(ci).is_some_and(|&o| o != u32::MAX)
+        self.cluster_object.get(ci).is_some_and(|&o| o != u32::MAX) || self.near_at.get(ci + 1).is_some_and(|&e| e > self.near_at[ci])
+    }
+
+    /// The share other objects leave a point of cluster `ci` at `p` facing
+    /// `n`: one minus what their discs hide, over what an open point facing
+    /// that way gets, for the sky and for the ground's light.
+    pub fn others(&self, ci: usize, p: Vec3, n: Vec3) -> [f32; 2] {
+        let Some(&end) = self.near_at.get(ci + 1) else { return [1.0, 1.0] };
+        let start = self.near_at[ci];
+        if start == end {
+            return [1.0, 1.0];
+        }
+        let open = open_transfer(n);
+        let (o_sky, o_ground) = (dot9(&open, &self.l.0), dot9(&open, &self.l.1));
+        let sky = sky_radiance(self.contrast);
+        let mut out = [1f32, 1.0];
+        for &j in &self.near[start as usize..end as usize] {
+            let Some((occ, c, r)) = &self.occluders[j as usize] else { continue };
+            let past = p.distance(*c) - r;
+            let reach = r * INFLUENCE;
+            if past >= reach {
+                continue;
+            }
+            let fade = if past <= 0.5 * reach { 1.0 } else { 2.0 * (1.0 - past / reach) };
+            let h = occ.hidden(p, n, |d| [sky(d), (d.y < 0.0) as u8 as f32]);
+            if o_sky > 1e-6 {
+                out[0] *= (1.0 - fade * h[0] / o_sky).clamp(0.0, 1.0);
+            }
+            if o_ground > 1e-6 {
+                out[1] *= (1.0 - fade * h[1] / o_ground).clamp(0.0, 1.0);
+            }
+        }
+        out
     }
 
     /// The shares at a point of cluster `ci` at `p` facing `n`: the samples
     /// of its object within reach, weighted by distance and by how close
     /// their facing is. Points no sample reaches get the whole sky.
     pub fn at(&self, ci: usize, scene: &crate::scene::Scene, p: Vec3, n: Vec3) -> [f32; 2] {
+        let own = self.own(ci, scene, p, n);
+        let others = self.others(ci, p, n);
+        [own[0] * others[0], own[1] * others[1]]
+    }
+
+    /// The share an object's own shape leaves a point of it.
+    fn own(&self, ci: usize, scene: &crate::scene::Scene, p: Vec3, n: Vec3) -> [f32; 2] {
         let o = match self.cluster_object.get(ci) {
             Some(&o) if o != u32::MAX => o,
             _ => return [1.0, 1.0],

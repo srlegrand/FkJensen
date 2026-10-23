@@ -385,6 +385,8 @@ pub struct Renderer {
     rate_scale: f32,
     /// Each sample's share of the sky, for the sky contrast it was made for.
     sky_share: Option<(SkyShare, u32)>,
+    /// Each surfel's share of the sky, for the shares above.
+    surfel_share: Vec<f32>,
 }
 
 #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
@@ -471,6 +473,7 @@ impl Renderer {
             frame_no: 0,
             rate_scale: 1.0,
             sky_share: None,
+            surfel_share: Vec::new(),
         }
     }
 
@@ -624,7 +627,8 @@ impl Renderer {
             // Who is in a moved box's shadow, before or after.
             let in_shadow = |c: &crate::scene::Cluster| -> bool {
                 spheres_m.iter().any(|&(b, rb)| {
-                    let near = c.centre.distance(b) <= c.radius + rb;
+                    // Near enough for its sky occlusion to reach too.
+                    let near = c.centre.distance(b) <= c.radius + rb * (1.0 + crate::transfer::INFLUENCE);
                     if near {
                         return true;
                     }
@@ -710,15 +714,25 @@ impl Renderer {
         // Each sample's share of the sky, made again when the sky's shape
         // changes or an object moves.
         let contrast = sky.contrast.to_bits();
+        let mut share_changed = false;
         if !(settings.sky_occlusion && sky.on) {
+            share_changed = self.sky_share.is_some();
             self.sky_share = None;
         } else if self.sky_share.as_ref().is_none_or(|s| s.1 != contrast) {
             self.sky_share = Some((SkyShare::new(scene, sky.contrast), contrast));
+            share_changed = true;
         }
         let sky_share = self.sky_share.as_ref().map(|s| &s.0);
         if settings.bounce {
             let new_cloud = self.bounce.is_none();
             let b = self.bounce.get_or_insert_with(|| Bounce::new(scene));
+            if new_cloud || share_changed || self.surfel_share.len() != b.surfels.len() {
+                self.surfel_share = match sky_share {
+                    Some(s) => b.surfels.par_iter().map(|sf| s.at(sf.cluster as usize, scene, sf.position, sf.normal)[0]).collect(),
+                    None => vec![1.0; b.surfels.len()],
+                };
+            }
+            let surfel_share = &self.surfel_share;
             // A new surfel cloud (an object moved) is lit whole.
             let all = global_changed || new_cloud;
             if all || !spheres.is_empty() {
@@ -726,14 +740,13 @@ impl Renderer {
                 // The brightest change, as an intensity (cd): how far the
                 // change in bounce light can be seen.
                 let changed = std::sync::Mutex::new(0f32);
-                b.radiance.par_iter_mut().zip(b.surfels.par_iter()).for_each(|(r, sf)| {
+                b.radiance.par_iter_mut().zip(b.surfels.par_iter()).zip(surfel_share.par_iter()).for_each(|((r, sf), &share)| {
                     if !all && !spheres.iter().any(|(p, rr)| p.distance(sf.position) <= rr + (sf.area / std::f32::consts::PI).sqrt()) {
                         return;
                     }
                     let in_reach: Vec<usize> = (0..lights.len()).filter(|&i| lights[i].position.distance(sf.position) <= reach[i]).collect();
                     // Direct light only, without the sky's ground term: the
                     // ground is in the cloud.
-                    let share = sky_share.map(|s| s.at(sf.cluster as usize, scene, sf.position, sf.normal)[0]).unwrap_or(1.0);
                     let new = shade_point(sf.position, sf.normal, sf.albedo, sf.position + sf.normal, Sky { lux: sky.lux * share, ..sky }, false, lights, &in_reach, &reach, &shadows, sun).0;
                     let delta = (new - *r).abs().max_element() * sf.area;
                     *r = new;
@@ -1082,24 +1095,31 @@ impl Renderer {
                     let mut batch = Batch::default();
                     let (mut vdest, mut gdest, mut dims) = (Vec::new(), Vec::new(), Vec::new());
                     gather(e, vtodo, ttodo, &mut batch, &mut vdest, &mut gdest, &mut dims);
-                    // Each point's share of the sky, from the samples
-                    // around it.
-                    if let Some(sh) = sky_share.filter(|s| s.covers(ci)) {
-                        let n = batch.len();
-                        batch.sv.reserve(n);
-                        batch.gv.reserve(n);
-                        for k in 0..n {
-                            let v = sh.at(ci, scene, Vec3::new(batch.px[k], batch.py[k], batch.pz[k]), Vec3::new(batch.nx[k], batch.ny[k], batch.nz[k]));
-                            batch.sv.push(v[0]);
-                            batch.gv.push(v[1]);
-                        }
-                    }
+
                     // The sky, the sun and the lights in the sum, then each
                     // hot light's share (one that no longer reaches gives
                     // nothing): shaded where the picture needs it, the rest
                     // interpolated (`shade_adaptive`).
                     let shares_in: Vec<bool> = lights_now.iter().map(|l| in_reach.contains(l)).collect();
+                    let share_here = sky_share.filter(|s| s.covers(ci));
                     let mut eval = |b: &Batch, d: &mut [Vec3], s: &mut [Vec3], sd: &mut [Vec<Vec3>], ss: &mut [Vec<Vec3>]| -> u64 {
+                        // Each point shaded takes its share of the sky from
+                        // the samples around it (those interpolated need
+                        // none).
+                        let with_share;
+                        let b = match share_here {
+                            Some(sh) => {
+                                let mut c = b.clone();
+                                for k in 0..c.len() {
+                                    let v = sh.at(ci, scene, Vec3::new(c.px[k], c.py[k], c.pz[k]), Vec3::new(c.nx[k], c.ny[k], c.nz[k]));
+                                    c.sv.push(v[0]);
+                                    c.gv.push(v[1]);
+                                }
+                                with_share = c;
+                                &with_share
+                            }
+                            None => b,
+                        };
                         let mut ev = shade_batch(b, eye, sky, ground, lights, &in_sum, &reach, &shadows, sun, d, s, true);
                         for (k, &l) in lights_now.iter().enumerate() {
                             if shares_in[k] {
@@ -1501,7 +1521,7 @@ fn pow48(x: f32) -> f32 {
 
 /// Points to shade, a component per array (structure of arrays), so eight
 /// are shaded at once.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Batch {
     pub px: Vec<f32>,
     pub py: Vec<f32>,
@@ -2252,6 +2272,9 @@ mod tests {
         scene.push_mesh(&ball, &[], &[Vec3::new(0.8, 0.3, 0.2)], &idx);
         let n = scene.clusters.len();
         scene.add_object("ball".into(), first..n, Vec3::new(0.0, 0.3, 0.0), Vec3::ZERO);
+        // With samples, so its occlusion of the ground's sky moves too.
+        scene.scatter_samples(0);
+        crate::transfer::compute(&mut scene.samples);
         let (w, h) = (200, 112);
         let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.6, 0.0), 4.0, 0.15);
         let mut settings = RenderSettings::new(Sky::new(30.0, true));
@@ -2382,5 +2405,47 @@ mod tests {
         let near_ratio = near.0 / near.1;
         assert!(near_ratio < 0.85, "by the wall: {near_ratio}");
         assert!((far.0 / far.1 - 1.0).abs() < 0.05, "far from it: {far:?}");
+    }
+
+    /// A ball just over a floor that is no object: the floor under it gets
+    /// less sky, the floor two metres away all of it.
+    #[test]
+    fn an_object_takes_sky_from_the_ground_under_it() {
+        let mut scene = Scene::new();
+        let quad = |c: Vec3, h: f32| [c + Vec3::new(-h, 0.0, h), c + Vec3::new(h, 0.0, h), c + Vec3::new(h, 0.0, -h), c + Vec3::new(-h, 0.0, -h)];
+        scene.push_mesh(&quad(Vec3::ZERO, 3.0), &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
+        let (p, idx) = crate::scene::tests::uv_sphere(32);
+        let first = scene.clusters.len();
+        let ball: Vec<Vec3> = p.iter().map(|v| *v * 0.4 + Vec3::new(0.0, 0.42, 0.0)).collect();
+        scene.push_mesh(&ball, &[], &[Vec3::splat(0.5)], &idx);
+        let n = scene.clusters.len();
+        let o = scene.add_object("ball".into(), first..n, Vec3::ZERO, Vec3::ZERO);
+        scene.scatter_samples(o);
+        let (w, h) = (160, 120);
+        let cam = cam_at(0.3, w, h, Vec3::ZERO, 4.0, 0.9);
+        let on = RenderSettings { bounce: false, shadows: false, ..RenderSettings::new(Sky::new(300.0, true)) };
+        let mut a = Frame::new(w, h);
+        render(&scene, &cam, &[], &on, &mut a);
+        let mut b = Frame::new(w, h);
+        render(&scene, &cam, &[], &RenderSettings { sky_occlusion: false, ..on }, &mut b);
+        let (mut near, mut far) = ((0.0, 0.0, 0), (0.0, 0.0, 0));
+        for y in 0..h {
+            for x in 0..w {
+                let Some((p, n)) = raster::unproject(&a, &scene, x, y) else { continue };
+                if n.y < 0.9 || p.y > 0.01 {
+                    continue;
+                }
+                let r = glam::Vec2::new(p.x, p.z).length();
+                let slot = if r > 0.42 && r < 0.6 { &mut near } else if r > 2.0 { &mut far } else { continue };
+                slot.0 += (a.color[y * w + x] & 255) as f32;
+                slot.1 += (b.color[y * w + x] & 255) as f32;
+                slot.2 += 1;
+            }
+        }
+        assert!(near.2 > 10 && far.2 > 10, "{near:?} {far:?}");
+        // About a quarter of the sky there, cosine weighted, is the
+        // ball: 0.75 of the light, about 0.88 in 8-bit sRGB.
+        assert!(near.0 / near.1 < 0.93, "by the ball: {near:?}");
+        assert!((far.0 / far.1 - 1.0).abs() < 0.02, "far: {far:?}");
     }
 }
