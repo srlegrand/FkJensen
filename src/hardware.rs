@@ -79,12 +79,13 @@ pub struct Plan {
 }
 
 /// A frame's shading pass does about half the points per second the
-/// shading benchmark does (dicing, interpolation, the cache), measured on
-/// the machine FkJensen is written on: 17 M/s in the benchmark, 8.8 M/s in
-/// the wide view.
+/// shading benchmark does (dicing, interpolation, shadow maps, the cache),
+/// measured on the machine FkJensen is written on, eight wide (23/10/2026):
+/// 27 to 32 M/s in the benchmark, 15 M/s in the wide view (17 M and 8.8 M
+/// one point at a time).
 const FRAME_RATE_SHARE: f64 = 0.5;
 /// Benchmark rate of that machine (2 cores of a Xeon at 2.1 GHz).
-const REFERENCE_RATE: f64 = 17.0e6;
+const REFERENCE_RATE: f64 = 28.0e6;
 
 /// Shading points per pixel with micropolygons one pixel apart, in a
 /// typical view of the built-in set; at r pixels apart, divide by r^2.
@@ -486,10 +487,10 @@ mod tests {
         assert!(p.shadows && p.shadow_res <= 128, "{}", p.shadow_res);
     }
 
-    /// The machine FkJensen is written on: 2 cores, 17 M benchmark points/s.
+    /// The machine FkJensen is written on: 2 cores, 28 M benchmark points/s.
     #[test]
     fn a_desktop_gets_everything() {
-        let p = machine(17e6, 8000, 8.0, 1024).plan();
+        let p = machine(28e6, 8000, 8.0, 1024).plan();
         assert!(p.highres && p.bounce && p.shadows);
         assert_eq!(p.shadow_res, 512);
         assert_eq!(p.png_size, PNG_MAX);
@@ -523,7 +524,7 @@ mod tests {
 
     #[test]
     fn little_memory_shrinks_shadow_maps() {
-        let p = machine(17e6, 40, 8.0, 1024).plan();
+        let p = machine(28e6, 40, 8.0, 1024).plan();
         assert!(p.shadow_res < 512);
         assert!((BUILT_IN_LIGHTS * 6 * p.shadow_res * p.shadow_res * 4) as f64 <= 40.0 * 1048576.0 * SHADOW_MEMORY_SHARE || !p.shadows);
     }

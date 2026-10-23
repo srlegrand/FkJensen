@@ -31,6 +31,8 @@
 
 use std::sync::OnceLock;
 
+use crate::simd::F;
+
 use glam::Vec3;
 
 use crate::scene::Scene;
@@ -138,6 +140,16 @@ fn texels() -> &'static [(Vec3, f32)] {
             }
         }
         v
+    })
+}
+
+/// The texels' directions, a component per array, eight to a lane group.
+fn texel_dirs() -> &'static (Vec<F>, Vec<F>, Vec<F>) {
+    static T: OnceLock<(Vec<F>, Vec<F>, Vec<F>)> = OnceLock::new();
+    T.get_or_init(|| {
+        let t = texels();
+        let group = |f: fn(&Vec3) -> f32| t.chunks(8).map(|c| F::from(std::array::from_fn::<f32, 8, _>(|j| f(&c[j].0)))).collect();
+        (group(|d| d.x), group(|d| d.y), group(|d| d.z))
     })
 }
 
@@ -470,20 +482,28 @@ impl Bounce {
                     // and is covered where that line meets the disc, which
                     // is enlarged by a third so that the discs of a tiled
                     // surface leave no gaps between them.
+                    // Eight texels at a time.
                     let mut any = false;
-                    for (t, (td, _)) in tex.iter().enumerate() {
-                        let den = td.dot(n);
-                        if den >= 0.0 {
+                    let (tx, ty, tz) = texel_dirs();
+                    let pn = F::splat((p - x).dot(n));
+                    let lim = F::splat((r * 1.33) * (r * 1.33));
+                    let q = p - x;
+                    for g in 0..tx.len() {
+                        let den = tx[g] * n.x + ty[g] * n.y + tz[g] * n.z;
+                        let s = pn / den;
+                        let (ex, ey, ez) = (tx[g] * s - q.x, ty[g] * s - q.y, tz[g] * s - q.z);
+                        let hit = den.simd_lt(F::ZERO) & s.simd_gt(F::ZERO) & (ex * ex + ey * ey + ez * ez).simd_le(lim);
+                        let mut m = hit.to_bitmask();
+                        if m == 0 {
                             continue;
                         }
-                        let s = (p - x).dot(n) / den;
-                        if s <= 0.0 {
-                            continue;
+                        let s = s.to_array();
+                        while m != 0 {
+                            let j = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            splats.push((s[j], (g * 8 + j) as u16, 1.0, l));
                         }
-                        if (x + *td * s).distance(p) <= r * 1.33 {
-                            splats.push((s, t as u16, 1.0, l));
-                            any = true;
-                        }
+                        any = true;
                     }
                     if !any {
                         splats.push((d, t0 as u16, 1.0, l));
@@ -496,9 +516,14 @@ impl Bounce {
                     // light than it should.
                     let cos_a = (alpha * 1.5).min(std::f32::consts::FRAC_PI_2).cos();
                     let mut any = false;
-                    for (t, (td, _)) in tex.iter().enumerate() {
-                        if td.dot(dir) >= cos_a {
-                            splats.push((d, t as u16, 1.0, l));
+                    let (tx, ty, tz) = texel_dirs();
+                    let ca = F::splat(cos_a);
+                    for g in 0..tx.len() {
+                        let mut m = (tx[g] * dir.x + ty[g] * dir.y + tz[g] * dir.z).simd_ge(ca).to_bitmask();
+                        while m != 0 {
+                            let j = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            splats.push((d, (g * 8 + j) as u16, 1.0, l));
                             any = true;
                         }
                     }

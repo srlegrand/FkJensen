@@ -8,6 +8,7 @@ glam = "0.34.1"
 png = "0.18.1"
 rayon = "1.12.0"
 softbuffer = "0.4.8"
+wide = "1.7.1"
 winit = "0.30.13"
 
 # The editor (--editor) and its importer window: 64-bit machines only, so

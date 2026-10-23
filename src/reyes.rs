@@ -101,6 +101,16 @@ impl TriDice {
         [1.0 - s1 - s2, s1, s2]
     }
 
+    /// Screen weights are affine in (u, v): those of (0, 0), and their
+    /// change along u and along v, so a grid's points need no `frame`
+    /// each.
+    fn screen_affine(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
+        let s0 = self.grid_to_screen(0.0, 0.0);
+        let su = self.grid_to_screen(1.0, 0.0);
+        let sv = self.grid_to_screen(0.0, 1.0);
+        (s0, [su[0] - s0[0], su[1] - s0[1], su[2] - s0[2]], [sv[0] - s0[0], sv[1] - s0[1], sv[2] - s0[2]])
+    }
+
     /// Grid position (u, v), each 0 to 1, of screen weights `s`.
     fn screen_to_grid(&self, s: [f32; 3]) -> (f32, f32) {
         let (o, ex, ey) = self.frame();
@@ -709,7 +719,11 @@ impl Renderer {
                 let in_reach: Vec<usize> = (0..lights.len()).filter(|&i| lights[i].position.distance(c.centre) <= c.radius + reach[i]).collect();
                 let (mut n_shaded, mut n_evals) = (0u64, 0u64);
 
-                // Vertices, for triangles at level 0.
+                // Every point to shade goes into one batch, shaded eight at
+                // a time, then back to its place.
+                let mut batch = Batch::default();
+                // Vertices, for triangles at level 0: (vertex, diffuse too).
+                let mut vdest: Vec<(usize, bool)> = Vec::new();
                 let mut bits = vtodo;
                 while bits != 0 {
                     let u = bits.trailing_zeros() as usize;
@@ -724,13 +738,8 @@ impl Renderer {
                         e.vback &= !bit;
                     }
                     let side = if back { -1.0 } else { 1.0 };
-                    let (d, s, k) = shade_point(scene.positions[v], scene.normals[v] * side, scene.colors[v], eye, sky, ground, lights, &in_reach, &reach, &shadows, sun);
-                    if diffuse_too {
-                        e.vdiffuse[u] = d;
-                    }
-                    e.vspec[u] = s;
-                    n_evals += k;
-                    n_shaded += 1;
+                    batch.push(scene.positions[v], scene.normals[v] * side, scene.colors[v]);
+                    vdest.push((u, diffuse_too));
                 }
                 e.vdone |= vtodo;
                 e.vspec_done |= vtodo;
@@ -748,6 +757,8 @@ impl Renderer {
                     l
                 };
                 let tiles = if ttodo != 0 { scene.textures.block(ci, c.tri_count as usize, finest.min(crate::texture::MAX_LEVEL)) } else { None };
+                // Runs of grid points: (first in the cache, count, diffuse too).
+                let mut gdest: Vec<(usize, usize, bool)> = Vec::new();
                 let mut bits = ttodo;
                 while bits != 0 {
                     let u = bits.trailing_zeros() as usize;
@@ -767,26 +778,44 @@ impl Renderer {
                     }
                     let side = if back { -1.0 } else { 1.0 };
                     let (nu, nv) = (1usize << d.lu, 1usize << d.lv);
-                    let mut g = d.offset as usize;
+                    gdest.push((d.offset as usize, (nu + 1) * (nv + 1), diffuse_too));
+                    let (s0, su, sv) = d.screen_affine();
+                    let (n0, n1, n2) = (scene.normals[i0], scene.normals[i1], scene.normals[i2]);
+                    let (c0, c1, c2) = (scene.colors[i0], scene.colors[i1], scene.colors[i2]);
                     for a in 0..=nu {
+                        let fu = a as f32 / nu as f32;
                         for b in 0..=nv {
-                            let [b0, b1, b2] = screen_to_tri(d.grid_to_screen(a as f32 / nu as f32, b as f32 / nv as f32), d.w);
+                            let fv = b as f32 / nv as f32;
+                            let sw = [0, 1, 2].map(|k| s0[k] + su[k] * fu + sv[k] * fv);
+                            let [b0, b1, b2] = screen_to_tri(sw, d.w);
                             let p = p0 * b0 + p1 * b1 + p2 * b2;
-                            let nn = (scene.normals[i0] * b0 + scene.normals[i1] * b1 + scene.normals[i2] * b2).normalize_or(Vec3::Y) * side;
+                            let nn = (n0 * b0 + n1 * b1 + n2 * b2).normalize_or(Vec3::Y) * side;
                             let alb = match &tiles {
                                 Some(t) => t.sample(u, b1, b2),
-                                None => (scene.colors[i0] * b0 + scene.colors[i1] * b1 + scene.colors[i2] * b2).max(Vec3::ZERO),
+                                None => (c0 * b0 + c1 * b1 + c2 * b2).max(Vec3::ZERO),
                             };
-                            let (dd, s, ev) = shade_point(p, nn, alb, eye, sky, ground, lights, &in_reach, &reach, &shadows, sun);
-                            if diffuse_too {
-                                e.diffuse[g] = dd;
-                            }
-                            e.spec[g] = s;
-                            g += 1;
-                            n_evals += ev;
-                            n_shaded += 1;
+                            batch.push(p, nn, alb);
                         }
                     }
+                }
+                let n = batch.len();
+                let mut dd = vec![Vec3::ZERO; n];
+                let mut ss = vec![Vec3::ZERO; n];
+                n_evals += shade_batch(&batch, eye, sky, ground, lights, &in_reach, &reach, &shadows, sun, &mut dd, &mut ss, true);
+                n_shaded += n as u64;
+                for (k, &(u, diffuse_too)) in vdest.iter().enumerate() {
+                    if diffuse_too {
+                        e.vdiffuse[u] = dd[k];
+                    }
+                    e.vspec[u] = ss[k];
+                }
+                let mut k = vdest.len();
+                for &(g, count, diffuse_too) in &gdest {
+                    if diffuse_too {
+                        e.diffuse[g..g + count].copy_from_slice(&dd[k..k + count]);
+                    }
+                    e.spec[g..g + count].copy_from_slice(&ss[k..k + count]);
+                    k += count;
                 }
                 e.done |= ttodo;
                 e.spec_done |= ttodo;
@@ -1028,7 +1057,7 @@ fn shade_point(
                 let e = sun.lux * (ndl * vis);
                 diffuse += e * albedo * inv_pi;
                 let h = (sun.dir + v).normalize_or(sun.dir);
-                spec += e * (n.dot(h).max(0.0).powf(48.0) * SPECULAR * inv_pi);
+                spec += e * (pow48(n.dot(h).max(0.0)) * SPECULAR * inv_pi);
             }
         }
     }
@@ -1055,13 +1084,194 @@ fn shade_point(
         let e = l.color * (l.candela() / d2 * ndl * vis);
         diffuse += e * albedo * inv_pi;
         let h = (ldir + v).normalize_or(ldir);
-        spec += e * (n.dot(h).max(0.0).powf(48.0) * SPECULAR * inv_pi);
+        spec += e * (pow48(n.dot(h).max(0.0)) * SPECULAR * inv_pi);
     }
     (diffuse, spec, evals)
 }
 
+/// x to the 48th, the highlight's sharpness: five squarings and a product,
+/// not a `powf`.
+#[inline]
+fn pow48(x: f32) -> f32 {
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    let x8 = x4 * x4;
+    let x16 = x8 * x8;
+    x16 * x16 * x16
+}
+
+/// Points to shade, a component per array (structure of arrays), so eight
+/// are shaded at once.
+#[derive(Default)]
+pub struct Batch {
+    pub px: Vec<f32>,
+    pub py: Vec<f32>,
+    pub pz: Vec<f32>,
+    pub nx: Vec<f32>,
+    pub ny: Vec<f32>,
+    pub nz: Vec<f32>,
+    pub ar: Vec<f32>,
+    pub ag: Vec<f32>,
+    pub ab: Vec<f32>,
+}
+
+impl Batch {
+    pub fn len(&self) -> usize {
+        self.px.len()
+    }
+
+    #[inline]
+    pub fn push(&mut self, p: Vec3, n: Vec3, albedo: Vec3) {
+        self.px.push(p.x);
+        self.py.push(p.y);
+        self.pz.push(p.z);
+        self.nx.push(n.x);
+        self.ny.push(n.y);
+        self.nz.push(n.z);
+        self.ar.push(albedo.x);
+        self.ag.push(albedo.y);
+        self.ab.push(albedo.z);
+    }
+}
+
+/// `shade_point` for every point of `b`, eight at a time (AVX on the
+/// desktop, two halves of four elsewhere, plain arrays on the Pi 1): the
+/// diffuse and highlight radiance of point k go to `diffuse[k]` (when
+/// `with_diffuse`) and `spec[k]`. Shadow map lookups stay one point at a
+/// time, for the points a light faces. Returns the lights evaluated.
+#[allow(clippy::too_many_arguments)]
+pub fn shade_batch(
+    b: &Batch,
+    eye: Vec3,
+    sky: Sky,
+    ground: bool,
+    lights: &[PointLight],
+    in_reach: &[usize],
+    reach: &[f32],
+    shadows: &[Option<&CubeShadow>],
+    sun: &SunLit,
+    diffuse: &mut [Vec3],
+    spec: &mut [Vec3],
+    with_diffuse: bool,
+) -> u64 {
+    use crate::simd::V3;
+    use wide::f32x8;
+    let n = b.len();
+    let zero = f32x8::ZERO;
+    let one = f32x8::ONE;
+    let inv_pi = std::f32::consts::FRAC_1_PI;
+    // The sky's terms that do not depend on the point.
+    let sky_c = sky.contrast.clamp(0.0, 1.0);
+    let sky_fill = sky.lux * (1.0 - 2.0 * sky_c).exp2();
+    let ground_k = if ground { crate::raster::GROUND_TINT * crate::raster::GROUND_BOUNCE } else { Vec3::ZERO };
+    let sky_exp = 1.0 + 6.0 * (sky_c - 0.5);
+    let pow48 = |x: f32x8| {
+        let x2 = x * x;
+        let x4 = x2 * x2;
+        let x8 = x4 * x4;
+        let x16 = x8 * x8;
+        x16 * x16 * x16
+    };
+    let norm = |x: f32x8, y: f32x8, z: f32x8| {
+        let l2 = x * x + y * y + z * z;
+        let inv = f32x8::ONE / l2.max(f32x8::splat(1e-30)).sqrt();
+        (x * inv, y * inv, z * inv, l2)
+    };
+    let mut evals = 0u64;
+    let mut k0 = 0;
+    while k0 < n {
+        let m = (n - k0).min(8);
+        // Lanes past the end repeat the last point; their results are not
+        // written.
+        let ld = |v: &Vec<f32>| -> f32x8 {
+            let mut a = [v[k0 + m - 1]; 8];
+            a[..m].copy_from_slice(&v[k0..k0 + m]);
+            f32x8::from(a)
+        };
+        let (px, py, pz) = (ld(&b.px), ld(&b.py), ld(&b.pz));
+        let (nx, ny, nz) = (ld(&b.nx), ld(&b.ny), ld(&b.nz));
+        let (ar, ag, ab) = (ld(&b.ar), ld(&b.ag), ld(&b.ab));
+        // Sky.
+        let (mut dr, mut dg, mut db) = (zero, zero, zero);
+        if sky.on {
+            let up = ny * 0.5 + 0.5;
+            let f = if sky_c <= 0.5 { one + (up - one) * (2.0 * sky_c) } else { (up.max(f32x8::splat(1e-30)).ln() * sky_exp).exp() };
+            let g = one - up;
+            let s = sky_fill * inv_pi;
+            dr = ar * (f * (sky.tint.x * s) + g * (ground_k.x * s));
+            dg = ag * (f * (sky.tint.y * s) + g * (ground_k.y * s));
+            db = ab * (f * (sky.tint.z * s) + g * (ground_k.z * s));
+        }
+        let (mut sr, mut sg, mut sb) = (zero, zero, zero);
+        let (vx, vy, vz, _) = norm(eye.x - px, eye.y - py, eye.z - pz);
+        let lane = |a: f32x8| a.to_array();
+        // One light: illuminance per channel `e` (already times n.l and
+        // visibility), direction to it; adds diffuse and highlight.
+        let mut add = |e: f32x8, (lx, ly, lz): (f32x8, f32x8, f32x8), col: Vec3, dr: &mut f32x8, dg: &mut f32x8, db: &mut f32x8| {
+            let (hx, hy, hz, _) = norm(lx + vx, ly + vy, lz + vz);
+            let ndh = (nx * hx + ny * hy + nz * hz).max(zero);
+            let hl = pow48(ndh) * (SPECULAR * inv_pi);
+            let (er, eg, eb) = (e * col.x, e * col.y, e * col.z);
+            *dr += er * ar * inv_pi;
+            *dg += eg * ag * inv_pi;
+            *db += eb * ab * inv_pi;
+            sr += er * hl;
+            sg += eg * hl;
+            sb += eb * hl;
+        };
+        // The sun.
+        if sun.lux != Vec3::ZERO {
+            let ndl = nx * sun.dir.x + ny * sun.dir.y + nz * sun.dir.z;
+            let facing = ndl.simd_gt(zero).to_bitmask() & ((1u32 << m) - 1);
+            if facing != 0 {
+                let vis = match sun.shadow {
+                    Some(s) => s.lit8(V3 { x: px, y: py, z: pz }, V3 { x: nx, y: ny, z: nz }, facing),
+                    None => std::array::from_fn(|j| if facing & (1 << j) != 0 { 1.0 } else { 0.0 }),
+                };
+                let e = ndl.max(zero) * f32x8::from(vis);
+                let dir = (f32x8::splat(sun.dir.x), f32x8::splat(sun.dir.y), f32x8::splat(sun.dir.z));
+                // The sun's lux is per channel: colour it in `add`.
+                add(e, dir, sun.lux, &mut dr, &mut dg, &mut db);
+            }
+        }
+        // Point lights in reach of the cluster.
+        for &i in in_reach {
+            let l = &lights[i];
+            let (dx, dy, dz) = (l.position.x - px, l.position.y - py, l.position.z - pz);
+            let d2 = (dx * dx + dy * dy + dz * dz).max(f32x8::splat(1e-12));
+            let within = d2.simd_le(f32x8::splat(reach[i] * reach[i])).to_bitmask() & ((1u32 << m) - 1);
+            evals += within.count_ones() as u64;
+            if within == 0 {
+                continue;
+            }
+            let inv_d = f32x8::ONE / d2.sqrt();
+            let (lx, ly, lz) = (dx * inv_d, dy * inv_d, dz * inv_d);
+            let ndl = nx * lx + ny * ly + nz * lz;
+            let lit = within & ndl.simd_gt(zero).to_bitmask();
+            if lit == 0 {
+                continue;
+            }
+            let vis = match shadows[i] {
+                Some(map) => map.lit8(V3 { x: px, y: py, z: pz }, V3 { x: nx, y: ny, z: nz }, lit),
+                None => std::array::from_fn(|j| if lit & (1 << j) != 0 { 1.0 } else { 0.0 }),
+            };
+            let e = f32x8::splat(l.candela()) / d2 * ndl.max(zero) * f32x8::from(vis);
+            add(e, (lx, ly, lz), l.color, &mut dr, &mut dg, &mut db);
+        }
+        let (dr, dg, db, sr, sg, sb) = (lane(dr), lane(dg), lane(db), lane(sr), lane(sg), lane(sb));
+        for j in 0..m {
+            if with_diffuse {
+                diffuse[k0 + j] = Vec3::new(dr[j], dg[j], db[j]);
+            }
+            spec[k0 + j] = Vec3::new(sr[j], sg[j], sb[j]);
+        }
+        k0 += m;
+    }
+    evals
+}
+
 /// Shading points per second on this machine, all cores, measured for
-/// about `seconds`: the real `shade_point` on synthetic points, the sky and
+/// about `seconds`: the real `shade_batch` on synthetic points, the sky and
 /// two lights in reach (about what a point of the built-in set evaluates),
 /// no shadow maps.
 pub fn shading_rate(seconds: f64) -> f64 {
@@ -1074,16 +1284,23 @@ pub fn shading_rate(seconds: f64) -> f64 {
     let shadows: [Option<&CubeShadow>; 2] = [None, None];
     let sky = Sky::new(30.0, true);
     let eye = Vec3::new(0.0, 1.0, 5.0);
+    // Shaded as a frame shades them: batches of points, eight at a time.
+    const CHUNK: usize = 1024;
     let run = |n: usize| -> f64 {
         let t = std::time::Instant::now();
-        let s: f32 = (0..n)
+        let s: f32 = (0..n.div_ceil(CHUNK))
             .into_par_iter()
-            .map(|i| {
-                let a = i as f32 * 0.618;
-                let n = Vec3::new(a.sin(), (a * 1.7).cos(), (a * 0.3).sin()).normalize_or(Vec3::Y);
-                let p = n * 0.5 + Vec3::new(0.0, 0.5, 0.0);
-                let (d, sp, _) = shade_point(p, n, Vec3::splat(0.5), eye, sky, true, &lights, &in_reach, &reach, &shadows, &SunLit { lux: Vec3::ZERO, dir: Vec3::Y, shadow: None });
-                d.x + sp.y
+            .map(|c| {
+                let mut b = Batch::default();
+                for i in c * CHUNK..((c + 1) * CHUNK).min(n) {
+                    let a = i as f32 * 0.618;
+                    let nn = Vec3::new(a.sin(), (a * 1.7).cos(), (a * 0.3).sin()).normalize_or(Vec3::Y);
+                    b.push(nn * 0.5 + Vec3::new(0.0, 0.5, 0.0), nn, Vec3::splat(0.5));
+                }
+                let mut d = vec![Vec3::ZERO; b.len()];
+                let mut sp = vec![Vec3::ZERO; b.len()];
+                shade_batch(&b, eye, sky, true, &lights, &in_reach, &reach, &shadows, &SunLit { lux: Vec3::ZERO, dir: Vec3::Y, shadow: None }, &mut d, &mut sp, true);
+                d.iter().zip(&sp).map(|(d, s)| d.x + s.y).sum::<f32>()
             })
             .sum();
         std::hint::black_box(s);

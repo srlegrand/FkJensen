@@ -11,6 +11,7 @@ use glam::{Vec3, Vec4};
 use rayon::prelude::*;
 
 use crate::scene::Scene;
+use crate::simd::{bits, pcf3, F, I, V3};
 
 /// Texels per cube face edge, by default (`--shadow-res` changes it).
 pub const SHADOW_RES: usize = 512;
@@ -125,6 +126,45 @@ impl CubeShadow {
         lit / 9.0
     }
 
+    /// `lit` for eight points at once, for the lanes in `mask` (others
+    /// come back 0).
+    pub fn lit8(&self, p: V3, n: V3, mask: u32) -> [f32; 8] {
+        let res = self.res as f32;
+        let to_light = V3::splat(self.position).sub(p);
+        let dist = to_light.length();
+        let n = n.facing(to_light);
+        let texel = dist * 2.0 / res;
+        let q = p.add(n.scale(texel * 1.5)).sub(V3::splat(self.position));
+        // The face each lane falls on, as `face_of`, without branches:
+        // w along the face's axis, (s, t) along its right and up.
+        let (ax, ay, az) = (q.x.abs(), q.y.abs(), q.z.abs());
+        let on_x = ax.simd_ge(ay) & ax.simd_ge(az);
+        let on_y = !on_x & ay.simd_ge(az);
+        let on_z = !(on_x | on_y);
+        let (px, py, pz) = (q.x.simd_ge(F::ZERO), q.y.simd_ge(F::ZERO), q.z.simd_ge(F::ZERO));
+        // +X (-z, y)  -X (z, y)  +Y (x, -z)  -Y (x, z)  +Z (x, y)  -Z (-x, y)
+        let w = on_x.select(ax, on_y.select(ay, az));
+        let sx = on_x.select(px.select(-q.z, q.z), on_y.select(q.x, pz.select(q.x, -q.x)));
+        let sy = on_y.select(py.select(-q.z, q.z), q.y);
+        let face = on_x.select(px.select(F::splat(0.0), F::splat(1.0)), on_y.select(py.select(F::splat(2.0), F::splat(3.0)), pz.select(F::splat(4.0), F::splat(5.0))));
+        let _ = on_z;
+        let w_safe = w.max(F::splat(1e-30));
+        let cx = ((sx / w_safe * 0.5 + 0.5) * res - 0.5).round_int();
+        let cy = ((sy / w_safe * 0.5 + 0.5) * res - 0.5).round_int();
+        let base = face.round_int() * I::splat((self.res * self.res) as i32);
+        // Lanes at the light, or nearer it than the maps start, are lit.
+        let near = bits(dist.simd_lt(F::splat(1e-6)) | w.simd_le(F::splat(NEAR)));
+        let look = mask & !near;
+        let limit = (F::ONE / (w * (1.0 - 0.004)).max(F::splat(1e-30))).to_array();
+        let mut out = pcf3(&self.inv_depth, self.res, base, cx, cy, look, |d, j| d <= limit[j]);
+        for (j, o) in out.iter_mut().enumerate() {
+            if mask & near & (1 << j) != 0 {
+                *o = 1.0;
+            }
+        }
+        out
+    }
+
     pub fn bytes(&self) -> usize {
         self.inv_depth.len() * 4
     }
@@ -199,23 +239,7 @@ fn fill(buf: &mut [f32], res: usize, a: Vec4, b: Vec4, c: Vec4) {
     if x0 > x1 || y0 > y1 {
         return;
     }
-    let inv = 1.0 / area;
-    for y in y0..=y1 {
-        let py = y as f32 + 0.5;
-        for x in x0..=x1 {
-            let px = x as f32 + 0.5;
-            let w0 = ((cx - bx) * (py - by) - (cy - by) * (px - bx)) * inv;
-            let w1 = ((ax - cx) * (py - cy) - (ay - cy) * (px - cx)) * inv;
-            let w2 = ((bx - ax) * (py - ay) - (by - ay) * (px - ax)) * inv;
-            if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
-                let z = w0 * az + w1 * bz + w2 * cz;
-                let i = y * res + x;
-                if z > buf[i] {
-                    buf[i] = z;
-                }
-            }
-        }
-    }
+    crate::simd::fill_max(buf, res, (ax, ay, az), (bx, by, bz), (cx, cy, cz), x0, x1, y0, y1, 1.0 / area);
 }
 
 #[cfg(test)]
@@ -243,6 +267,29 @@ mod tests {
         for d in [Vec3::X, Vec3::NEG_X, Vec3::Z, Vec3::NEG_Z] {
             let p = Vec3::new(d.x * 1.5, 0.0, d.z * 1.5);
             assert_eq!(m.lit(p, Vec3::Y), 1.0, "{p}");
+        }
+    }
+
+    /// Eight at a time gives what one at a time gives.
+    #[test]
+    fn eight_lookups_match_one() {
+        let s = blocker_scene();
+        let m = CubeShadow::build(&s, Vec3::new(0.0, 1.5, 0.0), 10.0, 128);
+        let mut pts = Vec::new();
+        for i in 0..64 {
+            let t = i as f32 * 0.37;
+            pts.push((Vec3::new(t.sin() * 1.8, (i % 3) as f32 * 0.25, (t * 1.3).cos() * 1.8), Vec3::new(0.1 * t.cos(), 1.0, 0.0).normalize()));
+        }
+        // And the light's own position.
+        pts[5].0 = Vec3::new(0.0, 1.5, 0.0);
+        for chunk in pts.chunks(8) {
+            let lane = |f: fn(&(Vec3, Vec3)) -> f32| F::from(std::array::from_fn::<f32, 8, _>(|j| f(&chunk[j])));
+            let p = V3 { x: lane(|c| c.0.x), y: lane(|c| c.0.y), z: lane(|c| c.0.z) };
+            let n = V3 { x: lane(|c| c.1.x), y: lane(|c| c.1.y), z: lane(|c| c.1.z) };
+            let got = m.lit8(p, n, 0xff);
+            for j in 0..8 {
+                assert_eq!(got[j], m.lit(chunk[j].0, chunk[j].1), "{:?}", chunk[j]);
+            }
         }
     }
 

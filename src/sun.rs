@@ -14,6 +14,7 @@ use glam::{Vec3, Vec4};
 use rayon::prelude::*;
 
 use crate::scene::Scene;
+use crate::simd::{bits, pcf3, F, I, V3};
 
 /// Everything the hour of the day sets.
 #[derive(Clone, Copy, Debug)]
@@ -209,6 +210,46 @@ impl SunShadow {
         lit / 9.0
     }
 
+    /// `lit` for eight points at once, for the lanes in `mask` (others
+    /// come back 0). A lane outside every cascade is lit.
+    pub fn lit8(&self, p: V3, n: V3, mask: u32) -> [f32; 8] {
+        let mut out = [0f32; 8];
+        let mut todo = mask;
+        let (right, up, dir) = (V3::splat(self.right), V3::splat(self.up), V3::splat(self.dir));
+        let n = n.facing(dir);
+        for c in &self.cascades {
+            if todo == 0 {
+                break;
+            }
+            let q = p.sub(V3::splat(c.centre));
+            let edge = F::splat(c.half * 0.97);
+            let inside = bits(q.dot(right).abs().simd_lt(edge) & q.dot(up).abs().simd_lt(edge)) & todo;
+            if inside == 0 {
+                continue;
+            }
+            todo &= !inside;
+            let texel = 2.0 * c.half / c.res as f32;
+            let q = p.add(n.scale(F::splat(texel * 1.5))).sub(V3::splat(c.centre));
+            let res = c.res as f32;
+            let half = F::splat(c.half);
+            let sx = ((q.dot(right) / half * 0.5 + 0.5) * res - 0.5).round_int();
+            let sy = ((q.dot(up) / half * 0.5 + 0.5) * res - 0.5).round_int();
+            let h = (q.dot(dir) + texel).to_array();
+            let lit = pcf3(&c.height, c.res, I::splat(0), sx, sy, inside, |t, j| t <= h[j]);
+            for j in 0..8 {
+                if inside & (1 << j) != 0 {
+                    out[j] = lit[j];
+                }
+            }
+        }
+        for (j, o) in out.iter_mut().enumerate() {
+            if todo & (1 << j) != 0 {
+                *o = 1.0;
+            }
+        }
+        out
+    }
+
     pub fn bytes(&self) -> usize {
         self.cascades.iter().map(|c| c.height.len() * 4).sum()
     }
@@ -229,26 +270,7 @@ fn fill_max(buf: &mut [f32], res: usize, a: Vec4, b: Vec4, c: Vec4) -> bool {
     if x0 > x1 || y0 > y1 {
         return false;
     }
-    let inv = 1.0 / area;
-    let mut any = false;
-    for y in y0 as usize..=y1 as usize {
-        let py = y as f32 + 0.5;
-        for x in x0 as usize..=x1 as usize {
-            let px = x as f32 + 0.5;
-            let w0 = ((c.x - b.x) * (py - b.y) - (c.y - b.y) * (px - b.x)) * inv;
-            let w1 = ((a.x - c.x) * (py - c.y) - (a.y - c.y) * (px - c.x)) * inv;
-            let w2 = ((b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x)) * inv;
-            if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
-                let z = w0 * a.z + w1 * b.z + w2 * c.z;
-                let i = y * res + x;
-                if z > buf[i] {
-                    buf[i] = z;
-                }
-                any = true;
-            }
-        }
-    }
-    any
+    crate::simd::fill_max(buf, res, (a.x, a.y, a.z), (b.x, b.y, b.z), (c.x, c.y, c.z), x0 as usize, x1 as usize, y0 as usize, y1 as usize, 1.0 / area)
 }
 
 #[cfg(test)]
@@ -287,6 +309,20 @@ mod tests {
         assert_eq!(m.lit(Vec3::new(0.1, 1.0, 0.1), Vec3::Y), 1.0, "the card does not shade itself");
         // A low sun from +x throws the shadow towards -x.
         let low = SunShadow::build(&s, Vec3::new(1.0, 1.0, 0.0).normalize(), Vec3::ZERO, &[5.0], 256);
+        // Eight at a time gives what one at a time gives, across cascades
+        // and outside them.
+        let two = SunShadow::build(&s, Vec3::new(0.3, 1.0, 0.2).normalize(), Vec3::ZERO, &[2.0, 50.0], 128);
+        for k in 0..8 {
+            let pts: [Vec3; 8] = std::array::from_fn(|j| {
+                let t = (k * 8 + j) as f32 * 0.53;
+                Vec3::new(t.sin() * (1.0 + k as f32 * 10.0), (j % 2) as f32, t.cos() * 3.0)
+            });
+            let p = V3 { x: F::from(pts.map(|p| p.x)), y: F::from(pts.map(|p| p.y)), z: F::from(pts.map(|p| p.z)) };
+            let got = two.lit8(p, V3::splat(Vec3::Y), 0xff);
+            for j in 0..8 {
+                assert_eq!(got[j], two.lit(pts[j], Vec3::Y), "{}", pts[j]);
+            }
+        }
         assert_eq!(low.lit(Vec3::new(-1.0, 0.0, 0.0), Vec3::Y), 0.0);
         assert_eq!(low.lit(Vec3::new(1.0, 0.0, 0.0), Vec3::Y), 1.0);
     }

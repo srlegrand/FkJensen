@@ -17,7 +17,7 @@ Read `LLM_instructions.md` too: the checks to run first and how changes are deli
 
 - No GPU API is linked, ever. Not for the viewport, not for a fallback, not for the window. The frame is pixels in RAM, copied to the screen through shared memory. On a machine with a GPU, the GPU stays idle, and that is the point: the same binary runs on a Raspberry Pi, a Ryzen, a Threadripper, an Apple M, an Intel or a Snapdragon without a driver.
 - The machine decides. At start FkJensen reads what the system reports (CPU, cores, SIMD features, caches, memory) and measures what it does not (memory bandwidth, shading points per second), then sets its own resolution, what it loads, shadow map size, bounce light and bucket size. Every choice can be overridden; nothing assumes a fast machine.
-- The language is Rust, stable, with rayon for threads. SIMD goes through a portable layer with runtime dispatch (fearless_simd or the equivalent), never bare intrinsics in the renderer, so one source serves AVX2, AVX-512 and NEON.
+- The language is Rust, stable, with rayon for threads. SIMD goes through a portable layer (the `wide` crate, in `src/simd.rs`), never bare intrinsics in the renderer, so one source serves AVX2, AVX-512 and NEON. Each machine builds for its own processor (`target-cpu=native`) rather than choosing at run time; runtime dispatch (fearless_simd or the equivalent) would let one binary serve every x86 machine.
 - The operating system is not the bottleneck and is not fought. Threads are pinned and pages are locked only where a measurement shows a gain. A direct DRM/KMS target for Linux is allowed later; a kernel of its own is not.
 - Memory bandwidth, not arithmetic, is the budget: about 3.75 GB/s per core on a 16-core Zen 5. Data is laid out for it: structure of arrays, 8-wide packets, nothing allocated in the frame.
 
@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 23/10/2026: eight-wide SIMD in shading, shadow map lookups and fills, and the bounce raster; each machine builds for its own processor. Dragging a light on the built-in set went from 1.31 s to 0.44 s a frame with the high-resolution T-rex on 2 cores.
 - 23/10/2026: objects rotate about any axis: three rings in the rotate manipulator, Rotate X Y Z in the attribute editor (Maya's xyz order), `OBJS` version 2. A rotation never mirrors, so texture tiles stay valid.
 - 23/10/2026: `--editor`, an interface laid out like Maya around the viewport (outliner with groups, attribute editor, timeline for the time of day, menus) and an importer window that reads glTF, FBX and OBJ, bakes the model on a thread and shows it as the scene will draw it before it is added. egui, painted on the CPU into the same buffer as the frame; no GPU API. 64-bit only, so the Raspberry Pi build is unchanged. Scenes save with their objects and groups (`OBJS`).
 - 23/10/2026: models are objects that can be selected and moved with Maya's manipulators (W move, E rotate about the vertical, R uniform scale), and the camera navigates as in Maya (Alt + left tumble, Alt + middle track, Alt + right dolly, F frame selected). Moving a model rewrites its vertices; nothing about light is kept on the model, so the renderer only drops what it had kept for it.

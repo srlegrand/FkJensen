@@ -358,7 +358,13 @@ budget (`--hardware` prints it), scaled up to fill the screen.
 
 ## Build
 
-Rust 1.85 or later (edition 2024). No system libraries are needed to build.
+Rust 1.89 or later (edition 2024). No system libraries are needed to build.
+
+`.cargo/config.toml` builds for the processor doing the build
+(`target-cpu=native` on x86-64), so the renderer's eight-wide SIMD runs as
+AVX2 or AVX-512 where the machine has it. A binary built on one machine
+may not start on an older one: build on each machine. The Raspberry Pi
+build is cross compiled for its own target and is not affected.
 
     cargo build --release
 
@@ -606,6 +612,28 @@ bounce light. `src/texture.rs` is the texture tiles and their cache;
 
 ## Measured
 
+Eight-wide SIMD (`src/simd.rs`, the `wide` crate): shading, shadow map
+lookups and fills, and the bounce raster's texel loops work on eight
+points or texels at a time. Same machine (2 cores of an Intel Xeon at
+2.1 GHz, AVX-512), 1280 x 720, the built-in set, `--bench-drag`, best of
+three runs, 23/10/2026:
+
+| | before | eight wide |
+|---|---|---|
+| low-resolution T-rex: first frame | 3.40 s | 2.34 s |
+| shading in it | 836 ms | 308 ms |
+| dragging the key light, a frame | 760 ms | 242 ms |
+| shading in it (3.2 M points) | 651 ms | 146 ms |
+| high-resolution T-rex: first frame | 6.05 s | 4.32 s |
+| dragging the key light, a frame | 1,306 ms | 437 ms |
+| shading in it | 1,112 ms | 266 ms |
+
+Most of the gain is the shadow map lookups (a 3 x 3 filter per light per
+point), which were 85% of shading; then the highlight's x^48 by squaring
+instead of `powf`, and building for the machine. The picture is the same:
+24 of 518,400 pixels differ, by 1 of 255. The first frame is still mostly
+the bounce gather.
+
 With the high-resolution T-rex and the car, both built into levels of
 detail (25.1 M triangles over every level, 605,406 clusters, 3 lights),
 micropolygons 2 px apart, 1280 x 720, 2 cores of an Intel Xeon at 2.1 GHz,
@@ -707,7 +735,10 @@ Not measured yet: a Raspberry Pi.
   each light's share apart would let it redo only its own.
 - Adaptive refinement (sparse samples where the picture is smooth) and
   front-to-back early stopping: not started.
-- SIMD: the inner loops are scalar.
+- SIMD: shading, shadow maps and the bounce raster are eight wide; the
+  visibility raster, the resolve and setting up the shading points are
+  not. The texel loads of a shadow lookup are one lane at a time. On the
+  Raspberry Pi 1 (no NEON) the eight lanes are plain arrays.
 - Vertex splatting.
 - Levels of detail: every level is loaded, so a small machine cannot yet
   leave the finest in the file; seams and separate parts never move when

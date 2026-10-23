@@ -48,6 +48,7 @@ mod raster;
 mod reyes;
 mod scene;
 mod shadow;
+mod simd;
 mod sun;
 mod texture;
 mod world;

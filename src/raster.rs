@@ -136,8 +136,8 @@ pub struct Sky {
 pub const SKY_ZENITH: Vec3 = Vec3::new(0.55, 0.78, 1.45);
 pub const SKY_HORIZON: Vec3 = Vec3::new(1.15, 1.0, 0.85);
 /// Light coming back up from the ground, as a share of the sky's.
-const GROUND_BOUNCE: f32 = 0.2;
-const GROUND_TINT: Vec3 = Vec3::new(1.0, 1.0, 0.9);
+pub(crate) const GROUND_BOUNCE: f32 = 0.2;
+pub(crate) const GROUND_TINT: Vec3 = Vec3::new(1.0, 1.0, 0.9);
 /// Colour of the sky's light on an upward-facing surface (luminance 1).
 pub const SKY_IRRADIANCE_TINT: Vec3 = Vec3::new(0.82, 0.95, 1.25);
 
