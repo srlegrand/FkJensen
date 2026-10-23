@@ -271,6 +271,12 @@ pub fn euler_quat(r: Vec3) -> glam::Quat {
     glam::Quat::from_euler(glam::EulerRot::ZYX, r.z, r.y, r.x)
 }
 
+/// A sample's sky transfer turned by `q`. A uniform scale changes nothing:
+/// a model's own occlusion does not depend on its size.
+fn turned_sky(t: &[f32; 9], q: glam::Quat, _scale: f32) -> [f32; 9] {
+    if t[0].is_nan() { *t } else { crate::transfer::rotate(t, q) }
+}
+
 /// Euler angles (radians, X then Y then Z) of a rotation.
 pub fn quat_euler(q: glam::Quat) -> Vec3 {
     let (z, y, x) = q.to_euler(glam::EulerRot::ZYX);
@@ -486,6 +492,7 @@ impl Scene {
             s.position = q * (s.position * scale) + d;
             s.normal = q * s.normal;
             s.area *= scale * scale;
+            s.sky = turned_sky(&s.sky, q, scale);
         }
         for l in &mut self.lights {
             l.position = q * (l.position * scale) + d;
@@ -533,7 +540,12 @@ impl Scene {
     /// Spread samples over object `i`'s finest level (`samples.rs`),
     /// replacing any it had. Returns how many and their spacing.
     pub fn scatter_samples(&mut self, i: usize) -> (usize, f32) {
-        let range = self.objects[i].clusters.clone();
+        self.scatter_over(self.objects[i].clusters.clone())
+    }
+
+    /// Spread samples over the finest level of clusters `range`, replacing
+    /// any they had.
+    pub fn scatter_over(&mut self, range: std::ops::Range<usize>) -> (usize, f32) {
         let old = self.samples_in(range.clone());
         self.samples.drain(old.clone());
         if range.is_empty() {
@@ -719,6 +731,7 @@ impl Scene {
             s.position = map(s.position);
             s.normal = q * s.normal;
             s.area *= k * k;
+            s.sky = turned_sky(&s.sky, q, k);
         }
         let ob = &mut self.objects[i];
         ob.pivot = pivot;

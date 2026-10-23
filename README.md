@@ -116,9 +116,32 @@ of the surface is closer than the spacing, so both sides of a claw keep
 theirs. The spacing is 1 cm, or wider so that a model has at most 150,000:
 the high-resolution T-rex gets 79,361 at 2.0 cm, the car 82,769 at 2.2 cm,
 in about a second each on 2 cores at load. They move with their object.
-Nothing reads them yet; they are where sky occlusion and bounce light are
-to be kept, so that their detail no longer follows the mesh. The ground
-and the mountains have none yet. `--debug-view samples` shows them.
+They carry the sky occlusion below, and are where bounce light is to be
+kept too, so that its detail no longer follows the mesh. The ground and
+the mountains have none yet. `--debug-view samples` shows them.
+
+**Sky occlusion** (`src/transfer.rs`). What a model's own shape takes of
+the sky (inside the mouth, under the arms, between the legs) is
+precomputed when it is imported, as precomputed radiance transfer (Sloan,
+Kautz and Snyder, 2002; Weta's PantaRay cached occlusion this way for
+Avatar). Each surface sample looks at the rest of its model on a 6 x 8 x 8
+cube raster, as the bounce gather does: the model's samples are discs,
+near ones laid on one by one, far groups as one disc each, no rays. What
+stays open, weighted by the cosine to the sample's normal, is folded into
+nine numbers, order-2 spherical harmonics, enough for the light a diffuse
+surface gets from a smooth sky to within about 1% (Ramamoorthi and
+Hanrahan, 2001). The sky is folded into the same nine numbers; a sample's
+share of it is the dot product of the two over that of an open sample
+facing the same way, and the same for the light the ground sends up. A
+sky change is one dot product a sample; turning a model turns its nine
+numbers. A shading point takes its share from the samples of its own
+object within two spacings, weighted by distance and facing, and the sky
+and ground terms are multiplied by it. Discs nearer than a few spacings
+and low over a sample's horizon are left out, and a near disc is held to
+half its distance across: as discs they would cover far more than the
+bump of skin they stand for. Occlusion by other objects (the ground under
+the T-rex) is not in it yet. `--no-sky-occlusion` turns it off, to
+compare; `--debug-view sky-share` shows the share.
 
 ### Light reach
 
@@ -252,6 +275,13 @@ records how far it may stray from the model as made, measured both ways
 against the level below. Every level gets its own tiles. `--no-lod` skips
 it.
 
+Each model also gets its surface samples and their sky transfer as it is
+imported (Light, above): about 3 s for the T-rex and 5 s for the car on 2
+cores. A model imported before this has none; `--sky` adds them to it,
+copying everything else:
+
+    tools/fkj-import/target/release/fkj-import --sky assets/models/trex_highres.fkj -o trex_highres_sky.fkj
+
 An OBJ's materials are not read: `--texture` gives its base colour
 texture. The high-resolution T-rex is a ZBrush export with the same UVs as
 the glTF one, so it takes the glTF's base colour texture.
@@ -339,7 +369,7 @@ build leaves them out.
 | `reshaded` | clusters shaded (red) and bounce gathered (green) in the last frames |
 | `albedo` | base colour: vertex colours or texture tiles |
 | `tiles` | the tile level read for each cluster, dim where finer levels stay on disk |
-| `sky` | the sky's light alone |
+| `sky` | the sky's light alone, times each point's share of it |
 | `direct` | the kept shading, without bounce |
 | `highlight` | the highlight alone, x4 |
 | `bounce` | bounce light alone, x4 |
@@ -351,6 +381,7 @@ build leaves them out.
 | `surfels` | the surfel cloud as lit discs |
 | `receivers` | bounce receivers: gathered or waiting |
 | `samples` | each object's surface samples, one colour each |
+| `sky-share` | each point's share of the sky, from its object's sky transfer |
 | `micro-raster` | the 6 x 8 x 8 cube raster of the receiver under the cursor, x4, and what its spherical harmonics give back |
 
 ## Without a display server
@@ -626,7 +657,8 @@ Painting the interface took about 7 ms a frame at 1920 x 1080 on the same
    mesh's own vertices. A kept grid stays while its points are between a
    quarter of the rate and the rate apart on the new view. Only triangles
    under visible pixels are diced and shaded, and only those
-   whose shading was not kept: radiance in cd/m² from the sky, then each
+   whose shading was not kept: radiance in cd/m² from the sky (times the
+   point's share of it, from its object's sky transfer), then each
    light in reach through its shadow map, Lambert diffuse and a small
    Blinn-Phong highlight. Adaptive shading: every other point of a grid
    (each way) is shaded first; where the four corners of a cell differ by
@@ -874,6 +906,13 @@ Not measured yet: a Raspberry Pi.
   visibility raster, the resolve and setting up the shading points are
   not. The texel loads of a shadow lookup are one lane at a time. On the
   Raspberry Pi 1 (no NEON) the eight lanes are plain arrays.
+- Sky occlusion: only an object's own shape; other objects (the T-rex
+  over the ground) and the ground and mountains take nothing yet. The
+  share comes from samples about 2 cm apart, so a crease narrower than a
+  few centimetres (between scales, under a claw) is not darkened. A model
+  imported before 23/10/2026 has no transfer until `fkj-import --sky` is
+  run on it. Each shading point looks its share up, which made the first
+  frame's shading of the high-resolution set 474 to 553 ms (2 cores).
 - Moving an object: shadow maps are drawn again in a rectangle round both
   its old and new place, so a large object (the T-rex) costs about as
   many triangles as a full map; the moved object itself is shaded again

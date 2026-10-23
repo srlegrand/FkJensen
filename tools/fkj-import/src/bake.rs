@@ -160,6 +160,12 @@ pub fn bake_logged(m: &Model, o: &Options, levels: bool, log: &dyn Fn(String)) -
         let stats = lod::LodStats { tris: vec![m.tris.len()], clusters: vec![scene.clusters.len()] };
         (source.iter().map(|&s| BakeTri::of(m, s as usize)).collect(), stats)
     };
+    // Surface samples and what each sees of the sky past the model itself
+    // (src/samples.rs, src/transfer.rs in FkJensen).
+    let ts = std::time::Instant::now();
+    let (n, h) = scene.scatter_over(0..scene.clusters.len());
+    crate::transfer::compute(&mut scene.samples);
+    log(format!("sky transfer: {n} surface samples, at least {:.1} cm apart, in {:.1} s", h * 100.0, ts.elapsed().as_secs_f64()));
     let mut error = vec![0f32; tris.len()];
     for c in &scene.clusters {
         error[c.first_tri as usize..(c.first_tri + c.tri_count) as usize].fill(c.lod_error);

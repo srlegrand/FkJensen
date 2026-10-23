@@ -40,6 +40,7 @@ use crate::raster::{self, Camera, Frame, NO_TRI, NOT_VISIBLE, RenderSettings, SP
 use crate::scene::{PointLight, Scene};
 use crate::shadow::CubeShadow;
 use crate::sun::SunShadow;
+use crate::transfer::SkyShare;
 
 /// How one triangle was diced, and where its points are kept.
 ///
@@ -361,7 +362,7 @@ pub struct Renderer {
     /// only it keeps a share of its own in the shading cache, so memory
     /// grows by one share a point.
     hot: Vec<usize>,
-    prev_global: Option<(Sky, raster::Sun, f32, bool, bool, bool, usize, bool)>,
+    prev_global: Option<(Sky, raster::Sun, f32, bool, bool, bool, usize, bool, bool)>,
     /// The sun's shadow map, and what it was built for (direction, texels,
     /// scene).
     sun_shadow: Option<SunShadow>,
@@ -382,6 +383,8 @@ pub struct Renderer {
     frame_no: u64,
     /// The shading rate is multiplied by this to fit the cache budget.
     rate_scale: f32,
+    /// Each sample's share of the sky, for the sky contrast it was made for.
+    sky_share: Option<(SkyShare, u32)>,
 }
 
 #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
@@ -392,6 +395,7 @@ pub struct Peek<'a> {
     pub shadows: &'a [Option<CubeShadow>],
     pub bounce: Option<&'a Bounce>,
     pub sun_shadow: Option<&'a SunShadow>,
+    pub sky_share: Option<&'a SkyShare>,
 }
 
 #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
@@ -466,6 +470,7 @@ impl Renderer {
             base_view: None,
             frame_no: 0,
             rate_scale: 1.0,
+            sky_share: None,
         }
     }
 
@@ -478,7 +483,7 @@ impl Renderer {
 
     #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
     pub fn peek(&self) -> Peek<'_> {
-        Peek { frame_no: self.frame_no, cache: &self.cache, shadows: &self.shadows, bounce: self.bounce.as_ref(), sun_shadow: self.sun_shadow.as_ref() }
+        Peek { frame_no: self.frame_no, cache: &self.cache, shadows: &self.shadows, bounce: self.bounce.as_ref(), sun_shadow: self.sun_shadow.as_ref(), sky_share: self.sky_share.as_ref().map(|s| &s.0) }
     }
 
     /// Memory held by the shading cache and the shadow maps, in bytes.
@@ -500,6 +505,8 @@ impl Renderer {
         if from == to {
             return;
         }
+        // Its samples moved and turned.
+        self.sky_share = None;
         for c in moved {
             if let Some(e) = self.cache.get_mut(c) {
                 *e = ClusterShade::empty();
@@ -540,7 +547,7 @@ impl Renderer {
         let reach: Vec<f32> = lights.iter().map(|l| if settings.light_reach { raster::light_reach(l, cut) } else { f32::INFINITY }).collect();
 
         // What changed since the last frame decides what is thrown away.
-        let global = (settings.sky, settings.sun, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.bounce, settings.shadow_res, settings.adaptive);
+        let global = (settings.sky, settings.sun, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.bounce, settings.shadow_res, settings.adaptive, settings.sky_occlusion);
         // Without incremental moves (to compare), a move relights all.
         let global_changed = self.prev_global != Some(global) || self.prev_lights.len() != lights.len() || (!settings.incremental_moves && !self.moves.is_empty());
         // Spheres (old and new position, with reach) of lights that changed,
@@ -700,6 +707,15 @@ impl Renderer {
         let tb = std::time::Instant::now();
         let shadows: Vec<Option<&CubeShadow>> = (0..lights.len()).map(|i| if settings.shadows { self.shadows[i].as_ref() } else { None }).collect();
         let sky = settings.sky;
+        // Each sample's share of the sky, made again when the sky's shape
+        // changes or an object moves.
+        let contrast = sky.contrast.to_bits();
+        if !(settings.sky_occlusion && sky.on) {
+            self.sky_share = None;
+        } else if self.sky_share.as_ref().is_none_or(|s| s.1 != contrast) {
+            self.sky_share = Some((SkyShare::new(scene, sky.contrast), contrast));
+        }
+        let sky_share = self.sky_share.as_ref().map(|s| &s.0);
         if settings.bounce {
             let new_cloud = self.bounce.is_none();
             let b = self.bounce.get_or_insert_with(|| Bounce::new(scene));
@@ -717,7 +733,8 @@ impl Renderer {
                     let in_reach: Vec<usize> = (0..lights.len()).filter(|&i| lights[i].position.distance(sf.position) <= reach[i]).collect();
                     // Direct light only, without the sky's ground term: the
                     // ground is in the cloud.
-                    let new = shade_point(sf.position, sf.normal, sf.albedo, sf.position + sf.normal, sky, false, lights, &in_reach, &reach, &shadows, sun).0;
+                    let share = sky_share.map(|s| s.at(sf.cluster as usize, scene, sf.position, sf.normal)[0]).unwrap_or(1.0);
+                    let new = shade_point(sf.position, sf.normal, sf.albedo, sf.position + sf.normal, Sky { lux: sky.lux * share, ..sky }, false, lights, &in_reach, &reach, &shadows, sun).0;
                     let delta = (new - *r).abs().max_element() * sf.area;
                     *r = new;
                     lit.fetch_add(1, Ordering::Relaxed);
@@ -1065,6 +1082,18 @@ impl Renderer {
                     let mut batch = Batch::default();
                     let (mut vdest, mut gdest, mut dims) = (Vec::new(), Vec::new(), Vec::new());
                     gather(e, vtodo, ttodo, &mut batch, &mut vdest, &mut gdest, &mut dims);
+                    // Each point's share of the sky, from the samples
+                    // around it.
+                    if let Some(sh) = sky_share.filter(|s| s.covers(ci)) {
+                        let n = batch.len();
+                        batch.sv.reserve(n);
+                        batch.gv.reserve(n);
+                        for k in 0..n {
+                            let v = sh.at(ci, scene, Vec3::new(batch.px[k], batch.py[k], batch.pz[k]), Vec3::new(batch.nx[k], batch.ny[k], batch.nz[k]));
+                            batch.sv.push(v[0]);
+                            batch.gv.push(v[1]);
+                        }
+                    }
                     // The sky, the sun and the lights in the sum, then each
                     // hot light's share (one that no longer reaches gives
                     // nothing): shaded where the picture needs it, the rest
@@ -1483,6 +1512,10 @@ pub struct Batch {
     pub ar: Vec<f32>,
     pub ag: Vec<f32>,
     pub ab: Vec<f32>,
+    /// Each point's share of the sky and of the ground's light
+    /// (`transfer.rs`); empty: all of both.
+    pub sv: Vec<f32>,
+    pub gv: Vec<f32>,
 }
 
 impl Batch {
@@ -1525,8 +1558,8 @@ impl Batch {
 impl Batch {
     /// The points `idx` of this batch, in that order.
     fn select(&self, idx: &[u32]) -> Batch {
-        let pick = |v: &Vec<f32>| idx.iter().map(|&i| v[i as usize]).collect();
-        Batch { px: pick(&self.px), py: pick(&self.py), pz: pick(&self.pz), nx: pick(&self.nx), ny: pick(&self.ny), nz: pick(&self.nz), ar: pick(&self.ar), ag: pick(&self.ag), ab: pick(&self.ab) }
+        let pick = |v: &Vec<f32>| if v.is_empty() { Vec::new() } else { idx.iter().map(|&i| v[i as usize]).collect() };
+        Batch { px: pick(&self.px), py: pick(&self.py), pz: pick(&self.pz), nx: pick(&self.nx), ny: pick(&self.ny), nz: pick(&self.nz), ar: pick(&self.ar), ag: pick(&self.ag), ab: pick(&self.ab), sv: pick(&self.sv), gv: pick(&self.gv) }
     }
 
     fn albedo(&self, i: usize) -> Vec3 {
@@ -1769,12 +1802,16 @@ pub fn shade_batch(
         let (px, py, pz) = (ld(&b.px), ld(&b.py), ld(&b.pz));
         let (nx, ny, nz) = (ld(&b.nx), ld(&b.ny), ld(&b.nz));
         let (ar, ag, ab) = (ld(&b.ar), ld(&b.ag), ld(&b.ab));
-        // Sky.
+        // Sky, times each point's share of it.
         let (mut dr, mut dg, mut db) = (zero, zero, zero);
         if sky.on {
             let up = ny * 0.5 + 0.5;
-            let f = if sky_c <= 0.5 { one + (up - one) * (2.0 * sky_c) } else { (up.max(f32x8::splat(1e-30)).ln() * sky_exp).exp() };
-            let g = one - up;
+            let mut f = if sky_c <= 0.5 { one + (up - one) * (2.0 * sky_c) } else { (up.max(f32x8::splat(1e-30)).ln() * sky_exp).exp() };
+            let mut g = one - up;
+            if !b.sv.is_empty() {
+                f *= ld(&b.sv);
+                g *= ld(&b.gv);
+            }
             let s = sky_fill * inv_pi;
             dr = ar * (f * (sky.tint.x * s) + g * (ground_k.x * s));
             dg = ag * (f * (sky.tint.y * s) + g * (ground_k.y * s));
@@ -2286,5 +2323,64 @@ mod tests {
         let (r, g, b) = ((px >> 16) & 255, (px >> 8) & 255, px & 255);
         assert!(r > 40 && g < 5 && b < 5, "red from the tiles, got {r} {g} {b}");
         assert!(scene.textures.stats().reads >= 1);
+    }
+
+    /// A floor and a tall wall as one object with its sky transfer: the
+    /// floor by the wall gets about half the sky it gets with sky
+    /// occlusion off, the floor far from it the same.
+    #[test]
+    fn the_sky_share_darkens_a_corner_and_nothing_else() {
+        let mut scene = Scene::new();
+        let grid = |c: Vec3, u: Vec3, v: Vec3, n: usize| {
+            let mut p = Vec::new();
+            let mut idx = Vec::new();
+            for j in 0..=n {
+                for i in 0..=n {
+                    p.push(c + u * (i as f32 / n as f32 * 2.0 - 1.0) + v * (j as f32 / n as f32 * 2.0 - 1.0));
+                }
+            }
+            let w = (n + 1) as u32;
+            for j in 0..n as u32 {
+                for i in 0..n as u32 {
+                    let a = j * w + i;
+                    idx.extend_from_slice(&[a, a + 1, a + w + 1, a, a + w + 1, a + w]);
+                }
+            }
+            (p, idx)
+        };
+        // Two triangles of floor: the samples, not the mesh, carry the detail.
+        let (p, i) = grid(Vec3::ZERO, Vec3::X * 2.0, Vec3::NEG_Z * 2.0, 1);
+        scene.push_mesh(&p, &[], &[Vec3::splat(0.5)], &i);
+        let (p, i) = grid(Vec3::new(-2.0, 2.0, 0.0), Vec3::NEG_Z * 2.0, Vec3::Y * 2.0, 2);
+        scene.push_mesh(&p, &[], &[Vec3::splat(0.5)], &i);
+        let n = scene.clusters.len();
+        let o = scene.add_object("corner".into(), 0..n, Vec3::ZERO, Vec3::ZERO);
+        scene.scatter_samples(o);
+        crate::transfer::compute(&mut scene.samples);
+        let (w, h) = (160, 120);
+        let cam = cam_at(0.4, w, h, Vec3::new(0.0, 0.0, 0.0), 5.0, 0.7);
+        let on = RenderSettings { bounce: false, shadows: false, ..RenderSettings::new(Sky::new(300.0, true)) };
+        let mut a = Frame::new(w, h);
+        render(&scene, &cam, &[], &on, &mut a);
+        let mut b = Frame::new(w, h);
+        render(&scene, &cam, &[], &RenderSettings { sky_occlusion: false, ..on }, &mut b);
+        let (mut near, mut far) = ((0.0, 0.0, 0), (0.0, 0.0, 0));
+        for y in 0..h {
+            for x in 0..w {
+                let Some((p, n)) = raster::unproject(&a, &scene, x, y) else { continue };
+                if n.y < 0.9 {
+                    continue;
+                }
+                let (va, vb) = ((a.color[y * w + x] & 255) as f32, (b.color[y * w + x] & 255) as f32);
+                let slot = if p.x < -1.85 { &mut near } else if p.x > 1.0 { &mut far } else { continue };
+                slot.0 += va;
+                slot.1 += vb;
+                slot.2 += 1;
+            }
+        }
+        assert!(near.2 > 10 && far.2 > 10, "{near:?} {far:?}");
+        let near_ratio = near.0 / near.1;
+        assert!(near_ratio < 0.85, "by the wall: {near_ratio}");
+        assert!((far.0 / far.1 - 1.0).abs() < 0.05, "far from it: {far:?}");
     }
 }

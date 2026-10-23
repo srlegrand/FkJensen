@@ -42,9 +42,10 @@ pub enum DebugView {
     Receivers,
     MicroRaster,
     Samples,
+    SkyShare,
 }
 
-pub const ALL: [DebugView; 25] = [
+pub const ALL: [DebugView; 26] = [
     DebugView::Final,
     DebugView::Clusters,
     DebugView::Lod,
@@ -70,6 +71,7 @@ pub const ALL: [DebugView; 25] = [
     DebugView::Receivers,
     DebugView::MicroRaster,
     DebugView::Samples,
+    DebugView::SkyShare,
 ];
 
 impl DebugView {
@@ -100,6 +102,7 @@ impl DebugView {
             DebugView::Receivers => "receivers",
             DebugView::MicroRaster => "micro-raster",
             DebugView::Samples => "samples",
+            DebugView::SkyShare => "sky-share",
         }
     }
 
@@ -128,7 +131,7 @@ impl DebugView {
             DebugView::Reshaded => ("SHADING CACHE", &["RED: SHADED IN THE LAST FRAMES; GREEN: BOUNCE GATHERED", "GREY: KEPT FROM EARLIER FRAMES. DRAG A LIGHT TO SEE ITS REACH REDONE"]),
             DebugView::Albedo => ("ALBEDO", &["BASE COLOUR: VERTEX COLOURS, OR TEXTURE TILES AT THE KEPT LEVEL"]),
             DebugView::Tiles => ("TEXTURE TILES", &["BRIGHT: THE TILE LEVEL READ FOR WHAT IS SEEN, IN THE CACHE NOW", "DIM: FINER LEVELS LEFT ON DISK; GREY: VERTEX COLOURS ONLY"]),
-            DebugView::Sky => ("SKY ONLY", &["LIGHT FROM THE SKY: BY FACING, NEVER BY DISTANCE"]),
+            DebugView::Sky => ("SKY ONLY", &["LIGHT FROM THE SKY: BY FACING, TIMES WHAT THE OBJECT'S OWN SHAPE LEAVES OPEN", "THAT SHARE IS PRECOMPUTED AT ITS SURFACE SAMPLES AS SPHERICAL HARMONICS"]),
             DebugView::Direct => ("DIRECT LIGHT", &["SKY AND POINT LIGHTS FROM THE SHADING CACHE, NO BOUNCE"]),
             DebugView::Highlight => ("HIGHLIGHT ONLY, X4", &["BLINN-PHONG, REDONE WHEN THE CAMERA MOVES"]),
             DebugView::Bounce => ("BOUNCE ONLY, X4", &["ONE BOUNCE, FROM EACH RECEIVER'S SPHERICAL HARMONICS"]),
@@ -140,6 +143,7 @@ impl DebugView {
             DebugView::Surfels => ("SURFELS", &["THE SURFACES AS DISCS, EACH LIT DIRECTLY", "THIS LIT CLOUD IS WHAT BOUNCE LIGHT IS GATHERED FROM"]),
             DebugView::Receivers => ("BOUNCE RECEIVERS", &["GREEN: GATHERED; RED: WAITING FOR ITS TURN"]),
             DebugView::Samples => ("SURFACE SAMPLES", &["EACH OBJECT'S SURFACE AS EVEN DISCS, ONE COLOUR EACH, WHATEVER ITS TRIANGLES", "THE SAME SPACING ON A LARGE FLAT TRIANGLE AS ON A DENSE SCULPT"]),
+            DebugView::SkyShare => ("SKY SHARE", &["WHITE: ALL OF THE SKY; BLACK: NONE. WHAT EACH OBJECT'S OWN SHAPE LEAVES OPEN", "PRECOMPUTED AT IMPORT AT ITS SURFACE SAMPLES, 9 NUMBERS EACH; BLUE: NO SAMPLES"]),
             DebugView::MicroRaster => ("MICRO-RASTER, X4", &["THE CUBE OF 6 X 8 X 8 TEXELS SEEN BY THE RECEIVER UNDER THE CURSOR", "NEAREST SURFELS FILL IT FIRST; THEN IT FOLDS INTO 4 NUMBERS PER COLOUR"]),
         }
     }
@@ -343,7 +347,22 @@ pub fn draw(view: DebugView, ctx: &Ctx, frame: &mut Frame) {
                         }
                     }
                 }
-                DebugView::Sky => shown(ctx, albedo(ctx, &hh) * ctx.settings.sky.irradiance_from(hh.n, !ctx.settings.bounce) * std::f32::consts::FRAC_1_PI),
+                DebugView::SkyShare => match ctx.peek.sky_share {
+                    Some(s) if s.covers(hh.cluster) => {
+                        let v = s.at(hh.cluster, ctx.scene, hh.p, hh.n)[0];
+                        // Shown as an occlusion pass is: the share is the grey value.
+                        Vec3::splat(v.powf(2.2))
+                    }
+                    _ => Vec3::new(0.01, 0.015, 0.08),
+                },
+                DebugView::Sky => {
+                    // The sky's light and the ground's, each times the
+                    // point's share from the object's samples.
+                    let sh = ctx.peek.sky_share.map(|s| s.at(hh.cluster, ctx.scene, hh.p, hh.n)).unwrap_or([1.0, 1.0]);
+                    let sky = ctx.settings.sky.irradiance_from(hh.n, false) * sh[0];
+                    let ground = (ctx.settings.sky.irradiance_from(hh.n, !ctx.settings.bounce) - ctx.settings.sky.irradiance_from(hh.n, false)) * sh[1];
+                    shown(ctx, albedo(ctx, &hh) * (sky + ground) * std::f32::consts::FRAC_1_PI)
+                }
                 DebugView::Direct => shown(ctx, ctx.peek.radiance(ctx.scene, hh.cluster, hh.tri, hh.w, Part::All)),
                 DebugView::Highlight => shown(ctx, ctx.peek.radiance(ctx.scene, hh.cluster, hh.tri, hh.w, Part::Highlight) * 4.0),
                 DebugView::Bounce => match ctx.peek.bounce {
@@ -1017,8 +1036,8 @@ mod tests {
         for v in ALL {
             assert_eq!(DebugView::from_name(v.name()), Some(v));
         }
-        assert_eq!(DebugView::Final.step(-1), DebugView::Samples);
-        assert_eq!(DebugView::Samples.step(1), DebugView::Final);
+        assert_eq!(DebugView::Final.step(-1), DebugView::SkyShare);
+        assert_eq!(DebugView::SkyShare.step(1), DebugView::Final);
     }
 
     #[test]

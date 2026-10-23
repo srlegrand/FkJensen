@@ -42,6 +42,7 @@ pub const TAG_INST: [u8; 4] = *b"INST";
 pub const TAG_TEXR: [u8; 4] = *b"TEXR";
 pub const TAG_LODS: [u8; 4] = *b"LODS";
 pub const TAG_OBJS: [u8; 4] = *b"OBJS";
+pub const TAG_SAMP: [u8; 4] = *b"SAMP";
 
 /// Extra copies of clusters `first_cluster..first_cluster + cluster_count`
 /// of the `MESH` section, each at `transform` applied to the stored
@@ -105,7 +106,8 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
     head.u32(if lods { VERSION_LOD } else { VERSION });
     let textured = !scene.textures.is_empty();
     let objs = !scene.objects.is_empty();
-    head.u32(2 + !instances.is_empty() as u32 + textured as u32 + lods as u32 + objs as u32);
+    let samp = !scene.samples.is_empty();
+    head.u32(2 + !instances.is_empty() as u32 + textured as u32 + lods as u32 + objs as u32 + samp as u32);
     head.u32(0);
     out.write_all(&head.0)?;
 
@@ -284,6 +286,27 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
         }
         section(out, TAG_OBJS, 2, &o.0)?;
     }
+
+    // SAMP: u32 sample count, u32 0; per sample, 60 bytes: position (3
+    // f32), normal (2 u16, octahedral), f32 area, u32 cluster, then its sky
+    // transfer, 9 f32 (NaN when not computed). In order of cluster.
+    if samp {
+        let mut sm = W(Vec::with_capacity(8 + scene.samples.len() * 60));
+        sm.u32(scene.samples.len() as u32);
+        sm.u32(0);
+        for x in &scene.samples {
+            sm.v3(x.position);
+            let e = oct_encode(x.normal);
+            sm.u16(e[0]);
+            sm.u16(e[1]);
+            sm.f32(x.area);
+            sm.u32(x.cluster);
+            for v in x.sky {
+                sm.f32(v);
+            }
+        }
+        section(out, TAG_SAMP, 1, &sm.0)?;
+    }
     Ok(())
 }
 
@@ -432,6 +455,7 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) 
     let mut inst_payloads: Vec<&[u8]> = Vec::new();
     let mut lods: Option<&[u8]> = None;
     let mut objs: Option<(&[u8], u32)> = None;
+    let mut samp: Option<&[u8]> = None;
     for (tag, section_version, payload) in &list {
         match *tag {
             TAG_OBJS => objs = Some((payload, *section_version)),
@@ -440,6 +464,7 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) 
             TAG_LITE if *section_version == 2 => read_lights(payload, &mut scene)?,
             TAG_LITE => report.skipped.push(format!("LITE version {section_version} (relative units, not lumens)")),
             TAG_INST => inst_payloads.push(payload),
+            TAG_SAMP if *section_version == 1 => samp = Some(payload),
             other => report.skipped.push(String::from_utf8_lossy(&other).into_owned()),
         }
     }
@@ -465,6 +490,9 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) 
         }
         scene.textures.entries = entries;
         scene.textures.sources = vec![Arc::new(source)];
+    }
+    if let Some(b) = samp {
+        read_samples(b, &mut scene, stored_clusters)?;
     }
     // Instances refer to the clusters as stored, so they are expanded after
     // every MESH section has been read.
@@ -562,6 +590,35 @@ fn read_mesh(b: &[u8], scene: &mut Scene) -> Result<(), String> {
     Ok(())
 }
 
+fn read_samples(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Result<(), String> {
+    let mut r = R { b, at: 0 };
+    let n = r.u32()? as usize;
+    r.u32()?;
+    if b.len() - r.at < n * 60 {
+        return Err("SAMP section is shorter than its count says".into());
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let position = r.v3()?;
+        let normal = crate::scene::oct_decode([r.u16()?, r.u16()?]);
+        let area = r.f32()?;
+        let cluster = r.u32()?;
+        let mut sky = [0f32; 9];
+        for v in &mut sky {
+            *v = r.f32()?;
+        }
+        if cluster as usize >= stored_clusters {
+            return Err("a sample lies on a cluster past the mesh".into());
+        }
+        out.push(crate::samples::Sample { position, normal, area, cluster, sky });
+    }
+    if out.windows(2).any(|w| w[0].cluster > w[1].cluster) {
+        return Err("SAMP is not in order of cluster".into());
+    }
+    scene.samples.extend(out);
+    Ok(())
+}
+
 fn expand_instances(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Result<(), String> {
     let mut r = R { b, at: 0 };
     let groups = r.u32()?;
@@ -585,6 +642,22 @@ fn expand_instances(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Resu
             let m = Mat4::from_cols(rows[0], rows[1], rows[2], Vec4::W).transpose();
             let nm = m.inverse().transpose();
             let scale = m.x_axis.truncate().length().max(m.y_axis.truncate().length()).max(m.z_axis.truncate().length());
+            let base = scene.clusters.len();
+            // The copy's samples: turned with it when it is a rotation and
+            // a uniform scale, else without sky transfer.
+            let rigid = m.determinant() > 0.0
+                && [m.x_axis, m.y_axis, m.z_axis].iter().all(|a| (a.truncate().length() - scale).abs() < 1e-4 * scale);
+            let turn = glam::Quat::from_mat3(&glam::Mat3::from_mat4(m).mul_scalar(1.0 / scale));
+            let copies: Vec<crate::samples::Sample> = scene.samples[scene.samples_in(first..first + count)]
+                .iter()
+                .map(|x| crate::samples::Sample {
+                    position: m.transform_point3(x.position),
+                    normal: nm.transform_vector3(x.normal).normalize_or(Vec3::Y),
+                    area: x.area * scale * scale,
+                    cluster: (base + x.cluster as usize - first) as u32,
+                    sky: if rigid && !x.sky[0].is_nan() { crate::transfer::rotate(&x.sky, turn) } else { [f32::NAN; 9] },
+                })
+                .collect();
             for ci in first..first + count {
                 let c = scene.clusters[ci];
                 let vbase = scene.vertex_count() as u32;
@@ -641,6 +714,7 @@ fn expand_instances(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Resu
                 let r = ps.iter().map(|p| crate::scene::dequantise(crate::scene::quantise(*p, qlo, qstep), qlo, qstep).distance(last.centre)).fold(0.0, f32::max);
                 last.radius = last.radius.max(r);
             }
+            scene.samples.extend(copies);
         }
     }
     Ok(())
@@ -738,6 +812,8 @@ mod tests {
         let colors: Vec<Vec3> = p.iter().map(|v| (*v * 0.5 + Vec3::splat(0.5)).powf(2.2)).collect();
         let mut s = Scene::new();
         s.push_mesh(&p, &[], &colors, &idx);
+        s.scatter_over(0..s.clusters.len());
+        crate::transfer::compute(&mut s.samples);
         s.lights.push(PointLight { position: Vec3::new(1.0, 2.0, 3.0), color: Vec3::new(1.0, 0.5, 0.25), lumens: 800.0 });
         s
     }
@@ -755,6 +831,7 @@ mod tests {
         assert_eq!(a.positions(), b.positions());
         assert_eq!(a.normals(), b.normals());
         assert_eq!(a.colors(), b.colors());
+        assert_eq!(a.samples.len(), b.samples.len());
         for c in &b.clusters {
             for v in c.first_vertex..c.first_vertex + c.vertex_count {
                 assert!(b.positions()[v as usize].distance(c.centre) <= c.radius);
@@ -767,7 +844,8 @@ mod tests {
         let a = sample();
         let mut bytes = write(&a, &[]);
         // Append a CURV section and bump the section count.
-        bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        bytes[8..12].copy_from_slice(&(n + 1).to_le_bytes());
         bytes.extend_from_slice(b"CURV");
         bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.extend_from_slice(&5u64.to_le_bytes());

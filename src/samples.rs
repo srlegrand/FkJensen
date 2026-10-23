@@ -37,6 +37,9 @@ pub struct Sample {
     pub area: f32,
     /// The scene cluster it lies on (finest level of detail).
     pub cluster: u32,
+    /// Its sky transfer (`transfer.rs`): what it sees of the sky as
+    /// order-2 spherical harmonics, in world space. NaN when not computed.
+    pub sky: [f32; 9],
 }
 
 /// Spacing for a model of `area` m².
@@ -114,7 +117,7 @@ pub fn scatter(count: usize, tri: impl Fn(usize) -> (u32, [Vec3; 3], [Vec3; 3]) 
         }
     }
     let each = if kept.is_empty() { 0.0 } else { area / kept.len() as f32 };
-    let mut out: Vec<Sample> = kept.into_iter().map(|(position, normal, cluster)| Sample { position, normal, area: each, cluster }).collect();
+    let mut out: Vec<Sample> = kept.into_iter().map(|(position, normal, cluster)| Sample { position, normal, area: each, cluster, sky: [f32::NAN; 9] }).collect();
     out.sort_by_key(|s| s.cluster);
     out
 }

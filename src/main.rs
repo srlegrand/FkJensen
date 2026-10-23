@@ -18,6 +18,7 @@
 //!   fkjensen --no-reach                evaluate every light everywhere (to compare)
 //!   fkjensen --no-occlusion            draw what is hidden behind what was seen (to compare)
 //!   fkjensen --no-adaptive             shade every grid point (to compare)
+//!   fkjensen --no-sky-occlusion        the sky not taken by objects' own shapes (to compare)
 //!   fkjensen --relight-on-move         light everything again when an object moves (to compare)
 //!   fkjensen --png out.png --bench-move  then move the first model five times, timing each frame
 //!   fkjensen --close                   start on the close framing of the subject
@@ -52,6 +53,7 @@ mod manip;
 mod raster;
 mod reyes;
 mod samples;
+mod transfer;
 mod scene;
 mod shadow;
 mod simd;
@@ -1203,6 +1205,7 @@ fn main() {
     let mut reach = true;
     let mut occlusion = true;
     let mut adaptive = true;
+    let mut sky_occlusion = true;
     let mut incremental_moves = true;
     let mut bench_move = false;
     let mut close = false;
@@ -1283,6 +1286,7 @@ fn main() {
             "--no-reach" => reach = false,
             "--no-occlusion" => occlusion = false,
             "--no-adaptive" => adaptive = false,
+            "--no-sky-occlusion" => sky_occlusion = false,
             "--relight-on-move" => incremental_moves = false,
             "--bench-move" => bench_move = true,
             "--close" => close = true,
@@ -1350,7 +1354,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--relight-on-move] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1434,6 +1438,7 @@ fn main() {
     app.settings.light_reach = reach;
     app.settings.occlusion = occlusion;
     app.settings.adaptive = adaptive;
+    app.settings.sky_occlusion = sky_occlusion;
     app.settings.incremental_moves = incremental_moves;
     if let Some(p) = &plan {
         app.settings.shadows = p.shadows;

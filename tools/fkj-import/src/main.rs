@@ -19,6 +19,11 @@
 //! any of its triangles needs. Each level is filtered from the source's mip
 //! chain at its own spacing. Vertex colours hold the coarsest view.
 //!
+//! Surface samples and sky transfer (src/samples.rs, src/transfer.rs in
+//! FkJensen): points spread evenly over the model, each with what it sees
+//! of the sky past the model itself as order-2 spherical harmonics.
+//! `fkj-import --sky in.fkj -o out.fkj` adds them to a file made before.
+//!
 //! Levels of detail (src/lod.rs in FkJensen): the mesh is built into a
 //! cluster hierarchy, each level about half the triangles of the one below,
 //! and every level gets its own tiles from the same textures. `--no-lod`
@@ -36,6 +41,8 @@ mod scene;
 mod texture;
 #[path = "../../../src/samples.rs"]
 mod samples;
+#[path = "../../../src/transfer.rs"]
+mod transfer;
 #[path = "../../../src/lod.rs"]
 mod lod;
 
@@ -63,6 +70,7 @@ fn main() {
     let mut texture: Option<PathBuf> = None;
     let mut opts = Options { texel: 0.002, max_level: MAX_LEVEL };
     let mut levels = true;
+    let mut sky_only = false;
     let mut i = 0;
     let num = |a: Option<&String>, what: &str| -> f32 {
         a.and_then(|s| s.parse().ok()).unwrap_or_else(|| {
@@ -101,6 +109,7 @@ fn main() {
                 i += 1;
             }
             "--no-lod" => levels = false,
+            "--sky" => sky_only = true,
             "--texture" => {
                 texture = args.get(i + 1).map(PathBuf::from);
                 i += 1;
@@ -112,7 +121,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fkj [--length M | --height M] [--rotate-x DEG] [--rotate-y DEG] [--texel M] [--max-level N] [--textures DIR] [--texture FILE (OBJ)] [--no-lod]");
+                eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fkj [--length M | --height M] [--rotate-x DEG] [--rotate-y DEG] [--texel M] [--max-level N] [--textures DIR] [--texture FILE (OBJ)] [--no-lod]\n       fkj-import --sky model.fkj -o out.fkj   (add surface samples and sky transfer to an .fkj made before them)");
                 return;
             }
             a => input = Some(PathBuf::from(a)),
@@ -123,6 +132,10 @@ fn main() {
         eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fkj [--length M | --height M] ...");
         std::process::exit(2);
     };
+    if sky_only {
+        add_sky(&input, out.as_deref());
+        return;
+    }
     let out = out.unwrap_or_else(|| input.with_extension("fkj"));
     let t0 = std::time::Instant::now();
     let model = bake::load(&input, texture.as_deref(), &tex_dirs);
@@ -172,4 +185,39 @@ fn main() {
         bytes as f64 / 1e6,
         t0.elapsed().as_secs_f64()
     );
+}
+
+/// Add surface samples and their sky transfer to an .fkj made without
+/// them, keeping everything else; texture tiles are copied from the input
+/// as they are written, never all in memory.
+fn add_sky(input: &std::path::Path, out: Option<&std::path::Path>) {
+    let Some(out) = out else {
+        eprintln!("--sky needs -o out.fkj (not the input file: its tiles are read while writing)");
+        std::process::exit(2);
+    };
+    if std::fs::canonicalize(input).ok() == std::fs::canonicalize(out).ok() {
+        eprintln!("--sky needs an output file other than the input");
+        std::process::exit(2);
+    }
+    let t0 = std::time::Instant::now();
+    let (mut scene, report) = fkj::read_file(input).unwrap_or_else(|e| {
+        eprintln!("{}: {e}", input.display());
+        std::process::exit(1);
+    });
+    for tag in &report.skipped {
+        eprintln!("  {tag} section not read: it will be missing from the output");
+    }
+    let (n, h) = scene.scatter_over(0..scene.clusters.len());
+    transfer::compute(&mut scene.samples);
+    eprintln!("{}: {n} surface samples, at least {:.1} cm apart, sky transfer in {:.1} s", input.display(), h * 100.0, t0.elapsed().as_secs_f64());
+    let written = std::fs::File::create(out).and_then(|f| {
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+        fkj::write_to(&mut w, &scene, &[])?;
+        std::io::Write::flush(&mut w)
+    });
+    if let Err(e) = written {
+        eprintln!("cannot write {}: {e}", out.display());
+        std::process::exit(1);
+    }
+    eprintln!("wrote {} in {:.1} s", out.display(), t0.elapsed().as_secs_f64());
 }

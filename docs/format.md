@@ -192,6 +192,28 @@ kept so the editor shows them. Version 1 (23/10/2026) held one f32, the
 turn about Y, in place of the rotation; it is still read. A group with nothing under it is its pivot. A
 parent chain that loops is cut at the object that closes it.
 
+## SAMP
+
+Surface samples (`src/samples.rs`) and their sky transfer
+(`src/transfer.rs`). Optional; a reader without it draws the same
+geometry with the sky unoccluded. Section version 1.
+
+    u32       sample count
+    u32       0
+    per sample, in order of cluster, 60 bytes
+      f32 x 3   position, metres
+      u16 x 2   unit normal, octahedral (as MESH)
+      f32       area it stands for, m²
+      u32       cluster it lies on (finest level of detail)
+      f32 x 9   sky transfer: what it sees of the sky past the model
+                itself, cosine weighted, as order-2 real spherical
+                harmonics (Y00, Y1-1, Y10, Y11, Y2-2, Y2-1, Y20, Y21, Y22),
+                in world space; NaN when not computed
+
+Instances (`INST`) copy the samples of the clusters they copy, the
+transfer turned with them when the transform is a rotation and a uniform
+scale, else NaN.
+
 ## LITE
 
 Section version 2.
@@ -255,7 +277,9 @@ cluster stores the finest level any of its triangles needs. Each level is
 filtered from the source's mip chain at its own point spacing. A triangle
 over two texels or fewer needs no tiles: its vertex colours hold them.
 Normal, roughness and other maps are not read. An OBJ's materials are not
-read; `--texture` gives its base colour.
+read; `--texture` gives its base colour. Every model gets its surface
+samples and their sky transfer (`SAMP`); `fkj-import --sky in.fkj -o
+out.fkj` adds them to a file made before them.
 
 ## Not done yet
 
@@ -266,9 +290,6 @@ read; `--texture` gives its base colour.
 - The chess set has no tiles yet: it was baked from USD with colours per
   vertex, so detail finer than the vertex spacing is lost (the board's
   squares have soft edges). `tools/fkj-import` does not read USD.
-- Positions, normals and colours are decoded to f32 at load; the renderer
-  does not yet read the quantised data directly, which would cut memory
-  traffic per frame.
 - Levels of detail are all loaded: a small machine cannot yet leave the
   finest ones in the file.
 - Seams (texture coordinates, normals, separate parts) never move when a

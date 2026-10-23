@@ -377,6 +377,9 @@ impl Editor {
             ui.label("Adaptive shading");
             ui.checkbox(&mut self.app.settings.adaptive, "");
             ui.end_row();
+            ui.label("Sky occlusion");
+            ui.checkbox(&mut self.app.settings.sky_occlusion, "");
+            ui.end_row();
             ui.label("Moves relight their shadows only");
             ui.checkbox(&mut self.app.settings.incremental_moves, "");
             ui.end_row();
