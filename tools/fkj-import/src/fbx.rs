@@ -344,11 +344,13 @@ pub fn load(path: &Path, tex_dirs: &[std::path::PathBuf]) -> Result<Model, Strin
                                         }
                                         Err(e) => {
                                             eprintln!("  {e}");
+                                            model.warnings.push(e);
                                             None
                                         }
                                     },
                                     None => {
                                         eprintln!("  texture {base_name} not found");
+                                        model.warnings.push(format!("texture {base_name} not found"));
                                         None
                                     }
                                 }

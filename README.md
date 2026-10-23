@@ -370,6 +370,7 @@ running.
 
     cargo run --release                     the built-in set
     cargo run --release -- scene.fkj        another .fkj scene
+    cargo run --release -- --editor         the editor (below), 64-bit machines
 
 Headless, for tests and screenshots (no window, no display needed):
 
@@ -484,6 +485,71 @@ frame 2.2 s. On KDE, Alt and the left button move windows by default; set
 the window manager's modifier to Meta for Alt to tumble here.
 
 ![Dragging a lamp on the earlier set (20/10/2026): the shadows follow](docs/light_drag.png)
+
+## Editor
+
+`--editor` opens the viewport inside an interface laid out like Maya
+(64-bit machines only; the Raspberry Pi build leaves it out). It is drawn
+with egui, on the CPU like everything else: egui's triangles are filled by
+`src/editor/paint.rs` into the buffer the frame is copied into.
+
+![The editor with the T-rex selected (23/10/2026)](docs/editor.png)
+
+- **Menus and tools** along the top: File (Open, Save, Save As, Import,
+  Quit), Edit (group, new empty group, add, delete or reset lights),
+  View (frame, lights, wireframe, back-face culling), and the select, move,
+  rotate and scale tools.
+- **Outliner** on the left: the objects and their groups, the lights, the
+  sun, the sky and exposure, the render settings. Click to select, double
+  click to frame, drag an object onto another to put it under it, onto
+  "Objects" to take it out. A group moves, turns and scales everything
+  under it about its pivot.
+- **Attribute editor** on the right, for what is selected: an object's
+  name, translate, rotate about the vertical, uniform scale, triangles,
+  levels of detail and size; a light's position, lumens and colour; the
+  sun's time and brightness; the sky's illuminance, both contrasts and the
+  exposure; the render settings (micropolygon spacing, resolution, shadows,
+  bounce, the visual debug views) with the last frame's numbers.
+- **Timeline** along the bottom: the day from 0 to 24 h, night shaded,
+  the time a red mark. Click or drag to set it; Play runs the day at 1 or
+  10 minutes, or 1 or 3 hours, a second. The time sets the sun, the sky and
+  the exposure.
+- **Viewport** in the middle: the same mouse and keys as the plain window
+  (Controls, above), except Esc. Keys go to the viewport unless a text box
+  is being typed in.
+
+Shortcuts: Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as, Ctrl+I import,
+Ctrl+G put the selected object in a new group. A scene file dropped on the
+window opens; a model dropped on it opens the importer.
+
+Saving writes the whole scene as it is (geometry where the objects now
+stand, texture tiles, the lights, the objects and their groups in an `OBJS`
+section) to the chosen `.fkj`, through a file beside it that replaces it
+once written, since the tiles may be read from the file being replaced.
+
+### Importer
+
+![The importer with the 28 K-triangle T-rex baked (23/10/2026)](docs/editor_import.png)
+
+File > Import reads glTF (.glb, .gltf), binary FBX and OBJ with
+`tools/fkj-import`'s own code, on a thread of its own: the model, its
+size and turn (as in the file, or a length or height in metres; turns
+about X and Y in steps of 90 or any angle), its textures (glTF holds its
+own; FBX textures are looked for beside the model, in a `textures` folder
+there and in folders added; an OBJ gets one base colour texture), the
+texture detail and whether to build levels of detail. It shows what the
+file holds (triangles, vertices, materials, size, textures found and their
+sizes, and any texture not found), then the model baked as the scene will
+draw it, levels of detail and texture tiles included, lit by an afternoon
+sun, to tumble (drag), dolly (right drag or wheel) and track (middle drag),
+with a wireframe switch and the triangles drawn. Add to scene puts it at
+the origin as one object, selected. A file that cannot be read says why
+in the importer's log; the editor carries on.
+
+The 28 K-triangle T-rex (.glb, one 4096 x 4096 texture) read and baked in
+3.3 s on 2 cores of the Xeon, levels of detail included (23/10/2026).
+Painting the interface took about 7 ms a frame at 1920 x 1080 on the same
+2 cores; the viewport is rendered as in the plain window.
 
 ## How a frame is made
 
@@ -649,6 +715,13 @@ Not measured yet: a Raspberry Pi.
   light on a textured surface is coloured by its vertex colours; the importer does not read USD or ASCII FBX, and
   reads FBX transforms without pivots or offsets.
 - Points, curves and volumes in `.fkj` (tags reserved).
+- The editor: no undo; one object selected at a time; objects cannot be
+  deleted or duplicated; a model is added at the origin; the interface is
+  painted again every frame, even when nothing in it changed; a bake
+  cannot be stopped once started (closing the importer leaves it to
+  finish); the importer reads the formats fkj-import reads, nothing more
+  (no USD, PLY, STL, ASCII FBX yet); a large model is held twice while it
+  is added (the importer's copy and the scene's).
 - Materials: albedo only, per vertex or from texture tiles.
 - Light reach is per cluster and per point, not per pixel.
 - The shading cache holds 118 MB for that view (186 MB before even

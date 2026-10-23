@@ -170,7 +170,8 @@ pub struct Scene {
 
 /// A model in the scene: its clusters (and so its vertices, which they
 /// hold in one run), and how it has been placed. Geometry is kept in world
-/// space; moving an object rewrites its vertices.
+/// space; moving an object rewrites its vertices. A group is an object with
+/// no clusters: moving it moves everything under it (`parent`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Object {
     pub name: String,
@@ -184,6 +185,8 @@ pub struct Object {
     /// Bounds of its finest level's vertices.
     pub lo: Vec3,
     pub hi: Vec3,
+    /// The group it is in, if any (an index into `Scene::objects`).
+    pub parent: Option<usize>,
 }
 
 impl Scene {
@@ -274,7 +277,8 @@ impl Scene {
     /// Append another scene's geometry, lights, texture tiles and objects.
     pub fn append(&mut self, other: Scene) {
         let cbase = self.clusters.len();
-        self.objects.extend(other.objects.iter().map(|o| Object { clusters: o.clusters.start + cbase..o.clusters.end + cbase, ..o.clone() }));
+        let obase = self.objects.len();
+        self.objects.extend(other.objects.iter().map(|o| Object { clusters: o.clusters.start + cbase..o.clusters.end + cbase, parent: o.parent.map(|p| p + obase), ..o.clone() }));
         let other_clusters = other.clusters.len();
         if !other.textures.is_empty() || !self.textures.is_empty() {
             self.textures.append(&other.textures, cbase, other_clusters);
@@ -294,16 +298,69 @@ impl Scene {
     /// Make clusters `clusters` an object turning about `pivot`, already
     /// turned by `yaw`.
     pub fn add_object(&mut self, name: String, clusters: std::ops::Range<usize>, pivot: Vec3, yaw: f32) -> usize {
-        self.objects.push(Object { name, clusters, pivot, yaw, scale: 1.0, lo: Vec3::ZERO, hi: Vec3::ZERO });
+        self.objects.push(Object { name, clusters, pivot, yaw, scale: 1.0, lo: Vec3::ZERO, hi: Vec3::ZERO, parent: None });
         let i = self.objects.len() - 1;
         self.refresh_bounds(i);
         i
     }
 
+    /// Make an empty group at `pivot`.
+    pub fn add_group(&mut self, name: String, pivot: Vec3) -> usize {
+        let n = self.clusters.len();
+        self.objects.push(Object { name, clusters: n..n, pivot, yaw: 0.0, scale: 1.0, lo: pivot, hi: pivot, parent: None });
+        self.objects.len() - 1
+    }
+
+    pub fn is_group(&self, i: usize) -> bool {
+        self.objects[i].clusters.is_empty()
+    }
+
+    /// The objects directly under `parent` (None: at the top), in order.
+    pub fn children(&self, parent: Option<usize>) -> Vec<usize> {
+        (0..self.objects.len()).filter(|&i| self.objects[i].parent == parent).collect()
+    }
+
+    /// Everything under `i`, at any depth.
+    pub fn descendants(&self, i: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut todo = vec![i];
+        while let Some(j) = todo.pop() {
+            for k in self.children(Some(j)) {
+                out.push(k);
+                todo.push(k);
+            }
+        }
+        out
+    }
+
+    /// Put `child` under `parent` (None: at the top). Refused, returning
+    /// false, when that would put an object under itself.
+    pub fn set_parent(&mut self, child: usize, parent: Option<usize>) -> bool {
+        if let Some(p) = parent {
+            if p == child || self.descendants(child).contains(&p) || p >= self.objects.len() {
+                return false;
+            }
+        }
+        self.objects[child].parent = parent;
+        true
+    }
+
+    /// The runs of clusters that move with object `i`: its own and those
+    /// of everything under it.
+    pub fn moving_clusters(&self, i: usize) -> Vec<std::ops::Range<usize>> {
+        std::iter::once(i).chain(self.descendants(i)).map(|j| self.objects[j].clusters.clone()).filter(|r| !r.is_empty()).collect()
+    }
+
     /// Measure an object's bounds again from its finest level's vertices.
-    fn refresh_bounds(&mut self, i: usize) {
+    pub fn refresh_bounds(&mut self, i: usize) {
         use rayon::prelude::*;
         let range = self.objects[i].clusters.clone();
+        if range.is_empty() {
+            let p = self.objects[i].pivot;
+            self.objects[i].lo = p;
+            self.objects[i].hi = p;
+            return;
+        }
         let finest = self.clusters[range.clone()].iter().map(|c| c.lod_level).min().unwrap_or(0);
         let (lo, hi) = self.clusters[range]
             .par_iter()
@@ -326,9 +383,15 @@ impl Scene {
         self.objects.iter().position(|o| o.clusters.contains(&c))
     }
 
-    /// Bounds of an object.
+    /// Bounds of an object and everything under it. A group with nothing
+    /// under it is its pivot.
     pub fn object_bounds(&self, i: usize) -> (Vec3, Vec3) {
-        (self.objects[i].lo, self.objects[i].hi)
+        std::iter::once(i)
+            .chain(self.descendants(i))
+            .filter(|&j| !self.objects[j].clusters.is_empty())
+            .map(|j| (self.objects[j].lo, self.objects[j].hi))
+            .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+            .unwrap_or((self.objects[i].lo, self.objects[i].hi))
     }
 
     /// Place object `i` at `pivot`, turned to `yaw` and scaled to `scale`
@@ -336,8 +399,8 @@ impl Scene {
     /// clusters and levels of detail move with it. Turning about the
     /// vertical and scaling the same on every axis keep each triangle's
     /// corners in order, so its texture tile stays valid.
+    /// Everything under it moves with it, about its pivot.
     pub fn set_object(&mut self, i: usize, pivot: Vec3, yaw: f32, scale: f32) {
-        use rayon::prelude::*;
         let o = self.objects[i].clone();
         let scale = scale.max(1e-4);
         let (dyaw, k) = (yaw - o.yaw, scale / o.scale);
@@ -346,6 +409,28 @@ impl Scene {
         }
         let q = glam::Quat::from_rotation_y(dyaw);
         let map = |p: Vec3| q * ((p - o.pivot) * k) + pivot;
+        for j in self.descendants(i) {
+            let d = self.objects[j].clone();
+            self.place_one(j, map(d.pivot), d.yaw + dyaw, d.scale * k);
+        }
+        self.place_one(i, pivot, yaw, scale);
+    }
+
+    /// `set_object` for object `i` alone.
+    fn place_one(&mut self, i: usize, pivot: Vec3, yaw: f32, scale: f32) {
+        use rayon::prelude::*;
+        let o = self.objects[i].clone();
+        let (dyaw, k) = (yaw - o.yaw, scale / o.scale);
+        let q = glam::Quat::from_rotation_y(dyaw);
+        let map = |p: Vec3| q * ((p - o.pivot) * k) + pivot;
+        if o.clusters.is_empty() {
+            let ob = &mut self.objects[i];
+            ob.pivot = pivot;
+            ob.yaw = yaw;
+            ob.scale = scale;
+            self.refresh_bounds(i);
+            return;
+        }
         let cs = &self.clusters[o.clusters.clone()];
         let (Some(first), Some(last)) = (cs.first(), cs.last()) else { return };
         let verts = first.first_vertex as usize..(last.first_vertex + last.vertex_count) as usize;
@@ -362,7 +447,7 @@ impl Scene {
         ob.yaw = yaw;
         ob.scale = scale;
         self.refresh_bounds(i);
-        let (lo, hi) = self.object_bounds(i);
+        let (lo, hi) = (self.objects[i].lo, self.objects[i].hi);
         self.bounds_min = self.bounds_min.min(lo);
         self.bounds_max = self.bounds_max.max(hi);
     }
@@ -712,6 +797,41 @@ pub mod tests {
         }
         assert_eq!(s.object_of(first), Some(0));
         assert_eq!(s.object_of(0), None);
+    }
+
+    /// A group moves, turns and scales what is under it about its own
+    /// pivot, at any depth; nothing can be put under itself.
+    #[test]
+    fn groups_carry_their_children() {
+        let (p, idx) = uv_sphere(16);
+        let mut s = Scene::new();
+        let a0 = s.clusters.len();
+        s.push_mesh(&p.iter().map(|v| *v * 0.5 + Vec3::new(2.0, 0.5, 0.0)).collect::<Vec<_>>(), &[], &[], &idx);
+        let a = s.add_object("a".into(), a0..s.clusters.len(), Vec3::new(2.0, 0.0, 0.0), 0.0);
+        let b0 = s.clusters.len();
+        s.push_mesh(&p.iter().map(|v| *v * 0.5 + Vec3::new(-2.0, 0.5, 0.0)).collect::<Vec<_>>(), &[], &[], &idx);
+        let b = s.add_object("b".into(), b0..s.clusters.len(), Vec3::new(-2.0, 0.0, 0.0), 0.0);
+        let g = s.add_group("g".into(), Vec3::ZERO);
+        let top = s.add_group("top".into(), Vec3::ZERO);
+        assert!(s.set_parent(a, Some(g)) && s.set_parent(b, Some(g)) && s.set_parent(g, Some(top)));
+        assert!(!s.set_parent(top, Some(a)), "a cycle");
+        assert!(!s.set_parent(g, Some(g)));
+        assert_eq!(s.descendants(top).len(), 3);
+        let (lo, hi) = s.object_bounds(top);
+        assert!((lo.x + 2.5).abs() < 0.01 && (hi.x - 2.5).abs() < 0.01, "{lo} {hi}");
+        // A half turn and twice the size about the origin: a goes to x = -4.
+        s.set_object(top, Vec3::new(0.0, 0.0, 1.0), std::f32::consts::PI, 2.0);
+        let oa = &s.objects[a];
+        assert!(oa.pivot.distance(Vec3::new(-4.0, 0.0, 1.0)) < 1e-4, "{}", oa.pivot);
+        assert!((oa.scale - 2.0).abs() < 1e-5 && (oa.yaw - std::f32::consts::PI).abs() < 1e-5);
+        let (lo, hi) = s.object_bounds(a);
+        assert!(((lo + hi) * 0.5).distance(Vec3::new(-4.0, 1.0, 1.0)) < 0.02, "{lo} {hi}");
+        assert_eq!(s.moving_clusters(top).len(), 2);
+        // Out of the group: moving the group leaves it.
+        assert!(s.set_parent(a, None));
+        let before = s.objects[a].pivot;
+        s.set_object(top, Vec3::ZERO, 0.0, 1.0);
+        assert_eq!(s.objects[a].pivot, before);
     }
 
     #[test]

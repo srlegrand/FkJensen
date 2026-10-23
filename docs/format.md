@@ -38,6 +38,7 @@ A reader skips any section whose tag it does not know, using the length.
 | `LITE` | point lights, lumens (section version 2) | yes; version 1 skipped |
 | `TEXR` | per-triangle texture tiles | yes, streamed from the file |
 | `LODS` | each cluster's level of detail | yes |
+| `OBJS` | objects and groups, for the editor | yes |
 | `PNTS` | points, particles | reserved |
 | `CURV` | curves, fur and hair | reserved |
 | `VOLM` | volumes | reserved |
@@ -166,6 +167,28 @@ A cluster's error is never above its replacement's, and its sphere is
 inside its replacement's, so what is drawn changes steadily with distance.
 Each level has its own texture tiles in `TEXR`. Clusters without `LODS`
 (the ground, the mountains, older files) are always drawn.
+
+## OBJS
+
+What the editor selects and moves (`Scene::objects`): runs of clusters
+with a pivot, and groups. Optional; a reader without it draws the same
+geometry. Section version 1.
+
+    u32       object count
+    u32       0
+    per object
+      u32       first cluster
+      u32       cluster count, 0 for a group
+      u32       parent + 1, 0 for none (an index into this list)
+      u32       name length, bytes
+      f32 x 3   pivot, metres: the point it turns and scales about
+      f32       turn about the vertical, radians, since first placed
+      f32       uniform scale since first placed
+      u8 x n    the name, UTF-8, padded with zeros to 4 bytes
+
+Geometry is stored where the objects stand; the turn and scale are kept
+so the editor shows them. A group with nothing under it is its pivot. A
+parent chain that loops is cut at the object that closes it.
 
 ## LITE
 

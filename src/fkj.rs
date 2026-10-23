@@ -15,7 +15,8 @@
 //! texture tiles (`texture.rs`), streamed from the file and never read
 //! whole, `LODS` each cluster's level of detail (`lod.rs`). A file with
 //! `LODS` is version 2, so that a reader without it refuses the file rather
-//! than drawing every level at once. Reserved for the primitives still
+//! than drawing every level at once. `OBJS` names the objects and groups
+//! the editor moves (`Scene::objects`). Reserved for the primitives still
 //! to come: `PNTS` (points, particles), `CURV` (curves, fur and hair),
 //! `VOLM` (volumes).
 
@@ -40,6 +41,7 @@ pub const TAG_LITE: [u8; 4] = *b"LITE";
 pub const TAG_INST: [u8; 4] = *b"INST";
 pub const TAG_TEXR: [u8; 4] = *b"TEXR";
 pub const TAG_LODS: [u8; 4] = *b"LODS";
+pub const TAG_OBJS: [u8; 4] = *b"OBJS";
 
 /// Extra copies of clusters `first_cluster..first_cluster + cluster_count`
 /// of the `MESH` section, each at `transform` applied to the stored
@@ -134,7 +136,8 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
     let lods = scene.clusters.iter().any(|c| c.has_lod());
     head.u32(if lods { VERSION_LOD } else { VERSION });
     let textured = !scene.textures.is_empty();
-    head.u32(2 + !instances.is_empty() as u32 + textured as u32 + lods as u32);
+    let objs = !scene.objects.is_empty();
+    head.u32(2 + !instances.is_empty() as u32 + textured as u32 + lods as u32 + objs as u32);
     head.u32(0);
     out.write_all(&head.0)?;
 
@@ -306,6 +309,27 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
         }
         section(out, TAG_LODS, 1, &l.0)?;
     }
+
+    // OBJS: u32 object count, u32 0; per object u32 first cluster, u32
+    // cluster count (0: a group), u32 parent + 1 (0: none), u32 name bytes,
+    // pivot, f32 yaw, f32 scale, then the name in UTF-8 padded to 4.
+    if objs {
+        let mut o = W(Vec::new());
+        o.u32(scene.objects.len() as u32);
+        o.u32(0);
+        for ob in &scene.objects {
+            o.u32(ob.clusters.start as u32);
+            o.u32(ob.clusters.len() as u32);
+            o.u32(ob.parent.map(|p| p as u32 + 1).unwrap_or(0));
+            o.u32(ob.name.len() as u32);
+            o.v3(ob.pivot);
+            o.f32(ob.yaw);
+            o.f32(ob.scale);
+            o.0.extend_from_slice(ob.name.as_bytes());
+            o.pad(4);
+        }
+        section(out, TAG_OBJS, 1, &o.0)?;
+    }
     Ok(())
 }
 
@@ -453,8 +477,10 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) 
     let mut report = ReadReport::default();
     let mut inst_payloads: Vec<&[u8]> = Vec::new();
     let mut lods: Option<&[u8]> = None;
+    let mut objs: Option<&[u8]> = None;
     for (tag, section_version, payload) in &list {
         match *tag {
+            TAG_OBJS => objs = Some(payload),
             TAG_MESH => read_mesh(payload, &mut scene)?,
             TAG_LODS => lods = Some(payload),
             TAG_LITE if *section_version == 2 => read_lights(payload, &mut scene)?,
@@ -490,6 +516,9 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) 
     // every MESH section has been read.
     for p in inst_payloads {
         expand_instances(p, &mut scene, stored_clusters)?;
+    }
+    if let Some(b) = objs {
+        read_objects(b, &mut scene, stored_clusters)?;
     }
     if scene.clusters.is_empty() {
         scene.bounds_min = Vec3::splat(-1.0);
@@ -664,6 +693,47 @@ fn expand_instances(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Resu
     Ok(())
 }
 
+fn read_objects(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Result<(), String> {
+    let mut r = R { b, at: 0 };
+    let n = r.u32()? as usize;
+    r.u32()?;
+    let mut objects = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        let first = r.u32()? as usize;
+        let count = r.u32()? as usize;
+        let parent = r.u32()? as usize;
+        let len = r.u32()? as usize;
+        let pivot = r.v3()?;
+        let yaw = r.f32()?;
+        let scale = r.f32()?;
+        let name = String::from_utf8_lossy(r.take(len)?).into_owned();
+        r.at = r.at.div_ceil(4) * 4;
+        if first + count > stored_clusters || parent > n {
+            return Err("OBJS refers past the stored clusters or objects".into());
+        }
+        let clusters = if count == 0 { scene.clusters.len()..scene.clusters.len() } else { first..first + count };
+        objects.push(crate::scene::Object { name, clusters, pivot, yaw, scale: if scale > 0.0 { scale } else { 1.0 }, lo: pivot, hi: pivot, parent: parent.checked_sub(1) });
+    }
+    scene.objects = objects;
+    // A parent chain that loops (a damaged file) is cut at the top.
+    for i in 0..n {
+        let mut seen = 0;
+        let mut p = scene.objects[i].parent;
+        while let Some(q) = p {
+            seen += 1;
+            if seen > n {
+                scene.objects[i].parent = None;
+                break;
+            }
+            p = scene.objects[q].parent;
+        }
+    }
+    for i in 0..n {
+        scene.refresh_bounds(i);
+    }
+    Ok(())
+}
+
 fn read_lods(b: &[u8], scene: &mut Scene) -> Result<(), String> {
     let mut r = R { b, at: 0 };
     let n = r.u32()? as usize;
@@ -821,6 +891,23 @@ mod tests {
 
     /// A mesh built into levels of detail is written as version 2 and reads
     /// back with every cluster's level, errors and spheres.
+    #[test]
+    fn objects_and_groups_round_trip() {
+        let mut s = sample();
+        let n = s.clusters.len();
+        let a = s.add_object("bishop".into(), 0..n, Vec3::new(0.5, 0.0, 0.0), 0.3);
+        s.objects[a].scale = 1.5;
+        let g = s.add_group("pieces".into(), Vec3::ONE);
+        s.set_parent(a, Some(g));
+        let (back, report) = read(&write(&s, &[])).unwrap();
+        assert!(report.skipped.is_empty());
+        assert_eq!(back.objects.len(), 2);
+        let (oa, og) = (&back.objects[a], &back.objects[g]);
+        assert_eq!((oa.name.as_str(), oa.clusters.clone(), oa.parent, oa.yaw, oa.scale), ("bishop", 0..n, Some(g), 0.3, 1.5));
+        assert_eq!((og.name.as_str(), og.clusters.is_empty(), og.parent, og.pivot), ("pieces", true, None, Vec3::ONE));
+        assert!(oa.hi.x > oa.lo.x);
+    }
+
     #[test]
     fn levels_of_detail_round_trip() {
         let (p, idx) = uv_sphere(64);

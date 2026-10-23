@@ -103,6 +103,9 @@ pub struct Model {
     pub tri_material: Vec<u32>,
     pub materials: Vec<Material>,
     pub textures: Vec<Texture>,
+    /// What the reader could not find or read (missing textures), for
+    /// whoever is importing to see.
+    pub warnings: Vec<String>,
 }
 
 impl Model {

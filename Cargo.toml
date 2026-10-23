@@ -10,5 +10,15 @@ rayon = "1.12.0"
 softbuffer = "0.4.8"
 winit = "0.30.13"
 
+# The editor (--editor) and its importer window: 64-bit machines only, so
+# the Raspberry Pi build stays lean. egui is drawn on the CPU here
+# (src/editor/paint.rs); none of these pulls in a GPU API.
+[target.'cfg(target_pointer_width = "64")'.dependencies]
+egui = { version = "0.37.0", features = ["default_fonts"] }
+egui-winit = { version = "0.37.0", default-features = false, features = ["clipboard", "wayland", "x11"] }
+gltf = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+flate2 = "1"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

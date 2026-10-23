@@ -28,6 +28,8 @@
 //!   fkjensen --no-highres              the low-resolution T-rex (28 K triangles, not 10.8 M)
 //!   fkjensen --shadow-res N            shadow map texels per cube face edge (512)
 //!   fkjensen --png out.png --bench-drag  then move the first light five times, timing each frame
+//!   fkjensen --editor [scene.fkj]      the editor: outliner, attribute editor, timeline, importer (64-bit)
+//!   fkjensen --editor --png out.png [--import model.glb]  the editor drawn to a file
 //!
 //! Controls are listed in README.md and printed at start.
 
@@ -49,6 +51,30 @@ mod shadow;
 mod sun;
 mod texture;
 mod world;
+#[cfg(target_pointer_width = "64")]
+mod editor;
+// The model readers of tools/fkj-import, for the editor's importer window
+// (parts only the command-line tool uses go unused here).
+#[cfg(target_pointer_width = "64")]
+#[allow(dead_code)]
+#[path = "../tools/fkj-import/src/bake.rs"]
+mod bake;
+#[cfg(target_pointer_width = "64")]
+#[allow(dead_code)]
+#[path = "../tools/fkj-import/src/fbx.rs"]
+mod fbx;
+#[cfg(target_pointer_width = "64")]
+#[allow(dead_code)]
+#[path = "../tools/fkj-import/src/gltf_in.rs"]
+mod gltf_in;
+#[cfg(target_pointer_width = "64")]
+#[allow(dead_code)]
+#[path = "../tools/fkj-import/src/model.rs"]
+mod model;
+#[cfg(target_pointer_width = "64")]
+#[allow(dead_code)]
+#[path = "../tools/fkj-import/src/obj.rs"]
+mod obj;
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -260,16 +286,10 @@ impl App {
         }
     }
 
-    fn open(&mut self, path: PathBuf) {
+    fn open(&mut self, path: PathBuf) -> Result<(), String> {
         match load_file(&path) {
             Ok(mut scene) => {
-                // A file dropped on the window is one object.
-                if scene.objects.is_empty() && !scene.clusters.is_empty() {
-                    let (lo, hi) = (scene.bounds_min, scene.bounds_max);
-                    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    let n = scene.clusters.len();
-                    scene.add_object(name, 0..n, Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5), 0.0);
-                }
+                prepare_opened(&mut scene, &path);
                 self.scene = scene;
                 self.scene_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.wide = true;
@@ -278,8 +298,9 @@ impl App {
                 self.drag = None;
                 self.manip = None;
                 self.selection = Selection::Nothing;
+                Ok(())
             }
-            Err(e) => eprintln!("{e}"),
+            Err(e) => Err(e),
         }
     }
 
@@ -422,7 +443,9 @@ impl App {
         match m.target {
             Selection::Object(i) => {
                 self.scene.set_object(i, pivot, yaw, scale);
-                self.renderer.moved(self.scene.objects[i].clusters.clone(), false);
+                for r in self.scene.moving_clusters(i) {
+                    self.renderer.moved(r, false);
+                }
             }
             Selection::Light(i) => {
                 if let Some(l) = self.rig.lights.get_mut(i) {
@@ -438,7 +461,9 @@ impl App {
         if let Some(m) = self.manip.take() {
             if let Selection::Object(i) = m.target {
                 // Bounce light is made again now the object has settled.
-                self.renderer.moved(self.scene.objects[i].clusters.clone(), true);
+                for r in self.scene.moving_clusters(i) {
+                    self.renderer.moved(r, true);
+                }
             }
         }
     }
@@ -525,6 +550,17 @@ impl App {
 
     fn tick(&mut self) {
         self.sync_size();
+        let dt = self.advance();
+        self.render();
+        self.present();
+        if self.count_frame(dt) {
+            self.update_title();
+        }
+    }
+
+    /// Time since the last frame: fly the camera and nudge the selected
+    /// light by the keys held. Returns the seconds passed.
+    fn advance(&mut self) -> f32 {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
@@ -564,15 +600,20 @@ impl App {
                 l.position += nudge * speed * dt;
             }
         }
-        self.render();
-        self.present();
+        dt
+    }
+
+    /// Count a frame of `dt` seconds; true when the frame rate was measured
+    /// again (twice a second).
+    fn count_frame(&mut self, dt: f32) -> bool {
         self.fps_accum.0 += dt;
         self.fps_accum.1 += 1;
         if self.fps_accum.0 >= 0.5 {
             self.title_fps = self.fps_accum.1 as f32 / self.fps_accum.0;
             self.fps_accum = (0.0, 0);
-            self.update_title();
+            return true;
         }
+        false
     }
 
     fn update_title(&self) {
@@ -877,6 +918,21 @@ impl App {
 
 }
 
+/// A scene read from a file, made ready to edit: a file without objects
+/// becomes one object, and the camera's subject is the objects (a saved
+/// set's ground runs for kilometres).
+fn prepare_opened(scene: &mut Scene, path: &Path) {
+    if scene.objects.is_empty() && !scene.clusters.is_empty() {
+        let (lo, hi) = (scene.bounds_min, scene.bounds_max);
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let n = scene.clusters.len();
+        scene.add_object(name, 0..n, Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5), 0.0);
+    }
+    if scene.focus.is_none() {
+        scene.focus = (0..scene.objects.len()).filter(|&i| !scene.objects[i].clusters.is_empty()).map(|i| scene.object_bounds(i)).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
+    }
+}
+
 /// The scene's own lights, or one 800 lm light above and to the side of
 /// the subject when it has none.
 fn default_rig(scene: &Scene) -> Vec<PointLight> {
@@ -990,7 +1046,11 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::DroppedFile(path) => self.open(path),
+            WindowEvent::DroppedFile(path) => {
+                if let Err(e) = self.open(path) {
+                    eprintln!("{e}");
+                }
+            }
             _ => {}
         }
     }
@@ -1137,6 +1197,8 @@ fn main() {
     let mut sky_contrast: Option<f32> = None;
     let mut debug_view: Option<String> = None;
     let mut select: Option<usize> = None;
+    let mut editor = false;
+    let mut import: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1215,6 +1277,12 @@ fn main() {
                 i += 1;
             }
             "--bench-drag" => bench_drag = true,
+            "--editor" => editor = true,
+            "--import" => {
+                i += 1;
+                import = args.get(i).map(PathBuf::from);
+                editor = true;
+            }
             "--fb" => use_fb = true,
             "--visual-debug" => visual_debug = true,
             "--debug-view" => {
@@ -1249,7 +1317,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1277,7 +1345,10 @@ fn main() {
 
     let (mut scene, name) = match &path {
         Some(p) => match load_file(p) {
-            Ok(s) => (s, p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+            Ok(mut s) => {
+                prepare_opened(&mut s, p);
+                (s, p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+            }
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(1);
@@ -1390,6 +1461,36 @@ fn main() {
         {
             let _ = &debug_view;
             eprintln!("--visual-debug is not in this build (64-bit machines only)");
+        }
+    }
+
+    if editor {
+        #[cfg(target_pointer_width = "64")]
+        {
+            match png_out {
+                // The editor drawn to a file, no window.
+                Some(out) => {
+                    if let Err(e) = editor::shot(app, size.0, size.1, &out, import) {
+                        eprintln!("cannot write {out}: {e}");
+                        std::process::exit(1);
+                    }
+                    eprintln!("wrote {out}");
+                }
+                None => {
+                    if import.is_some() {
+                        eprintln!("--import is for --png (drag a model onto the editor, or File > Import)");
+                    }
+                    eprintln!("{CONTROLS}");
+                    editor::run(app, path);
+                }
+            }
+            return;
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            let _ = &import;
+            eprintln!("--editor is not in this build (64-bit machines only)");
+            std::process::exit(2);
         }
     }
 
@@ -1596,7 +1697,7 @@ mod tests {
 
     /// A ball on a floor, the ball an object, in an app with no window,
     /// rendered once at 320 x 180.
-    fn ball_app() -> App {
+    pub(crate) fn ball_app() -> App {
         let mut scene = Scene::new();
         scene.push_mesh(&[Vec3::new(-5.0, 0.0, -5.0), Vec3::new(5.0, 0.0, -5.0), Vec3::new(5.0, 0.0, 5.0), Vec3::new(-5.0, 0.0, 5.0)], &[], &[], &[0, 2, 1, 0, 3, 2]);
         let first = scene.clusters.len();
