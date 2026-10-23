@@ -52,12 +52,16 @@ fn face_of(q: Vec3) -> usize {
 }
 
 impl CubeShadow {
-    /// Draw every cluster inside `reach` of `position` into the six faces.
+    /// Draw every cluster inside `reach` of `position` into the six faces,
+    /// at the level of detail whose error is under a texel as seen from
+    /// the light.
     pub fn build(scene: &Scene, position: Vec3, reach: f32, res: usize) -> CubeShadow {
+        // A face spans 90 degrees: res / 2 texels per unit of tangent.
+        let lod_scale = crate::scene::perspective_scale(position, res as f32 * 0.5, 1e-3);
         let near_clusters: Vec<usize> = (0..scene.clusters.len())
             .filter(|&i| {
                 let c = &scene.clusters[i];
-                c.centre.distance(position) <= c.radius + reach
+                c.centre.distance(position) <= c.radius + reach && c.lod_drawn(1.0, &lod_scale)
             })
             .collect();
         let faces: Vec<(Vec<f32>, u64)> = (0..6)

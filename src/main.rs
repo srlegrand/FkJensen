@@ -40,6 +40,7 @@ mod fbdev;
 mod fkj;
 mod hardware;
 mod lights;
+mod lod;
 mod raster;
 mod reyes;
 mod scene;
@@ -145,7 +146,10 @@ struct App {
     output: (usize, usize),
     /// When set, the render scale follows the output size so that a frame
     /// holds about this many pixels (from the machine's plan).
-    pixel_budget: Option<f64>,
+    /// Shading points a window frame may take, from the machine's plan:
+    /// the micropolygon spacing and render scale follow it as the window
+    /// is resized. None once either is set by hand.
+    point_budget: Option<f64>,
     /// Shading, visibility and shadow maps kept between frames.
     renderer: reyes::Renderer,
     /// Which framing `F` last chose.
@@ -191,7 +195,7 @@ impl App {
             drag: None,
             quit: false,
             output: (0, 0),
-            pixel_budget: None,
+            point_budget: None,
             renderer: reyes::Renderer::new(),
             wide: true,
             mouse: (0.0, 0.0),
@@ -415,7 +419,7 @@ impl App {
             if s.visibility_kept { "visibility kept" } else { "visibility new" },
             s.points_shaded,
             s.points_used,
-            if s.rate_scale > 1.0 { format!(" ({:.0} px apart to fit memory)", raster::SHADING_RATE_PX * s.rate_scale) } else { String::new() },
+            if s.rate_scale > 1.0 { format!(", {:.1} px apart to fit memory", self.settings.shading_rate_px * s.rate_scale) } else { format!(", {:.1} px apart", self.settings.shading_rate_px) },
             s.cache_bytes >> 20,
             self.settings.cache_budget >> 20,
             if self.settings.shadows { "on" } else { "off" },
@@ -539,11 +543,14 @@ impl App {
         }
     }
 
-    /// Size the frame for an output of `ow` x `oh` pixels: the render scale
-    /// follows the pixel budget unless it was set by hand.
+    /// Size the frame for an output of `ow` x `oh` pixels: micropolygon
+    /// spacing, then render scale, follow the point budget unless set by
+    /// hand.
     fn fit_frame(&mut self, ow: usize, oh: usize) {
-        if let Some(b) = self.pixel_budget {
-            self.render_scale = ((b / (ow * oh).max(1) as f64).sqrt() as f32).clamp(0.0625, 1.0);
+        if let Some(b) = self.point_budget {
+            let (r, scale) = hardware::window_rate(b, ow * oh);
+            self.settings.shading_rate_px = r;
+            self.render_scale = scale;
         }
         let fw = ((ow as f32 * self.render_scale).round() as usize).max(1);
         let fh = ((oh as f32 * self.render_scale).round() as usize).max(1);
@@ -601,7 +608,7 @@ impl App {
                 // Z: render at a finer resolution, Shift+Z: coarser.
                 let s = if self.shift { self.render_scale / 1.25 } else { self.render_scale * 1.25 };
                 self.render_scale = s.clamp(0.0625, 1.0);
-                self.pixel_budget = None;
+                self.point_budget = None;
                 self.surface_sized = false;
                 let (ow, oh) = self.output;
                 if ow > 0 {
@@ -887,6 +894,7 @@ fn main() {
     let mut auto = true;
     let mut hardware_only = false;
     let mut scale: Option<f32> = None;
+    let mut shading_rate: Option<f32> = None;
     let mut bench_drag = false;
     let mut use_fb = false;
     let mut look: Option<(Vec3, Vec3)> = None;
@@ -960,6 +968,14 @@ fn main() {
             "--bounce" => bounce = Some(true),
             "--no-auto" => auto = false,
             "--hardware" => hardware_only = true,
+            "--shading-rate" => {
+                shading_rate = args.get(i + 1).and_then(|s| s.parse::<f32>().ok()).filter(|r| *r >= 0.25 && *r <= 64.0);
+                if shading_rate.is_none() {
+                    eprintln!("--shading-rate takes the pixels between micropolygons, 0.25 to 64, e.g. 2");
+                    std::process::exit(2);
+                }
+                i += 1;
+            }
             "--scale" => {
                 scale = args.get(i + 1).and_then(|s| s.parse().ok());
                 if scale.is_none() {
@@ -1003,7 +1019,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1089,7 +1105,8 @@ fn main() {
         app.settings.bounce_budget_ms = Some(p.bounce_budget_ms);
         app.settings.tile = p.tile;
         app.render_scale = p.render_scale;
-        app.pixel_budget = Some(p.pixel_budget);
+        app.settings.shading_rate_px = p.window_rate_px;
+        app.point_budget = Some(p.point_budget);
         app.scene.textures.set_budget(p.texture_cache);
         app.settings.cache_budget = p.shade_cache;
     }
@@ -1104,7 +1121,11 @@ fn main() {
     }
     if let Some(v) = scale {
         app.render_scale = v.clamp(0.0625, 1.0);
-        app.pixel_budget = None;
+        app.point_budget = None;
+    }
+    if let Some(r) = shading_rate {
+        app.settings.shading_rate_px = r;
+        app.point_budget = None;
     }
     let size = size.or(plan.as_ref().map(|p| p.png_size)).unwrap_or((1280, 720));
     if let Some(n) = select {
@@ -1143,8 +1164,12 @@ fn main() {
     }
 
     if let Some(out) = png_out {
-        // A still frame waits for all the bounce light.
+        // A still frame waits for all the bounce light, and has the
+        // plan's still shading rate.
         app.settings.bounce_budget_ms = None;
+        if let (None, Some(p)) = (shading_rate, &plan) {
+            app.settings.shading_rate_px = p.still_rate_px;
+        }
         app.frame.resize(size.0, size.1);
         let t = Instant::now();
         app.render();
@@ -1179,7 +1204,7 @@ fn main() {
             s.light_evals_all,
             app.renderer.memory() as f64 / 1e6,
             app.settings.cache_budget as f64 / 1e6,
-            if s.rate_scale > 1.0 { format!(", micropolygons {:.0} px apart to fit it", raster::SHADING_RATE_PX * s.rate_scale) } else { String::new() }
+            if s.rate_scale > 1.0 { format!(", micropolygons {:.1} px apart to fit it", app.settings.shading_rate_px * s.rate_scale) } else { format!("; micropolygons {:.1} px apart", app.settings.shading_rate_px) }
         );
         if let Err(e) = save_png(&app.frame, &out) {
             eprintln!("cannot write {out}: {e}");

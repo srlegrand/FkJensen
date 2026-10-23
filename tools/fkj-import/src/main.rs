@@ -18,6 +18,11 @@
 //! than `--texel` metres (default 0.002). A cluster stores the finest level
 //! any of its triangles needs. Each level is filtered from the source's mip
 //! chain at its own spacing. Vertex colours hold the coarsest view.
+//!
+//! Levels of detail (src/lod.rs in FkJensen): the mesh is built into a
+//! cluster hierarchy, each level about half the triangles of the one below,
+//! and every level gets its own tiles from the same textures. `--no-lod`
+//! keeps the mesh as made only.
 
 #[path = "../../../src/fkj.rs"]
 mod fkj;
@@ -25,6 +30,8 @@ mod fkj;
 mod scene;
 #[path = "../../../src/texture.rs"]
 mod texture;
+#[path = "../../../src/lod.rs"]
+mod lod;
 
 mod fbx;
 mod gltf_in;
@@ -54,18 +61,35 @@ fn linear_to_srgb8(v: f32) -> u8 {
     (s * 255.0).round() as u8
 }
 
+/// A triangle to bake: its corners as model vertices, and the model
+/// triangle whose material it has (itself at level 0; the one it was made
+/// from on coarser levels).
+#[derive(Clone, Copy)]
+pub struct BakeTri {
+    pub corners: [u32; 3],
+    pub material_of: u32,
+}
+
+impl BakeTri {
+    fn of(m: &Model, t: usize) -> Self {
+        BakeTri { corners: m.tris[t], material_of: t as u32 }
+    }
+}
+
 /// Area of a triangle's UVs in source texels, and its texture.
-fn texel_area(m: &Model, t: usize) -> Option<(f32, &model::Texture)> {
-    let mat = &m.materials[m.tri_material[t] as usize];
+fn texel_area(m: &Model, t: BakeTri) -> Option<(f32, &model::Texture)> {
+    let mat = &m.materials[m.tri_material[t.material_of as usize] as usize];
     let tex = &m.textures[mat.texture?];
     let (w, h) = tex.size();
-    let [a, b, c] = m.tris[t].map(|i| m.uvs[i as usize] * Vec2::new(w as f32, h as f32));
+    let [a, b, c] = t.corners.map(|i| m.uvs[i as usize] * Vec2::new(w as f32, h as f32));
     Some((((b - a).perp_dot(c - a)).abs() * 0.5, tex))
 }
 
-/// The finest tile level a source triangle needs (0: vertex colours are
-/// enough, or untextured).
-fn wanted_level(m: &Model, t: usize, o: &Options) -> u8 {
+/// The finest tile level a triangle needs (0: vertex colours are enough,
+/// or untextured). Points no closer than `--texel`, nor than `spacing`
+/// metres: a coarser level of detail is only drawn where its error is
+/// under a micropolygon, so its tiles need be no finer than its error.
+fn wanted_level(m: &Model, t: BakeTri, o: &Options, spacing: f32) -> u8 {
     let Some((area, _)) = texel_area(m, t) else { return 0 };
     // Two texels or fewer: the three vertex colours hold them.
     if area <= 2.0 {
@@ -73,19 +97,19 @@ fn wanted_level(m: &Model, t: usize, o: &Options) -> u8 {
     }
     // Points at level L are about (2^L)^2 / 2: as many as the texels.
     let l_src = (2.0 * area).sqrt().log2().ceil();
-    let [a, b, c] = m.tris[t].map(|i| m.positions[i as usize]);
+    let [a, b, c] = t.corners.map(|i| m.positions[i as usize]);
     let edge = (a - b).length().max((b - c).length()).max((c - a).length());
-    let l_world = (edge / o.texel).max(1.0).log2().floor();
+    let l_world = (edge / o.texel.max(spacing * 2.0)).max(1.0).log2().floor();
     (l_src.min(l_world).max(0.0) as u8).min(o.max_level)
 }
 
-/// Linear colour of source triangle `t` at barycentric (b1, b2), filtered
-/// for points `spacing` texels apart.
-fn colour_at(m: &Model, t: usize, b1: f32, b2: f32, levels_per_edge: f32) -> Vec3 {
-    let mat = &m.materials[m.tri_material[t] as usize];
+/// Linear colour of triangle `t` at barycentric (b1, b2), filtered for
+/// points `spacing` texels apart.
+fn colour_at(m: &Model, t: BakeTri, b1: f32, b2: f32, levels_per_edge: f32) -> Vec3 {
+    let mat = &m.materials[m.tri_material[t.material_of as usize] as usize];
     let Some(ti) = mat.texture else { return mat.color };
     let tex = &m.textures[ti];
-    let [ua, ub, uc] = m.tris[t].map(|i| m.uvs[i as usize]);
+    let [ua, ub, uc] = t.corners.map(|i| m.uvs[i as usize]);
     let uv = ua * (1.0 - b1 - b2) + ub * b1 + uc * b2;
     let area = texel_area(m, t).map(|(a, _)| a).unwrap_or(1.0);
     // Distance between neighbouring points, in texels.
@@ -97,10 +121,13 @@ pub struct Baked {
     pub scene: Scene,
     pub levels: Vec<usize>,
     pub pool_bytes: usize,
+    /// Triangles and clusters per level of detail.
+    pub lod: lod::LodStats,
 }
 
-/// Cluster the model and bake its tiles.
-pub fn bake(m: &Model, o: &Options) -> Baked {
+/// Cluster the model, build its levels of detail (unless `levels` is
+/// false), and bake the tiles of every level.
+pub fn bake(m: &Model, o: &Options, levels: bool) -> Baked {
     // Vertex colours: the texture at each vertex, filtered over about one
     // triangle, from the first triangle that uses the vertex.
     let mut first_tri = vec![usize::MAX; m.positions.len()];
@@ -119,54 +146,86 @@ pub fn bake(m: &Model, o: &Options) -> Baked {
             }
             let k = m.tris[t].iter().position(|&x| x as usize == v).unwrap();
             let (b1, b2) = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)][k];
-            colour_at(m, t, b1, b2, 1.0)
+            colour_at(m, BakeTri::of(m, t), b1, b2, 1.0)
         })
         .collect();
-    let flat: Vec<u32> = m.tris.iter().flatten().copied().collect();
-    let normals = if m.normals.iter().any(|n| n.length_squared() < 0.5) { Vec::new() } else { m.normals.clone() };
+    let normals = if m.normals.len() == m.positions.len() && m.normals.iter().all(|n| n.length_squared() >= 0.5) {
+        m.normals.clone()
+    } else {
+        let mut acc = vec![Vec3::ZERO; m.positions.len()];
+        for t in &m.tris {
+            let [a, b, c] = t.map(|i| i as usize);
+            let f = (m.positions[b] - m.positions[a]).cross(m.positions[c] - m.positions[a]);
+            acc[a] += f;
+            acc[b] += f;
+            acc[c] += f;
+        }
+        acc.into_iter().map(|v| v.normalize_or(Vec3::Y)).collect()
+    };
     let mut scene = Scene::new();
-    let source = scene.push_mesh_mapped(&m.positions, &normals, &colors, &flat);
-
-    let wanted: Vec<u8> = (0..m.tris.len()).map(|t| wanted_level(m, t, o)).collect();
-    let mut entries = Vec::with_capacity(scene.clusters.len());
+    // The triangle each scene triangle bakes from.
+    let (tris, lod_stats): (Vec<BakeTri>, lod::LodStats) = if levels {
+        let (clusters, stats) = lod::build_logged(&m.positions, &m.tris, &|s| eprintln!("  {s}"));
+        let corners = scene.push_lod_mesh(&m.positions, &normals, &colors, &clusters);
+        let sources = clusters.iter().flat_map(|c| c.source.iter().copied());
+        (corners.into_iter().zip(sources).map(|(corners, s)| BakeTri { corners, material_of: s }).collect(), stats)
+    } else {
+        let flat: Vec<u32> = m.tris.iter().flatten().copied().collect();
+        let source = scene.push_mesh_mapped(&m.positions, &normals, &colors, &flat);
+        let stats = lod::LodStats { tris: vec![m.tris.len()], clusters: vec![scene.clusters.len()] };
+        (source.iter().map(|&s| BakeTri::of(m, s as usize)).collect(), stats)
+    };
+    let mut error = vec![0f32; tris.len()];
+    for c in &scene.clusters {
+        error[c.first_tri as usize..(c.first_tri + c.tri_count) as usize].fill(c.lod_error);
+    }
+    let wanted: Vec<u8> = tris.par_iter().zip(&error).map(|(&t, &e)| wanted_level(m, t, o, e)).collect();
+    // Each cluster's finest level and its place in the pool, then the
+    // tiles baked in parallel straight into it.
+    let cluster_levels: Vec<u8> = scene.clusters.iter().map(|c| (c.first_tri as usize..(c.first_tri + c.tri_count) as usize).map(|t| wanted[t]).max().unwrap_or(0)).collect();
     let mut levels = vec![0usize; MAX_LEVEL as usize + 1];
-    // Each cluster's tiles, baked in parallel, then laid end to end.
-    let blocks: Vec<(u8, Vec<u8>)> = scene
-        .clusters
-        .par_iter()
-        .map(|c| {
-            let tris: Vec<usize> = (c.first_tri..c.first_tri + c.tri_count).map(|t| source[t as usize] as usize).collect();
-            let level = tris.iter().map(|&s| wanted[s]).max().unwrap_or(0);
-            let mut data = Vec::new();
-            for l in 1..=level {
-                let n = 1usize << l;
-                let inv = 1.0 / n as f32;
-                for &s in &tris {
-                    for i in 0..=n {
-                        for j in 0..=(n - i) {
-                            let col = colour_at(m, s, i as f32 * inv, j as f32 * inv, n as f32);
-                            data.extend_from_slice(&[linear_to_srgb8(col.x), linear_to_srgb8(col.y), linear_to_srgb8(col.z)]);
-                        }
-                    }
-                }
-            }
-            (level, data)
-        })
-        .collect();
-    let mut pool = Vec::new();
-    for (level, data) in blocks {
+    let mut entries = Vec::with_capacity(scene.clusters.len());
+    let mut total = 0usize;
+    for (c, &level) in scene.clusters.iter().zip(&cluster_levels) {
         levels[level as usize] += 1;
         if level == 0 {
             entries.push(TexEntry::default());
         } else {
-            entries.push(TexEntry { level, source: 0, offset: pool.len() as u64 });
-            pool.extend_from_slice(&data);
+            entries.push(TexEntry { level, source: 0, offset: total as u64 });
+            total += texture::level_offset(c.tri_count as usize, level + 1) as usize;
         }
     }
+    let mut pool = vec![0u8; total];
+    let mut slices: Vec<&mut [u8]> = Vec::with_capacity(scene.clusters.len());
+    let mut rest: &mut [u8] = &mut pool;
+    for (c, &level) in scene.clusters.iter().zip(&cluster_levels) {
+        let len = if level == 0 { 0 } else { texture::level_offset(c.tri_count as usize, level + 1) as usize };
+        let (head, tail) = rest.split_at_mut(len);
+        slices.push(head);
+        rest = tail;
+    }
+    slices.into_par_iter().zip(scene.clusters.par_iter()).zip(cluster_levels.par_iter()).for_each(|((out, c), &level)| {
+        let range = c.first_tri as usize..(c.first_tri + c.tri_count) as usize;
+        let mut k = 0;
+        for l in 1..=level {
+            let n = 1usize << l;
+            let inv = 1.0 / n as f32;
+            for t in range.clone() {
+                for i in 0..=n {
+                    for j in 0..=(n - i) {
+                        let col = colour_at(m, tris[t], i as f32 * inv, j as f32 * inv, n as f32);
+                        out[k..k + 3].copy_from_slice(&[linear_to_srgb8(col.x), linear_to_srgb8(col.y), linear_to_srgb8(col.z)]);
+                        k += 3;
+                    }
+                }
+            }
+        }
+        debug_assert_eq!(k, out.len());
+    });
     let pool_bytes = pool.len();
     scene.textures.entries = entries;
     scene.textures.sources = vec![Arc::new(Source::Memory(Arc::new(pool)))];
-    Baked { scene, levels, pool_bytes }
+    Baked { scene, levels, pool_bytes, lod: lod_stats }
 }
 
 /// Turn, then scale and move the model onto the ground at the origin.
@@ -195,6 +254,7 @@ fn main() {
     let mut tex_dirs = Vec::new();
     let mut texture: Option<PathBuf> = None;
     let mut opts = Options { texel: 0.002, max_level: MAX_LEVEL };
+    let mut levels = true;
     let mut i = 0;
     let num = |a: Option<&String>, what: &str| -> f32 {
         a.and_then(|s| s.parse().ok()).unwrap_or_else(|| {
@@ -232,6 +292,7 @@ fn main() {
                 opts.max_level = (num(args.get(i + 1), "--max-level") as u8).clamp(1, MAX_LEVEL);
                 i += 1;
             }
+            "--no-lod" => levels = false,
             "--texture" => {
                 texture = args.get(i + 1).map(PathBuf::from);
                 i += 1;
@@ -243,7 +304,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fkj [--length M | --height M] [--rotate-x DEG] [--rotate-y DEG] [--texel M] [--max-level N] [--textures DIR] [--texture FILE (OBJ)]");
+                eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fkj [--length M | --height M] [--rotate-x DEG] [--rotate-y DEG] [--texel M] [--max-level N] [--textures DIR] [--texture FILE (OBJ)] [--no-lod]");
                 return;
             }
             a => input = Some(PathBuf::from(a)),
@@ -281,15 +342,24 @@ fn main() {
         hi.y - lo.y,
         hi.z - lo.z
     );
-    let baked = bake(&model, &opts);
-    let bytes = fkj::write(&baked.scene, &[]);
+    let baked = bake(&model, &opts, levels);
+    eprintln!(
+        "levels of detail: {}",
+        baked.lod.tris.iter().zip(&baked.lod.clusters).enumerate().map(|(l, (t, c))| format!("pass {l}: {t} triangles in {c} clusters")).collect::<Vec<_>>().join(", ")
+    );
     if let Some(dir) = out.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    std::fs::write(&out, &bytes).unwrap_or_else(|e| {
+    let written = std::fs::File::create(&out).and_then(|f| {
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+        fkj::write_to(&mut w, &baked.scene, &[])?;
+        std::io::Write::flush(&mut w)
+    });
+    if let Err(e) = written {
         eprintln!("cannot write {}: {e}", out.display());
         std::process::exit(1);
-    });
+    }
+    let bytes = std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0);
     let hist: Vec<String> = baked.levels.iter().enumerate().filter(|(_, n)| **n > 0).map(|(l, n)| format!("level {l}: {n}")).collect();
     eprintln!(
         "wrote {}: {} clusters ({}), tiles {:.1} MB of {:.1} MB, in {:.1} s",
@@ -297,7 +367,7 @@ fn main() {
         baked.scene.clusters.len(),
         hist.join(", "),
         baked.pool_bytes as f64 / 1e6,
-        bytes.len() as f64 / 1e6,
+        bytes as f64 / 1e6,
         t0.elapsed().as_secs_f64()
     );
 }
@@ -327,7 +397,7 @@ mod tests {
         }
         m.textures.push(model::Texture::from_rgb8("t".into(), 64, 64, &rgb));
         m.materials.push(model::Material { name: "m".into(), color: Vec3::ONE, texture: Some(0) });
-        let baked = bake(&m, &Options { texel: 0.001, max_level: 5 });
+        let baked = bake(&m, &Options { texel: 0.001, max_level: 5 }, false);
         assert_eq!(baked.scene.clusters.len(), 1);
         let e = baked.scene.textures.entry(0);
         // 64 x 64 texels over two triangles: 2048 each, level 6 wanted,
@@ -377,9 +447,12 @@ mod tests {
         m.textures.push(model::Texture::from_rgb8("t".into(), 16, 16, &vec![128; 16 * 16 * 3]));
         m.materials.push(model::Material { name: "m".into(), color: Vec3::ONE, texture: Some(0) });
         // 128 texels: level 4 by texels; a 1 cm triangle at 2 mm: level 2.
-        assert_eq!(wanted_level(&m, 0, &Options { texel: 0.002, max_level: 5 }), 2);
-        assert_eq!(wanted_level(&m, 0, &Options { texel: 0.0001, max_level: 5 }), 4);
+        let t = BakeTri::of(&m, 0);
+        assert_eq!(wanted_level(&m, t, &Options { texel: 0.002, max_level: 5 }, 0.0), 2);
+        assert_eq!(wanted_level(&m, t, &Options { texel: 0.0001, max_level: 5 }, 0.0), 4);
+        // A coarse level with 2.5 mm of error: points 5 mm apart at most.
+        assert_eq!(wanted_level(&m, t, &Options { texel: 0.0001, max_level: 5 }, 0.0025), 1);
         m.materials[0].texture = None;
-        assert_eq!(wanted_level(&m, 0, &Options { texel: 0.002, max_level: 5 }), 0);
+        assert_eq!(wanted_level(&m, t, &Options { texel: 0.002, max_level: 5 }, 0.0), 0);
     }
 }

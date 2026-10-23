@@ -170,8 +170,8 @@ From those it chooses:
 
 | choice | rule |
 |---|---|
-| render resolution | a pixel budget: a whole frame shaded in 150 ms at 3 points per pixel; the window or screen renders at the scale that fits it, from 6.25% to 100%, scaled up with nearest pixels |
-| `--png` size without `--size` | about 2 s of shading, up to 1280 x 720 |
+| window shading rate, then resolution | a point budget: a whole frame shaded in a thirtieth of a second, at 8 points per pixel with micropolygons one pixel apart (divided by the square of the spacing). Micropolygons first move apart, from 2 to 8 pixels, at full resolution; past 8 the window or screen renders at the scale that fits, from 6.25% to 100%, scaled up with nearest pixels. Both follow the window's size |
+| `--png` size and shading rate without `--size` | about 2 s of shading: micropolygons 1 to 2 pixels apart at up to 1280 x 720, then smaller |
 | high-resolution T-rex | at least 3,200 MB available (peak 2,523 MB measured), and its 10.8 M triangles' memory traffic per frame (100 bytes each) under 250 ms; otherwise the 28 K-triangle T-rex |
 | shadow maps | 512, 256 or 128 texels per face by speed, halved until 17 lights fit in a tenth of free memory; off below 64 |
 | bounce light | on at an eighth of the reference machine's speed or more, with a gather budget of 10 to 30 ms per window frame |
@@ -179,27 +179,33 @@ From those it chooses:
 
 It prints what it found and each choice with its reason. `--hardware`
 prints them and exits. Any option on the command line overrides the plan
-(`--size`, `--scale`, `--shadow-res`, `--[no-]highres`, `--[no-]shadows`,
-`--[no-]bounce`); `--no-auto` skips detection and uses fixed defaults.
-In the window `Z` and `Shift+Z` change the render scale.
+(`--size`, `--scale`, `--shading-rate PX`, `--shadow-res`,
+`--[no-]highres`, `--[no-]shadows`, `--[no-]bounce`); `--no-auto` skips
+detection and uses fixed defaults (micropolygons 2 pixels apart). In the
+window `Z` and `Shift+Z` change the render scale; the title shows the
+micropolygon spacing.
 
-On the machine this was written on (21/10/2026):
+On the machine this was written on (23/10/2026):
 
     CPU: Intel(R) Xeon(R) Processor @ 2.10GHz (x86_64), 2 cores, up to 2100 MHz
     features: sse2 sse4.1 avx avx2 fma avx512f
     caches (per core or shared): L1 data 48 KB, L1 instruction 32 KB, L2 unified 2048 KB, L3 unified 266240 KB
-    memory: 7.84 GB total, 7.28 GB available
-    measured: memory read 10.35 GB/s on one core, 18.85 GB/s on all; shading benchmark 16.33 M points/s on all cores (749 ms to measure)
-      frames of about 408 K pixels (62% of a 1280 x 720 window): about 8.16 M shading points/s in a frame, 150 ms per frame at 3 points per pixel
-      --png without --size renders 1280x720 (about 2 s of shading)
-      high-resolution T-rex: 7452 MB available, its triangles take 57 ms of memory traffic per frame
+    memory: 7.84 GB total, 7.24 GB available
+    measured: memory read 11.28 GB/s on one core, 21.23 GB/s on all; shading benchmark 19.06 M points/s on all cores (576 ms to measure)
+      window: micropolygons 4.8 px apart at 100% of a 1280 x 720 window, about 318 K shading points per frame (9.53 M points/s in a frame, 30 frames/s)
+      --png without --size renders 1280x720, micropolygons 1.0 px apart (about 2 s of shading)
+      high-resolution T-rex: 7411 MB available, its triangles take 51 ms of memory traffic per frame
       shadow maps 512 x 512 per face (107.0 MB for 17 lights)
-      bounce light on, gathered 29 ms per window frame
+      bounce light on, gathered 30 ms per window frame
       buckets 64 x 64 (32 KB of depth and ids, L2 2048 KB)
-      texture tile cache up to 931 MB
-      shading cache up to 1862 MB (added 22/10/2026)
+      texture tile cache up to 588 MB
+      shading cache up to 1177 MB
 
-The shading cache's budget is kept every frame: past it, clusters off
+The two caches share what the set leaves of available memory (2.1 GB for
+the set with the high-resolution T-rex, 0.5 GB with the low-resolution
+one): an eighth for texture tiles, a quarter for shading. On an i5-8250U
+laptop with 3,961 MB available that is 232 MB and 465 MB beside the
+high-resolution T-rex. The shading cache's budget is kept every frame: past it, clusters off
 screen are dropped, least recently seen first; when what is on screen alone
 does not fit, micropolygons grow (4, 8, up to 32 pixels apart) until it
 does, and shrink back once there is room. A small machine renders coarser
@@ -208,9 +214,10 @@ or slower; it does not run out of memory. Without a plan the budget is
 
 On a Raspberry Pi 1 Model B Rev 1 (59 MB available, about 80 K shading
 points per second measured in a frame on 20/10/2026) the rules give, as the
-tests check: the low-resolution T-rex, no bounce light, 128 x 128 shadow maps, frames
-of about 4 K pixels (its 1080 x 1920 screen renders at the 6.25% floor,
-68 x 120) and stills of about 304 x 171. Not yet run on the Pi.
+tests check: the low-resolution T-rex, no bounce light, 128 x 128 shadow
+maps, window frames with micropolygons 8 pixels apart at about 21 K pixels
+(its 1080 x 1920 screen renders at the 6.25% floor, 68 x 120) and stills of
+about 368 x 207 with micropolygons 2 pixels apart. Not yet run on the Pi.
 
 ## Models and texture tiles
 
@@ -221,6 +228,15 @@ binary FBX and OBJ, and writes `.fkj`:
     tools/fkj-import/target/release/fkj-import trex.glb -o assets/models/trex.fkj --length 12.3
     tools/fkj-import/target/release/fkj-import car.fbx -o assets/models/car.fkj --length 4.79 --textures path/to/textures
     tools/fkj-import/target/release/fkj-import trex_highres.obj -o assets/models/trex_highres.fkj --length 12.3 --texture trex_basecolor.png
+
+Each model is built into levels of detail as it is imported (`src/lod.rs`,
+the cluster hierarchy of Nanite: Karis, Stubbs, Wihlidal, SIGGRAPH 2021).
+Neighbouring clusters are gathered in fours, each group simplified to about
+half its triangles by edge collapse (Garland and Heckbert's quadrics) with
+its outer edges locked, cut into clusters again, and so on up. Each cluster
+records how far it may stray from the model as made, measured both ways
+against the level below. Every level gets its own tiles. `--no-lod` skips
+it.
 
 An OBJ's materials are not read: `--texture` gives its base colour
 texture. The high-resolution T-rex is a ZBrush export with the same UVs as
@@ -253,17 +269,24 @@ Models are looked for in `$FKJENSEN_ASSETS`, then `assets/models/` and
 built from, and beside the program. `assets/local/` is ignored by git, for
 models that are not to be published.
 
-Measured on 21/10/2026 (2 cores of a Xeon at 2.1 GHz):
+Measured on 23/10/2026 (2 cores of a Xeon at 2.1 GHz), with levels of
+detail:
 
-| model | source | triangles | clusters | tiles | import |
-|---|---|---|---|---|---|
-| T-rex | glTF, one 4096 x 4096 texture | 28,152 | 770 | 53.4 MB | 2.1 s |
-| car | FBX, 17 textures up to 1024 x 1024 | 17,243 | 575 | 37.6 MB | 1.0 s |
-| T-rex, high resolution | OBJ (639 MB, 5.4 M quads), the glTF's texture | 10,810,368 | 268,130 | 116.4 MB | 16.3 s |
+| model | source | triangles as made | all levels | coarsest cut | file | import |
+|---|---|---|---|---|---|---|
+| T-rex | glTF, one 4096 x 4096 texture | 28,152 | 1,746 clusters | 1,248 | 59.5 MB | 2.4 s |
+| car | FBX, 17 textures up to 1024 x 1024 | 17,243 | 1,101 clusters | 11,071 | 43.4 MB | 1.3 s |
+| T-rex, high resolution | OBJ (639 MB, 5.4 M quads), the glTF's texture | 10,810,368 | 25.0 M triangles, 601,107 clusters | about 230,000 | 1,552 MB | 195 s |
 
-The high-resolution file is 304 MB: 188 MB of geometry and 116 MB of tiles.
-About half its clusters need no tiles, since most of its triangles cover
-under two texels.
+The coarsest cut is what is drawn from far away: everything no coarser
+level replaces. The car stays heavy because it is many small separate
+parts whose open edges never move. The high-resolution file grows from
+304 MB (one level) to 1,552 MB: every level carries its own tiles, at the
+texture's own detail until a level's error passes twice a texel, and the
+fine levels are all limited by the texture, not the error. The tiles stay
+in the file and are read for what is seen; in memory the program peaks at
+about 2 GB with it (2.6 GB before levels). Git LFS stores the file whole:
+its storage and bandwidth count against the account's LFS quota.
 
 Decoded at full size, without mips, those textures alone are 71 MB of RGB.
 A 1280 x 720 frame of the wide view read 4.1 MB of tiles; one filling the
@@ -291,6 +314,7 @@ build leaves them out.
 | view | what it shows |
 |---|---|
 | `clusters` | one colour per cluster |
+| `lod` | the level of detail drawn for each cluster |
 | `triangles` | one colour per triangle id: the visibility buffer |
 | `depth` | distance from the eye, log scale over the range in view |
 | `normals` | world-space normals |
@@ -453,7 +477,12 @@ rig holds 64 lights at most.
    Clusters are culled against the view frustum as a whole (and their
    normal cone, with back-face culling on), then their triangles are set
    up, binned into 64 x 64 buckets and hidden with a depth buffer, one
-   bucket per thread, no atomics.
+   bucket per thread, no atomics. Of a model built into levels of detail,
+   each stretch of surface is drawn at the coarsest level whose error looks
+   no bigger than the micropolygon spacing from the eye, so geometry follows
+   the machine's plan as shading does. Shadow maps pick their level the
+   same way, by texels as seen from the light or the sun; the surfel cloud
+   uses the level whose error is under 2 cm.
 4. **Shading** (`src/reyes.rs`). Each triangle is diced from its own size
    on screen, whatever the mesh's topology: a grid laid on it as seen,
    rows along its longest edge and rows up to the opposite corner, 2^level
@@ -487,9 +516,18 @@ bounce light. `src/texture.rs` is the texture tiles and their cache;
 
 ## Measured
 
-With the T-rex and the car (10,925,731 triangles, 271,903 clusters, 3
-lights, 561,573 surfels), 1280 x 720, 2 cores of an Intel Xeon at 2.1 GHz,
-21/10/2026, one run:
+With the high-resolution T-rex and the car, both built into levels of
+detail (25.1 M triangles over every level, 605,406 clusters, 3 lights),
+micropolygons 2 px apart, 1280 x 720, 2 cores of an Intel Xeon at 2.1 GHz,
+23/10/2026, one run (`--bench-drag --highres --shading-rate 2`): the first
+frame took 5.0 s, of which the bounce gather 3.3 s, shading 404 ms and
+visibility 113 ms for 462 K triangles drawn; each step of dragging the key
+light took 557 to 603 ms, its shadow map 41 to 47 ms for 316 K triangles.
+At 4.4 px apart (this machine's window rate) a frame draws 316 K
+triangles and shades 418 K points in 117 ms.
+
+Before levels of detail (21/10/2026, 10,925,731 triangles, 271,903
+clusters, 561,573 surfels, the same machine, one run):
 
 | | first frame, wide view | dragging the key light, steps 1 to 5 |
 |---|---|---|
@@ -501,7 +539,7 @@ lights, 561,573 surfels), 1280 x 720, 2 cores of an Intel Xeon at 2.1 GHz,
 | resolve | 106 ms | 58 to 67 ms |
 | total | 13.8 s | 1.77 to 1.95 s |
 
-A drag frame is now dominated by the key light's shadow map holding all
+A drag frame was then dominated by the key light's shadow map holding all
 10.9 M triangles of the T-rex, and by re-shading what its 920 m reach
 covers, which is everything but the mountains.
 
@@ -577,12 +615,14 @@ Not measured yet: a Raspberry Pi.
   aerial perspective; the light count view leaves it out.
 - A moved light re-shades its points with every light in reach; keeping
   each light's share apart would let it redo only its own.
-- Shadow maps are drawn at full detail: the key light draws all 10.9 M
-  triangles of the T-rex every time it moves.
 - Adaptive refinement (sparse samples where the picture is smooth) and
   front-to-back early stopping: not started.
 - SIMD: the inner loops are scalar.
-- Vertex splatting and cluster level of detail.
+- Vertex splatting.
+- Levels of detail: every level is loaded, so a small machine cannot yet
+  leave the finest in the file; seams and separate parts never move when
+  simplifying, so a model of many parts (the car) gains one level at
+  most.
 - Texture tiles: base colour only (no normal or roughness maps); bounce
   light on a textured surface is coloured by its vertex colours; the importer does not read USD or ASCII FBX, and
   reads FBX transforms without pivots or offsets.
@@ -593,7 +633,7 @@ Not measured yet: a Raspberry Pi.
   dicing). Only the shading cache has a budget: geometry, shadow maps
   and surfels are as large as the scene makes them. With the
   high-resolution T-rex the program needs
-  about 2.5 GB, and with the low-resolution one it still does not fit: geometry is decoded to f32 at load and every visible triangle
+  about 2.6 GB (each frame's setup records alone are about 1 GB), and with the low-resolution one it still does not fit: geometry is decoded to f32 at load and every visible triangle
   gets a setup record each frame, so it does not fit a 256 MB Raspberry
   Pi 1. Quantised geometry in memory, cluster level of detail and
   per-bucket setup are what it needs.
@@ -609,9 +649,6 @@ Not measured yet: a Raspberry Pi.
   2 cores of a Xeon at 2.1 GHz, 22/10/2026), 4.5 M points and 859 ms of
   shading against 1.3 M and 260 to 277 ms at two pixels (3.7 M and 545 to
   569 ms before this change).
-- Dicing down: triangles smaller than two pixels are still shaded at
-  their vertices, so the high-resolution T-rex costs a point per vertex;
-  cluster level of detail is next.
 - `tools/fkj-import` does not read USD (`docs/format.md`).
 - Light rigs and the sky setting are not saved.
 - Text overlay: the numbers are in the window title.

@@ -52,7 +52,7 @@ impl PointLight {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cluster {
     pub first_vertex: u32,
     pub vertex_count: u32,
@@ -66,6 +66,78 @@ pub struct Cluster {
     /// `cone_cos <= 0` means the cone is too wide to cull with.
     pub cone_axis: Vec3,
     pub cone_cos: f32,
+    /// Level of detail (`lod.rs`): 0 for the model as made, each level up
+    /// about half the triangles of the one below.
+    pub lod_level: u8,
+    /// How far, in metres, this cluster may stray from the model as made,
+    /// and the sphere that error is seen from (its group's).
+    pub lod_error: f32,
+    pub lod_centre: Vec3,
+    pub lod_radius: f32,
+    /// The same for the coarser clusters that replace it and its group;
+    /// `f32::INFINITY` when nothing does.
+    pub parent_error: f32,
+    pub parent_centre: Vec3,
+    pub parent_radius: f32,
+}
+
+impl Default for Cluster {
+    fn default() -> Self {
+        Self {
+            first_vertex: 0,
+            vertex_count: 0,
+            first_tri: 0,
+            tri_count: 0,
+            centre: Vec3::ZERO,
+            radius: 0.0,
+            cone_axis: Vec3::Y,
+            cone_cos: -1.0,
+            lod_level: 0,
+            lod_error: 0.0,
+            lod_centre: Vec3::ZERO,
+            lod_radius: 0.0,
+            parent_error: f32::INFINITY,
+            parent_centre: Vec3::ZERO,
+            parent_radius: 0.0,
+        }
+    }
+}
+
+impl Cluster {
+    /// Whether this cluster is the one to draw for a view in which an error
+    /// of one metre at a sphere looks `scale(centre, radius)` units big
+    /// (pixels, texels), when errors up to `threshold` units may show: its
+    /// own error is small enough and its replacement's is not (Karis,
+    /// Stubbs, Wihlidal, "Nanite", 2021). Exactly one cluster of each
+    /// stretch of surface passes. A cluster with no levels always does.
+    #[inline]
+    pub fn lod_drawn(&self, threshold: f32, scale: impl Fn(Vec3, f32) -> f32) -> bool {
+        (self.lod_error == 0.0 || self.lod_error * scale(self.lod_centre, self.lod_radius) <= threshold)
+            && (self.parent_error.is_infinite() || self.parent_error * scale(self.parent_centre, self.parent_radius) > threshold)
+    }
+
+    /// Whether it belongs to a level-of-detail hierarchy at all.
+    pub fn has_lod(&self) -> bool {
+        self.lod_error > 0.0 || self.parent_error.is_finite()
+    }
+
+    /// Move its spheres as `f` moves points, with lengths times `scale`.
+    pub fn move_lod(&mut self, f: impl Fn(Vec3) -> Vec3, scale: f32) {
+        self.lod_centre = f(self.lod_centre);
+        self.lod_radius *= scale;
+        self.lod_error *= scale;
+        self.parent_centre = f(self.parent_centre);
+        self.parent_radius *= scale;
+        self.parent_error *= scale;
+    }
+}
+
+/// For a perspective view from `eye`: pixels per metre at the nearest point
+/// of a sphere, for `lod_drawn`. `px_per_unit` is pixels per unit of
+/// tangent (half the frame height over tan(fov / 2)).
+#[inline]
+pub fn perspective_scale(eye: Vec3, px_per_unit: f32, near: f32) -> impl Fn(Vec3, f32) -> f32 {
+    move |c, r| px_per_unit / (c.distance(eye) - r).max(near)
 }
 
 #[derive(Default)]
@@ -135,6 +207,7 @@ impl Scene {
         }
         for c in &mut self.clusters {
             c.centre += d;
+            c.move_lod(|p| p + d, 1.0);
         }
         for l in &mut self.lights {
             l.position += d;
@@ -163,6 +236,7 @@ impl Scene {
             c.centre = q * (c.centre * scale) + d;
             c.radius *= scale;
             c.cone_axis = q * c.cone_axis;
+            c.move_lod(|p| q * (p * scale) + d, scale);
         }
         for l in &mut self.lights {
             l.position = q * (l.position * scale) + d;
@@ -252,6 +326,47 @@ impl Scene {
         source
     }
 
+    /// Append a mesh's level-of-detail hierarchy (`lod::build`), one scene
+    /// cluster per hierarchy cluster, with its errors and spheres. Returns,
+    /// per triangle added, its corners as vertices of the mesh given.
+    pub fn push_lod_mesh(&mut self, positions: &[Vec3], normals: &[Vec3], colors: &[Vec3], clusters: &[crate::lod::LodCluster]) -> Vec<[u32; 3]> {
+        let mut corners = Vec::new();
+        for lc in clusters {
+            let first_vertex = self.positions.len() as u32;
+            let first_tri = (self.indices.len() / 3) as u32;
+            let mut local: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            for t in &lc.tris {
+                for &v in t {
+                    let l = *local.entry(v).or_insert_with(|| {
+                        self.positions.push(positions[v as usize]);
+                        self.normals.push(normals[v as usize]);
+                        self.colors.push(colors[v as usize]);
+                        self.positions.len() as u32 - 1
+                    });
+                    self.indices.push(l);
+                }
+                corners.push(*t);
+            }
+            let mut cl = Cluster {
+                first_vertex,
+                vertex_count: self.positions.len() as u32 - first_vertex,
+                first_tri,
+                tri_count: lc.tris.len() as u32,
+                lod_level: lc.level,
+                lod_error: lc.error,
+                lod_centre: lc.sphere.0,
+                lod_radius: lc.sphere.1,
+                parent_error: lc.parent_error,
+                parent_centre: lc.parent_sphere.0,
+                parent_radius: lc.parent_sphere.1,
+                ..Default::default()
+            };
+            self.finish_cluster(&mut cl);
+            self.clusters.push(cl);
+        }
+        corners
+    }
+
     /// Fill a cluster's sphere and cone from its vertices and triangles, and
     /// grow the scene bounds.
     pub fn finish_cluster(&mut self, cl: &mut Cluster) {
@@ -312,10 +427,12 @@ pub fn build_clusters(positions: &[Vec3], tri_indices: &[u32]) -> Vec<BuiltClust
     if n_tris == 0 {
         return Vec::new();
     }
+    // Bounds of the vertices these triangles use (not of all positions: the
+    // level-of-detail builder calls this once per group of a large mesh).
     let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
-    for p in positions {
-        lo = lo.min(*p);
-        hi = hi.max(*p);
+    for &i in tri_indices {
+        lo = lo.min(positions[i as usize]);
+        hi = hi.max(positions[i as usize]);
     }
     let ext = (hi - lo).max(Vec3::splat(1e-20));
     let mut order: Vec<(u64, u32)> = (0..n_tris)

@@ -8,7 +8,8 @@
 //! spaced on screen however the triangle recedes. Points on an edge between
 //! that edge's own samples are interpolated along it, so two triangles
 //! sharing an edge agree along it. A triangle whose edges are all under
-//! `raster::SHADING_RATE_PX` uses the cluster's shaded vertices.
+//! the shading rate (`RenderSettings::shading_rate_px`) uses the cluster's
+//! shaded vertices.
 //!
 //! Shading happens on those points, in world space, before the picture is
 //! made, and the results are kept (Cook, Carpenter, Catmull 1987). The
@@ -44,7 +45,7 @@ use crate::sun::SunShadow;
 ///
 /// Its grid lies on the triangle as seen when it was diced: rows along its
 /// longest edge on screen, 2^lu + 1 points each, and 2^lv + 1 rows up to the
-/// opposite corner, so points are about `raster::SHADING_RATE_PX` apart
+/// opposite corner, so points are about the shading rate apart
 /// both ways on screen however thin or receding the triangle is. The grid
 /// covers the rectangle on that edge, twice the triangle; points outside it
 /// are shaded on the triangle's plane, for interpolating up to its edges.
@@ -269,6 +270,7 @@ struct VisKey {
     size: (usize, usize),
     cull: bool,
     wireframe: bool,
+    lod_px: u32,
 }
 
 static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
@@ -547,7 +549,7 @@ impl Renderer {
         frame.stats.bounce_ms = tb.elapsed().as_secs_f32() * 1000.0;
 
         // Visibility, unless the camera and the frame are as they were.
-        let vk = VisKey { tile: settings.tile, view: cam.view, proj: cam.proj, size: (frame.width, frame.height), cull: settings.cull_backfaces, wireframe: settings.wireframe };
+        let vk = VisKey { tile: settings.tile, view: cam.view, proj: cam.proj, size: (frame.width, frame.height), cull: settings.cull_backfaces, wireframe: settings.wireframe, lod_px: settings.lod_px().to_bits() };
         if self.vis_key == Some(vk) && frame.vis_stamp == self.vis_stamp && self.vis_stamp != 0 {
             frame.stats.visibility_kept = true;
             frame.stats.clusters_in = scene.clusters.len();
@@ -556,7 +558,7 @@ impl Renderer {
             frame.stats.tris_drawn = frame.setups.len();
         } else {
             full_resolve = true;
-            self.levels = raster::visibility(scene, cam, settings.cull_backfaces, settings.wireframe, settings.tile, frame);
+            self.levels = raster::visibility(scene, cam, settings.cull_backfaces, settings.wireframe, settings.tile, settings.lod_px(), frame);
             self.vis_key = Some(vk);
             self.vis_stamp = NEXT_STAMP.fetch_add(1, Ordering::Relaxed);
             frame.vis_stamp = self.vis_stamp;
@@ -584,7 +586,7 @@ impl Renderer {
         let ground = !settings.bounce;
         let vp = cam.proj * cam.view;
         let (near, size) = (cam.near, (frame.width, frame.height));
-        let rate = raster::SHADING_RATE_PX * self.rate_scale;
+        let rate = settings.shading_rate_px.max(0.25) * self.rate_scale;
         if settings.view == View::Shaded {
             self.cache.par_iter_mut().enumerate().for_each(|(ci, e)| {
                 let need_tris = need[ci];

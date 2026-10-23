@@ -75,6 +75,9 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 23/10/2026: levels of detail. fkj-import builds each model into a cluster hierarchy (groups of four clusters simplified to half by quadric edge collapse, borders locked; own Rust simplifier, no C++), every level with its own tiles, in a `LODS` section (.fkj version 2). The renderer draws the coarsest level whose error looks no bigger than the micropolygon spacing, so geometry density follows the machine's plan with shading; shadow maps by their texels, surfels at 2 cm.
+- 23/10/2026: the machine's plan sets the micropolygon spacing: the window aims at 30 frames a second, spacing micropolygons 2 to 8 pixels apart before lowering resolution; stills shade 1 to 2 pixels apart. `--shading-rate PX` overrides it.
+- 22/10/2026: a window frame no longer holds the last frame's setup records while making new ones (about 1 GB with the high-resolution T-rex, which ran an 8 GB laptop out of memory), and the texture and shading caches are sized from what the set leaves of available memory, not all of it.
 - 22/10/2026: the shading cache has a budget, a quarter of available memory: clusters off screen are dropped first, then micropolygons grow until what is on screen fits. Slower or coarser, never out of memory. Before this, moving the camera grew the cache without end.
 - 22/10/2026: micropolygons evenly spaced on screen: each triangle gets its own grid, laid along its longest edge on screen, fine along its length only when thin, perspective-correct when receding, up to 256 parts per side. Replaces one level per cluster from its longest edge, capped at 32 parts. Next: cluster level of detail, for triangles under the shading rate.
 - 21/10/2026: the sun, a directional light with cascaded orthographic shadow maps and a 0 to 1000 brightness; time of day; lighting contrast and visible sky contrast, independent.

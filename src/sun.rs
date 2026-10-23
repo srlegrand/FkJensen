@@ -136,6 +136,11 @@ impl SunShadow {
                         || (vec![f32::NEG_INFINITY; res * res], 0u64),
                         |(mut buf, mut n), chunk| {
                             for c in chunk {
+                                // The level of detail whose error is under
+                                // a texel of this cascade.
+                                if !c.lod_drawn(texel, |_, _| 1.0) {
+                                    continue;
+                                }
                                 let q = c.centre - centre;
                                 if q.dot(right).abs() > half + c.radius || q.dot(up).abs() > half + c.radius {
                                     continue;

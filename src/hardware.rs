@@ -51,11 +51,15 @@ pub struct Hardware {
 /// What FkJensen chooses for this machine.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
-    /// The window renders at this fraction of its size and is scaled up
-    /// (for a 1280 x 720 window; any other output follows `pixel_budget`).
+    /// The window renders at this fraction of its size and is scaled up,
+    /// and its micropolygons are this many pixels apart (for a 1280 x 720
+    /// window; any other size follows `point_budget`, `window_rate`).
     pub render_scale: f32,
-    /// Pixels a frame can have to re-shade in the interactive time.
-    pub pixel_budget: f64,
+    pub window_rate_px: f32,
+    /// Shading points a window frame can re-shade in the interactive time.
+    pub point_budget: f64,
+    /// Micropolygon spacing of a `--png` render, pixels.
+    pub still_rate_px: f32,
     /// Size of a `--png` render when `--size` is not given.
     pub png_size: (usize, usize),
     pub highres: bool,
@@ -82,13 +86,22 @@ const FRAME_RATE_SHARE: f64 = 0.5;
 /// Benchmark rate of that machine (2 cores of a Xeon at 2.1 GHz).
 const REFERENCE_RATE: f64 = 17.0e6;
 
-/// Shading points per pixel in a typical view of the built-in set
-/// (measured: 2.2 M points for 0.92 M pixels in the wide view, 1.1 M in the
-/// close view; up to 5 on low-resolution renders).
-const POINTS_PER_PIXEL: f64 = 3.0;
+/// Shading points per pixel with micropolygons one pixel apart, in a
+/// typical view of the built-in set; at r pixels apart, divide by r^2.
+/// Grids cover twice their triangle and are rounded up to powers of two,
+/// and small triangles cost more at coarse spacing (measured 23/10/2026 at
+/// 1280 x 720 with the low-resolution T-rex: 4.51 M points at 1 px, 1.34 M
+/// at 2 px, 0.40 M at 4.4 px, so 4.9, 5.8 and 8.5).
+const POINTS_AT_1PX: f64 = 8.0;
 /// The window aims to re-shade a whole frame in this time when the camera
-/// moves.
-const INTERACTIVE_S: f64 = 0.15;
+/// moves: 30 frames a second.
+const INTERACTIVE_S: f64 = 1.0 / 30.0;
+/// Micropolygon spacing in the window: no finer than this...
+const WINDOW_RATE_MIN: f32 = 2.0;
+/// ...and no coarser; past it the window renders at a lower resolution.
+const WINDOW_RATE_MAX: f32 = 8.0;
+/// Micropolygon spacing of stills: from one pixel to two.
+const STILL_RATE: (f32, f32) = (1.0, 2.0);
 /// A `--png` render with no `--size` aims to take this long to shade.
 const STILL_S: f64 = 2.0;
 /// Largest automatic `--png` size.
@@ -97,6 +110,13 @@ const PNG_MAX: (usize, usize) = (1280, 720);
 /// features on, at 1280 x 720 (measured peak 2,523 MB on x86-64,
 /// 21/10/2026), with margin.
 const HIGHRES_MEMORY: u64 = 3200 << 20;
+/// What the built-in set takes before the two caches: peaks measured with
+/// `--png`, rounded up. With the high-resolution T-rex and its levels of
+/// detail, 1,983 MB (23/10/2026, 2 cores of a Xeon at 2.1 GHz; 2,603 MB
+/// without levels on 22/10/2026 on an i5-8250U); with the low-resolution
+/// one, 492 MB. The caches' budgets come out of what is left.
+const HIGHRES_PEAK: u64 = 2100 << 20;
+const LOWRES_PEAK: u64 = 512 << 20;
 /// Bytes read and written per triangle each time visibility runs: vertex
 /// positions and the setup record. The high-resolution T-rex has 10.8 M
 /// triangles.
@@ -216,6 +236,19 @@ fn bandwidth(buf: &[u64], all: bool) -> f64 {
     best / 1e9
 }
 
+/// Micropolygon spacing and render scale for a window of `pixels` that may
+/// re-shade `budget` points a frame: spacing first, from `WINDOW_RATE_MIN`
+/// to `WINDOW_RATE_MAX` pixels, then resolution.
+pub fn window_rate(budget: f64, pixels: usize) -> (f32, f32) {
+    let r = (POINTS_AT_1PX * pixels as f64 / budget.max(1.0)).sqrt() as f32;
+    if r <= WINDOW_RATE_MAX {
+        return (r.max(WINDOW_RATE_MIN), 1.0);
+    }
+    let affordable = budget * (WINDOW_RATE_MAX * WINDOW_RATE_MAX) as f64 / POINTS_AT_1PX;
+    let scale = ((affordable / pixels.max(1) as f64).sqrt() as f32).clamp(0.0625, 1.0);
+    (WINDOW_RATE_MAX, (scale * 16.0).floor().max(1.0) / 16.0)
+}
+
 impl Hardware {
     /// Read the system and run the two measurements. Takes about 0.1 to
     /// 0.5 s.
@@ -277,25 +310,30 @@ impl Hardware {
         let bench = self.shading_rate.max(1.0);
         let rate = bench * FRAME_RATE_SHARE;
 
-        // Window: shade a whole frame in INTERACTIVE_S. The scale applies
-        // to each side of a 1280 x 720 window.
-        let px = rate * INTERACTIVE_S / POINTS_PER_PIXEL;
-        let pixel_budget = px;
-        let render_scale = ((px / (1280.0 * 720.0)).sqrt() as f32).clamp(0.125, 1.0);
-        let render_scale = (render_scale * 8.0).round().max(1.0) / 8.0;
+        // Window: re-shade a whole frame in INTERACTIVE_S, at full
+        // resolution with micropolygons further apart first, then at a
+        // lower resolution.
+        let point_budget = rate * INTERACTIVE_S;
+        let (window_rate_px, render_scale) = window_rate(point_budget, 1280 * 720);
         reasons.push(format!(
-            "frames of about {:.0} K pixels ({:.0}% of a 1280 x 720 window): about {:.2} M shading points/s in a frame, {} ms per frame at {POINTS_PER_PIXEL} points per pixel",
-            pixel_budget / 1e3,
+            "window: micropolygons {:.1} px apart at {:.0}% of a 1280 x 720 window, about {:.0} K shading points per frame ({:.2} M points/s in a frame, {:.0} frames/s)",
+            window_rate_px,
             render_scale * 100.0,
+            point_budget / 1e3,
             rate / 1e6,
-            (INTERACTIVE_S * 1000.0) as u32
+            1.0 / INTERACTIVE_S
         ));
 
-        // Still renders.
-        let px = rate * STILL_S / POINTS_PER_PIXEL;
+        // Still renders: as fine as STILL_S allows at full size, then
+        // smaller.
+        let budget = rate * STILL_S;
+        let full = (PNG_MAX.0 * PNG_MAX.1) as f64;
+        let r = ((POINTS_AT_1PX * full / budget).sqrt() as f32).clamp(STILL_RATE.0, STILL_RATE.1);
+        let px = (budget * (r * r) as f64 / POINTS_AT_1PX).min(full);
         let w = ((px * 16.0 / 9.0).sqrt() as usize).clamp(160, PNG_MAX.0) / 16 * 16;
         let png_size = (w, w * 9 / 16);
-        reasons.push(format!("--png without --size renders {}x{} (about {} s of shading)", png_size.0, png_size.1, STILL_S as u32));
+        let still_rate_px = r;
+        reasons.push(format!("--png without --size renders {}x{}, micropolygons {:.1} px apart (about {} s of shading)", png_size.0, png_size.1, still_rate_px, STILL_S as u32));
 
         // The high-resolution T-rex: memory, and memory traffic per frame.
         let traffic_s = HIGHRES_TRIANGLES * BYTES_PER_TRIANGLE / (self.bandwidth_all.max(0.01) * 1e9);
@@ -348,17 +386,19 @@ impl Hardware {
         }
         reasons.push(format!("buckets {tile} x {tile} ({} KB of depth and ids, L2 {} KB)", tile * tile * 8 / 1024, l2 >> 10));
 
-        // Texture tiles: an eighth of available memory, 8 MB to 1 GB.
-        let texture_cache = (self.mem_available.unwrap_or(2 << 30) / 8).clamp(8 << 20, 1 << 30) as usize;
+        // The caches share what the set leaves of available memory.
+        let left = self.mem_available.unwrap_or(2 << 30).saturating_sub(if highres { HIGHRES_PEAK } else { LOWRES_PEAK });
+
+        // Texture tiles: an eighth of what is left, 8 MB to 1 GB.
+        let texture_cache = (left / 8).clamp(8 << 20, 1 << 30) as usize;
         reasons.push(format!("texture tile cache up to {} MB", texture_cache >> 20));
 
-        // Shading cache: a quarter of available memory, 8 MB to 4 GB.
-        // Past it, clusters off screen are dropped, then micropolygons
-        // grow.
-        let shade_cache = (self.mem_available.unwrap_or(2 << 30) / 4).clamp(8 << 20, if cfg!(target_pointer_width = "64") { 4 << 30 } else { 256 << 20 }) as usize;
+        // Shading cache: a quarter of what is left, 8 MB to 4 GB. Past it,
+        // clusters off screen are dropped, then micropolygons grow.
+        let shade_cache = (left / 4).clamp(8 << 20, if cfg!(target_pointer_width = "64") { 4 << 30 } else { 256 << 20 }) as usize;
         reasons.push(format!("shading cache up to {} MB", shade_cache >> 20));
 
-        Plan { texture_cache, shade_cache, render_scale, pixel_budget, png_size, highres, shadows, shadow_res, bounce, bounce_budget_ms, tile, reasons }
+        Plan { texture_cache, shade_cache, render_scale, window_rate_px, point_budget, still_rate_px, png_size, highres, shadows, shadow_res, bounce, bounce_budget_ms, tile, reasons }
     }
 
     pub fn report(&self) -> String {
@@ -440,7 +480,9 @@ mod tests {
         assert!(!p.highres);
         assert!(!p.bounce);
         assert_eq!(p.render_scale, 0.125);
-        assert!(p.png_size.0 <= 320, "{:?}", p.png_size);
+        assert!(p.png_size.0 <= 480, "{:?}", p.png_size);
+        assert_eq!(p.window_rate_px, WINDOW_RATE_MAX);
+        assert_eq!(p.still_rate_px, STILL_RATE.1);
         assert!(p.shadows && p.shadow_res <= 128, "{}", p.shadow_res);
     }
 
@@ -453,6 +495,30 @@ mod tests {
         assert_eq!(p.png_size, PNG_MAX);
         assert!(p.render_scale >= 0.5);
         assert_eq!(p.tile, 64);
+    }
+
+    /// Spacing grows before resolution drops: the i5-8250U laptop (18.1 M
+    /// points/s in a frame) keeps the full window with micropolygons 3 to 4
+    /// 3 px apart; a machine a hundred times slower reaches the coarsest
+    /// spacing and renders smaller.
+    #[test]
+    fn spacing_grows_before_resolution_drops() {
+        let (r, scale) = window_rate(18.1e6 * INTERACTIVE_S, 1280 * 720);
+        assert!(scale == 1.0 && r > 2.5 && r < 4.0, "{r} px at {scale}");
+        let (r, scale) = window_rate(18.1e4 * INTERACTIVE_S, 1280 * 720);
+        assert!(r == WINDOW_RATE_MAX && scale < 0.5, "{r} px at {scale}");
+        let (r, scale) = window_rate(1e9, 1280 * 720);
+        assert!(r == WINDOW_RATE_MIN && scale == 1.0);
+    }
+
+    /// The i5-8250U laptop on 22/10/2026: 3,961 MB available. The
+    /// high-resolution T-rex fits, and the caches leave room for it.
+    #[test]
+    fn the_caches_fit_beside_the_set() {
+        let p = machine(36e6, 3961, 24.9, 256).plan();
+        assert!(p.highres);
+        let total = (HIGHRES_PEAK as usize) + p.shade_cache + p.texture_cache;
+        assert!(total < (3961usize << 20) * 9 / 10, "{} MB", total >> 20);
     }
 
     #[test]

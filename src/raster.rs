@@ -290,14 +290,22 @@ pub struct RenderSettings {
     pub view: View,
     /// Most bytes the shading cache may hold (`reyes::Renderer`).
     pub cache_budget: usize,
+    /// Micropolygon spacing on screen, pixels.
+    pub shading_rate_px: f32,
 }
 
 /// Shading cache budget when the machine's plan does not set one.
 pub const CACHE_BUDGET: usize = if cfg!(target_pointer_width = "64") { 1 << 30 } else { 16 << 20 };
 
 impl RenderSettings {
+    /// Geometric error allowed on screen, pixels: as much as the
+    /// micropolygons' spacing, since detail finer than that is not shaded.
+    pub fn lod_px(&self) -> f32 {
+        self.shading_rate_px.max(1.0)
+    }
+
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET }
+        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX }
     }
 }
 
@@ -494,7 +502,8 @@ fn cluster_hidden(c: &Cluster, planes: &[Vec4; 5], eye: Vec3, cull_backfaces: bo
     false
 }
 
-/// Shading points per micropolygon edge target, in pixels.
+/// Micropolygon spacing on screen, in pixels, when the machine's plan does
+/// not set it (`RenderSettings::shading_rate_px`).
 pub const SHADING_RATE_PX: f32 = 2.0;
 /// Finest dicing level: a triangle is cut into 2^level parts per edge.
 /// Finer than the finest texture tile (`texture::MAX_LEVEL`), which grids
@@ -522,7 +531,14 @@ pub fn dice_level_at(edge_px: f32, rate: f32) -> u8 {
 /// Work out what each pixel sees. Fills `frame.depth`, `frame.tri_id` and
 /// `frame.setups`, and returns each cluster's dicing level (`NOT_VISIBLE`
 /// for clusters culled whole).
-pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile: usize, frame: &mut Frame) -> Vec<u8> {
+///
+/// Of clusters with levels of detail, only those whose error looks no
+/// bigger than `lod_px` pixels and whose replacement's does are drawn
+/// (`Cluster::lod_drawn`).
+pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile: usize, lod_px: f32, frame: &mut Frame) -> Vec<u8> {
+    // The last frame's setup records go before the new ones are made: with
+    // the high-resolution T-rex they are about 1 GB.
+    frame.setups = Vec::new();
     let tile = tile.max(8);
     let width = frame.width;
     let height = frame.height;
@@ -534,6 +550,7 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile
     let near = cam.near;
     let planes = frustum_planes(vp, near);
     let eye = cam.eye;
+    let lod_scale = crate::scene::perspective_scale(eye, cam.proj.y_axis.y * height as f32 * 0.5, near);
     let parts: Vec<(Vec<TriSetup>, Vec<(u32, u8)>)> = scene
         .clusters
         .par_chunks(64)
@@ -545,7 +562,7 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile
             let mut clip = [Vec4::ZERO; crate::scene::CLUSTER_VERTS];
             for (k, c) in chunk.iter().enumerate() {
                 let cluster = (ci * 64 + k) as u32;
-                if cluster_hidden(c, &planes, eye, cull) {
+                if !c.lod_drawn(lod_px, &lod_scale) || cluster_hidden(c, &planes, eye, cull) {
                     continue;
                 }
                 let fv = c.first_vertex as usize;

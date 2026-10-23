@@ -19,6 +19,7 @@ use crate::scene::{PointLight, Scene};
 pub enum DebugView {
     Final,
     Clusters,
+    Lod,
     Triangles,
     Depth,
     Normals,
@@ -42,9 +43,10 @@ pub enum DebugView {
     MicroRaster,
 }
 
-pub const ALL: [DebugView; 23] = [
+pub const ALL: [DebugView; 24] = [
     DebugView::Final,
     DebugView::Clusters,
+    DebugView::Lod,
     DebugView::Triangles,
     DebugView::Depth,
     DebugView::Normals,
@@ -73,6 +75,7 @@ impl DebugView {
         match self {
             DebugView::Final => "final",
             DebugView::Clusters => "clusters",
+            DebugView::Lod => "lod",
             DebugView::Triangles => "triangles",
             DebugView::Depth => "depth",
             DebugView::Normals => "normals",
@@ -112,11 +115,12 @@ impl DebugView {
         match self {
             DebugView::Final => ("FINAL", &[]),
             DebugView::Clusters => ("CLUSTERS", &["ONE COLOUR PER CLUSTER: AT MOST 64 VERTICES, 124 TRIANGLES", "THE UNIT OF CULLING, LIGHT REACH, SHADING CACHE AND TEXTURE STREAMING"]),
+            DebugView::Lod => ("LEVEL OF DETAIL", &["THE LEVEL DRAWN FOR EACH CLUSTER: 0 IS THE MODEL AS MADE", "EACH LEVEL ABOUT HALF THE TRIANGLES; ERROR UNDER THE SHADING RATE ON SCREEN"]),
             DebugView::Triangles => ("TRIANGLES (VISIBILITY BUFFER)", &["ONE COLOUR PER TRIANGLE ID: WHAT EACH PIXEL SEES", "DEPTH AND TRIANGLE ID ARE ALL VISIBILITY STORES; NOTHING IS SHADED THERE"]),
             DebugView::Depth => ("DEPTH", &["DISTANCE FROM THE EYE, LOG SCALE, OVER THE RANGE IN VIEW"]),
             DebugView::Normals => ("NORMALS", &["WORLD-SPACE NORMAL, X Y Z AS RED GREEN BLUE"]),
             DebugView::Buckets => ("BUCKETS", &["EACH BUCKET IS HIDDEN BY ONE THREAD, WITH NO LOCKS", "NUMBER: TRIANGLES BINNED INTO IT; BLUE FEW, RED MANY"]),
-            DebugView::Dice => ("DICING LEVEL", &["PER TRIANGLE, FROM ITS EDGES ON SCREEN", "LEVEL L CUTS A TRIANGLE INTO 2^L PARTS PER EDGE"]),
+            DebugView::Dice => ("DICING LEVEL", &["PER TRIANGLE, FROM ITS SIZE ON SCREEN", "LEVEL L: 2^L PARTS ALONG ITS LONGEST SIDE OR ACROSS"]),
             DebugView::Micropolygons => ("MICROPOLYGONS", &["THE GRID EACH TRIANGLE WAS SHADED ON, EVEN ON SCREEN", "WHITE: TRIANGLE EDGES; COLOUR: MICROPOLYGON EDGES BY LEVEL"]),
             DebugView::Reshaded => ("SHADING CACHE", &["RED: SHADED IN THE LAST FRAMES; GREEN: BOUNCE GATHERED", "GREY: KEPT FROM EARLIER FRAMES. DRAG A LIGHT TO SEE ITS REACH REDONE"]),
             DebugView::Albedo => ("ALBEDO", &["BASE COLOUR: VERTEX COLOURS, OR TEXTURE TILES AT THE KEPT LEVEL"]),
@@ -293,12 +297,16 @@ pub fn draw(view: DebugView, ctx: &Ctx, frame: &mut Frame) {
             let i = y * w + x;
             let Some(hh) = hit(ctx, fr, x, y) else {
                 return match view {
-                    DebugView::Depth | DebugView::Normals | DebugView::Clusters | DebugView::Triangles | DebugView::Dice | DebugView::Tiles | DebugView::Albedo => Vec3::splat(0.004),
+                    DebugView::Depth | DebugView::Normals | DebugView::Clusters | DebugView::Lod | DebugView::Triangles | DebugView::Dice | DebugView::Tiles | DebugView::Albedo => Vec3::splat(0.004),
                     _ => dim(i, 0.35),
                 };
             };
             match view {
                 DebugView::Clusters => hash_colour(hh.cluster as u32) * facing(ctx, &hh),
+                DebugView::Lod => {
+                    let c = &ctx.scene.clusters[hh.cluster];
+                    if c.has_lod() { level_colour(c.lod_level) * facing(ctx, &hh) } else { Vec3::splat(0.08) * facing(ctx, &hh) }
+                }
                 DebugView::Triangles => hash_colour(hh.tri.wrapping_mul(2_654_435_761)) * facing(ctx, &hh),
                 DebugView::Depth => {
                     let d = 1.0 / fr.depth[i].max(1e-12);
@@ -792,8 +800,17 @@ fn legend(view: DebugView, ctx: &Ctx, frame: &mut Frame) {
     }
     // Swatches for views whose colours are a scale.
     let swatches: Vec<(Vec3, String)> = match view {
-        DebugView::Dice | DebugView::Micropolygons => (0..=raster::MAX_DICE_LEVEL).map(|l| (level_colour(l), match l { 0 => "L0 VERTS".to_string(), 1 => "L1 <4 PX".to_string(), _ => format!("L{} <{}", l, 2u32 << l) })).collect(),
+        DebugView::Dice | DebugView::Micropolygons => {
+            let r = ctx.settings.shading_rate_px;
+            (0..=raster::MAX_DICE_LEVEL).map(|l| (level_colour(l), match l { 0 => "L0 VERTS".to_string(), 1 => format!("L1 <{:.0} PX", r * 2.0), _ => format!("L{} <{:.0}", l, r * (1u32 << l) as f32) })).collect()
+        }
         DebugView::Tiles => (1..=5u8).map(|l| (level_colour(l), format!("L{l} {} PTS", crate::texture::tile_points(l)))).collect(),
+        DebugView::Lod => {
+            let top = ctx.scene.clusters.iter().filter(|c| c.has_lod()).map(|c| c.lod_level).max().unwrap_or(0);
+            let mut v: Vec<(Vec3, String)> = (0..=top.min(8)).map(|l| (level_colour(l), format!("L{l}"))).collect();
+            v.push((Vec3::splat(0.08), "NO LEVELS".to_string()));
+            v
+        }
         DebugView::LightCount => (0..=5u32).map(|k| (raster::heat(k) * 1.4, if k == 5 { "5+".to_string() } else { k.to_string() })).collect(),
         DebugView::Reach => (0..8u32).map(|k| (reach_colour(k), if k == 0 { "REACH".to_string() } else { format!("X{}", 1u32 << k) })).collect(),
         DebugView::Depth => {

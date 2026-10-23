@@ -6,14 +6,16 @@
 //! every byte.
 //!
 //! ```text
-//! header   "FKJ\0"  u32 version (1)  u32 section count  u32 0
+//! header   "FKJ\0"  u32 version (1, or 2 with LODS)  u32 section count  u32 0
 //! section  [u8;4] tag  u32 section version  u64 payload bytes  payload  (padded to 8)
 //! ```
 //!
 //! Tags: `MESH` clustered triangles, `INST` copies of a run of clusters at
 //! other transforms, `LITE` point lights in lumens, `TEXR` per-triangle
 //! texture tiles (`texture.rs`), streamed from the file and never read
-//! whole. Reserved for the primitives still
+//! whole, `LODS` each cluster's level of detail (`lod.rs`). A file with
+//! `LODS` is version 2, so that a reader without it refuses the file rather
+//! than drawing every level at once. Reserved for the primitives still
 //! to come: `PNTS` (points, particles), `CURV` (curves, fur and hair),
 //! `VOLM` (volumes).
 
@@ -29,11 +31,15 @@ use crate::scene::{Cluster, PointLight, Scene};
 use crate::texture::{level_offset, Source, TexEntry};
 
 pub const MAGIC: [u8; 4] = *b"FKJ\0";
+/// Version written when no cluster has levels of detail; `VERSION_LOD`
+/// when one does. Both are read.
 pub const VERSION: u32 = 1;
+pub const VERSION_LOD: u32 = 2;
 pub const TAG_MESH: [u8; 4] = *b"MESH";
 pub const TAG_LITE: [u8; 4] = *b"LITE";
 pub const TAG_INST: [u8; 4] = *b"INST";
 pub const TAG_TEXR: [u8; 4] = *b"TEXR";
+pub const TAG_LODS: [u8; 4] = *b"LODS";
 
 /// Extra copies of clusters `first_cluster..first_cluster + cluster_count`
 /// of the `MESH` section, each at `transform` applied to the stored
@@ -115,12 +121,22 @@ impl W {
 /// cluster's box, normals to 16-bit octahedral pairs, colours to 8-bit sRGB.
 /// `instances` adds copies of stored clusters; pass `&[]` for none.
 pub fn write(scene: &Scene, instances: &[InstanceGroup]) -> Vec<u8> {
-    let mut out = W(Vec::new());
-    out.0.extend_from_slice(&MAGIC);
-    out.u32(VERSION);
+    let mut v = Vec::new();
+    write_to(&mut v, scene, instances).expect("writing to memory");
+    v
+}
+
+/// `write`, streamed to `out`: texture tiles go from their source to `out`
+/// a cluster at a time, never all in memory.
+pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[InstanceGroup]) -> std::io::Result<()> {
+    let mut head = W(Vec::new());
+    head.0.extend_from_slice(&MAGIC);
+    let lods = scene.clusters.iter().any(|c| c.has_lod());
+    head.u32(if lods { VERSION_LOD } else { VERSION });
     let textured = !scene.textures.is_empty();
-    out.u32(2 + !instances.is_empty() as u32 + textured as u32);
-    out.u32(0);
+    head.u32(2 + !instances.is_empty() as u32 + textured as u32 + lods as u32);
+    head.u32(0);
+    out.write_all(&head.0)?;
 
     // MESH
     let mut m = W(Vec::new());
@@ -185,7 +201,7 @@ pub fn write(scene: &Scene, instances: &[InstanceGroup]) -> Vec<u8> {
             }
         }
     }
-    section(&mut out, TAG_MESH, 1, &m.0);
+    section(out, TAG_MESH, 1, &m.0)?;
 
     // INST: u32 group count, u32 0, then per group u32 first cluster,
     // u32 cluster count, u32 transform count, u32 0, and that many affine
@@ -209,7 +225,7 @@ pub fn write(scene: &Scene, instances: &[InstanceGroup]) -> Vec<u8> {
                 }
             }
         }
-        section(&mut out, TAG_INST, 1, &g.0);
+        section(out, TAG_INST, 1, &g.0)?;
     }
 
     // LITE, version 2: lumens.
@@ -222,7 +238,7 @@ pub fn write(scene: &Scene, instances: &[InstanceGroup]) -> Vec<u8> {
         l.f32(li.lumens);
         l.f32(0.0);
     }
-    section(&mut out, TAG_LITE, 2, &l.0);
+    section(out, TAG_LITE, 2, &l.0)?;
 
     // TEXR: u32 cluster count, u32 0, u64 bytes from the payload's start to
     // the pool; per cluster u8 finest level (0: none), 7 bytes 0, u64
@@ -235,22 +251,20 @@ pub fn write(scene: &Scene, instances: &[InstanceGroup]) -> Vec<u8> {
         t.u32(n as u32);
         t.u32(0);
         t.u64(table_end);
-        let mut pool: Vec<u8> = Vec::new();
+        // Each cluster's tiles: where they come from and how many bytes.
+        let mut parts: Vec<Option<(usize, u64, usize)>> = Vec::with_capacity(n);
+        let mut pool_len = 0u64;
         for (ci, c) in scene.clusters.iter().enumerate() {
             let e = scene.textures.entry(ci);
-            let data = if e.level > 0 {
-                scene.textures.sources.get(e.source as usize).and_then(|src| src.read(e.offset, level_offset(c.tri_count as usize, e.level + 1) as usize).ok())
-            } else {
-                None
-            };
-            match data {
-                Some(d) => {
+            let part = (e.level > 0 && scene.textures.sources.get(e.source as usize).is_some()).then(|| (e.source as usize, e.offset, level_offset(c.tri_count as usize, e.level + 1) as usize));
+            match part {
+                Some((_, _, len)) => {
                     t.u8(e.level);
                     for _ in 0..7 {
                         t.u8(0);
                     }
-                    t.u64(pool.len() as u64);
-                    pool.extend_from_slice(&d);
+                    t.u64(pool_len);
+                    pool_len += len as u64;
                 }
                 None => {
                     for _ in 0..16 {
@@ -258,19 +272,49 @@ pub fn write(scene: &Scene, instances: &[InstanceGroup]) -> Vec<u8> {
                     }
                 }
             }
+            parts.push(part);
         }
-        t.0.extend_from_slice(&pool);
-        section(&mut out, TAG_TEXR, 1, &t.0);
+        let len = t.0.len() as u64 + pool_len;
+        out.write_all(&TAG_TEXR)?;
+        out.write_all(&1u32.to_le_bytes())?;
+        out.write_all(&len.to_le_bytes())?;
+        out.write_all(&t.0)?;
+        for (src, off, l) in parts.into_iter().flatten() {
+            out.write_all(&scene.textures.sources[src].read(off, l)?)?;
+        }
+        out.write_all(&[0u8; 8][..((8 - len % 8) % 8) as usize])?;
     }
-    out.0
+
+    // LODS: u32 cluster count, u32 0; per cluster, 44 bytes: u8 level, 3
+    // bytes 0, f32 error, centre and radius of the sphere it is seen from,
+    // then the same three for what replaces it (error infinite: nothing).
+    if lods {
+        let mut l = W(Vec::new());
+        l.u32(scene.clusters.len() as u32);
+        l.u32(0);
+        for c in &scene.clusters {
+            l.u8(c.lod_level);
+            l.u8(0);
+            l.u8(0);
+            l.u8(0);
+            l.f32(c.lod_error);
+            l.v3(c.lod_centre);
+            l.f32(c.lod_radius);
+            l.f32(c.parent_error);
+            l.v3(c.parent_centre);
+            l.f32(c.parent_radius);
+        }
+        section(out, TAG_LODS, 1, &l.0)?;
+    }
+    Ok(())
 }
 
-fn section(out: &mut W, tag: [u8; 4], version: u32, payload: &[u8]) {
-    out.0.extend_from_slice(&tag);
-    out.u32(version);
-    out.u64(payload.len() as u64);
-    out.0.extend_from_slice(payload);
-    out.pad(8);
+fn section(out: &mut impl std::io::Write, tag: [u8; 4], version: u32, payload: &[u8]) -> std::io::Result<()> {
+    out.write_all(&tag)?;
+    out.write_all(&version.to_le_bytes())?;
+    out.write_all(&(payload.len() as u64).to_le_bytes())?;
+    out.write_all(payload)?;
+    out.write_all(&[0u8; 8][..(8 - payload.len() % 8) % 8])
 }
 
 // ---------------------------------------------------------------- decoding
@@ -386,8 +430,8 @@ fn header(b: &[u8]) -> Result<u32, String> {
         return Err("not an .fkj file".into());
     }
     let version = u32::from_le_bytes(b[4..8].try_into().unwrap());
-    if version != VERSION {
-        return Err(format!(".fkj version {version}, this build reads version {VERSION}"));
+    if version != VERSION && version != VERSION_LOD {
+        return Err(format!(".fkj version {version}, this build reads versions {VERSION} and {VERSION_LOD}"));
     }
     Ok(u32::from_le_bytes(b[8..12].try_into().unwrap()))
 }
@@ -408,9 +452,11 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) 
     let mut scene = Scene::new();
     let mut report = ReadReport::default();
     let mut inst_payloads: Vec<&[u8]> = Vec::new();
+    let mut lods: Option<&[u8]> = None;
     for (tag, section_version, payload) in &list {
         match *tag {
             TAG_MESH => read_mesh(payload, &mut scene)?,
+            TAG_LODS => lods = Some(payload),
             TAG_LITE if *section_version == 2 => read_lights(payload, &mut scene)?,
             TAG_LITE => report.skipped.push(format!("LITE version {section_version} (relative units, not lumens)")),
             TAG_INST => inst_payloads.push(payload),
@@ -418,6 +464,9 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) 
         }
     }
     let stored_clusters = scene.clusters.len();
+    if let Some(b) = lods {
+        read_lods(b, &mut scene)?;
+    }
     if let Some((table, source)) = tex {
         let mut r = R { b: &table, at: 16 };
         let n = u32::from_le_bytes(table[0..4].try_into().unwrap()) as usize;
@@ -493,6 +542,7 @@ fn read_mesh(b: &[u8], scene: &mut Scene) -> Result<(), String> {
             radius,
             cone_axis: ax.normalize_or(Vec3::Y),
             cone_cos,
+            ..Default::default()
         });
     }
     scene.normals.reserve(n_verts);
@@ -607,7 +657,34 @@ fn expand_instances(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Resu
                     },
                     ..c
                 });
+                scene.clusters.last_mut().unwrap().move_lod(|p| m.transform_point3(p), scale);
             }
+        }
+    }
+    Ok(())
+}
+
+fn read_lods(b: &[u8], scene: &mut Scene) -> Result<(), String> {
+    let mut r = R { b, at: 0 };
+    let n = r.u32()? as usize;
+    r.u32()?;
+    if n != scene.clusters.len() {
+        return Err(format!("LODS has {n} clusters, MESH has {}", scene.clusters.len()));
+    }
+    if b.len() - r.at < n * 44 {
+        return Err("LODS section is shorter than its count says".into());
+    }
+    for c in &mut scene.clusters {
+        c.lod_level = r.u8()?;
+        r.take(3)?;
+        c.lod_error = r.f32()?;
+        c.lod_centre = r.v3()?;
+        c.lod_radius = r.f32()?;
+        c.parent_error = r.f32()?;
+        c.parent_centre = r.v3()?;
+        c.parent_radius = r.f32()?;
+        if !(c.lod_error >= 0.0) || !(c.parent_error >= c.lod_error) {
+            return Err("LODS: a cluster's error is negative or above what replaces it".into());
         }
     }
     Ok(())
@@ -740,6 +817,28 @@ mod tests {
         assert!(b.lights.is_empty());
         assert_eq!(rep.skipped.len(), 1);
         assert!(rep.skipped[0].starts_with("LITE version 1"));
+    }
+
+    /// A mesh built into levels of detail is written as version 2 and reads
+    /// back with every cluster's level, errors and spheres.
+    #[test]
+    fn levels_of_detail_round_trip() {
+        let (p, idx) = uv_sphere(64);
+        let tris: Vec<[u32; 3]> = idx.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let (lods, _) = crate::lod::build(&p, &tris);
+        let mut a = Scene::new();
+        a.push_lod_mesh(&p, &p, &vec![Vec3::splat(0.5); p.len()], &lods);
+        let bytes = write(&a, &[]);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), VERSION_LOD);
+        let (b, rep) = read(&bytes).unwrap();
+        assert!(rep.skipped.is_empty());
+        assert!(a.clusters.iter().any(|c| c.lod_level > 1));
+        for (x, y) in a.clusters.iter().zip(&b.clusters) {
+            assert_eq!((x.lod_level, x.lod_error, x.lod_centre, x.lod_radius), (y.lod_level, y.lod_error, y.lod_centre, y.lod_radius));
+            assert_eq!((x.parent_error, x.parent_centre, x.parent_radius), (y.parent_error, y.parent_centre, y.parent_radius));
+        }
+        // Without levels, still version 1.
+        assert_eq!(u32::from_le_bytes(write(&sample(), &[])[4..8].try_into().unwrap()), VERSION);
     }
 
     #[test]

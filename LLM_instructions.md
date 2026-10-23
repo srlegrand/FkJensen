@@ -28,7 +28,7 @@ At the start of a session, run these and report each to the person as passed or 
        git push origin main && \
        cargo run --release
 
-   The commands are joined with `&&`: a patch that does not apply is never followed by a commit. The block holds no other commands; deletions travel in the patch. The one exception: when the assistant sends `.fkj` models too large for a patch, the block moves them from `~/Downloads` into `assets/models/` before the commit. `cargo run` comes last so the program can stay open.
+   The commands are joined with `&&`: a patch that does not apply is never followed by a commit. The block holds no other commands; deletions travel in the patch. The exceptions: when the assistant sends `.fkj` models too large for a patch, the block moves them from `~/Downloads` into `assets/models/` before the commit; when a change to `tools/fkj-import` or the format means the models must be imported again, the block builds the importer and runs it on the source files (commands in `README.md`) before the commit. `cargo run` comes last so the program can stay open.
 
    Then the Pi block, also on the desktop, after the local block has pushed. It cross-compiles for the Pi 1 (ARMv6, 32-bit), copies the binary over and runs it there headless, so the output comes back to the desktop terminal:
 

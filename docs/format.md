@@ -8,6 +8,9 @@ first frame needs no preparation. `src/fkj.rs` reads and writes it.
 The four kinds of primitive the format is meant to hold are triangle meshes,
 points (particles), curves (fur, hair) and volumes. Version 1 implements
 meshes; the other three have reserved tags and are skipped by this reader.
+Version 2 is version 1 with a `LODS` section: a mesh built into levels of
+detail. A file with levels is written as version 2 so that a reader that
+does not know them refuses it, rather than drawing every level at once.
 
 ## Layout
 
@@ -15,7 +18,7 @@ Little-endian throughout. A file is a header and a list of sections.
 
     header    16 bytes
       [u8; 4]   "FKJ\0"
-      u32       version, 1
+      u32       version, 1 (2 with LODS)
       u32       number of sections
       u32       0
 
@@ -34,6 +37,7 @@ A reader skips any section whose tag it does not know, using the length.
 | `INST` | extra copies of mesh clusters at other transforms | yes |
 | `LITE` | point lights, lumens (section version 2) | yes; version 1 skipped |
 | `TEXR` | per-triangle texture tiles | yes, streamed from the file |
+| `LODS` | each cluster's level of detail | yes |
 | `PNTS` | points, particles | reserved |
 | `CURV` | curves, fur and hair | reserved |
 | `VOLM` | volumes | reserved |
@@ -133,6 +137,36 @@ seen at, are read.
 An `INST` copy of a cluster uses the same tiles; a mirrored copy keeps
 vertex colours only, since mirroring turns its tiles over.
 
+## LODS
+
+Levels of detail, built by `tools/fkj-import` (`src/lod.rs`): the
+clusters of `MESH` hold every level, the model as made (level 0) and each
+coarser level, about half the triangles of the one below. A cluster records
+its level, its error (how far, in metres, it may stray from the model as
+made) with the sphere that error is seen from, and the same two for the
+clusters that replace it. The renderer draws a cluster when its error,
+seen from the eye, is under the threshold and its replacement's is not:
+one level for each stretch of surface, and no cracks, because the edges
+where levels meet were never moved (Karis, Stubbs, Wihlidal, "Nanite",
+SIGGRAPH 2021).
+
+    u32       cluster count (the MESH section's)
+    u32       0
+    per cluster, 44 bytes
+      u8        level, 0 for the model as made
+      u8 x 3    0
+      f32       error, metres (0 at level 0)
+      f32 x 3   centre of the sphere the error is seen from
+      f32       its radius
+      f32       error of what replaces it, metres; infinite when nothing does
+      f32 x 3   centre of that sphere
+      f32       its radius
+
+A cluster's error is never above its replacement's, and its sphere is
+inside its replacement's, so what is drawn changes steadily with distance.
+Each level has its own texture tiles in `TEXR`. Clusters without `LODS`
+(the ground, the mountains, older files) are always drawn.
+
 ## LITE
 
 Section version 2.
@@ -210,7 +244,11 @@ read; `--texture` gives its base colour.
 - Positions, normals and colours are decoded to f32 at load; the renderer
   does not yet read the quantised data directly, which would cut memory
   traffic per frame.
-- Level of detail: clusters have no coarser levels yet.
+- Levels of detail are all loaded: a small machine cannot yet leave the
+  finest ones in the file.
+- Seams (texture coordinates, normals, separate parts) never move when a
+  level is simplified, so models made of many parts, like the car,
+  simplify little.
 - No compression beyond quantisation; tiles are raw sRGB8.
 - Tiles are one level per cluster: a cluster's largest triangle sets it for
   all of them.

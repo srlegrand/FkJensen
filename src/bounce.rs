@@ -41,6 +41,10 @@ const SMALL_CLUSTER: f32 = 0.15;
 /// Mean triangle area (m²) from which a cluster's receivers are its
 /// vertices.
 const LARGE_TRIANGLE: f32 = 0.01;
+/// The surfel cloud is made from the level of detail whose error is under
+/// this many metres: bounce light is soft, and finer levels would only add
+/// surfels.
+const SURFEL_LOD_ERROR: f32 = 0.02;
 /// Leaf size of the tree.
 const LEAF: usize = 4;
 /// A node is taken whole when its radius over its distance is below this.
@@ -189,7 +193,30 @@ impl Bounce {
             let f = (pb - pa).cross(pc - pa);
             ((pa + pb + pc) / 3.0, f * 0.5, (scene.colors[a] + scene.colors[b] + scene.colors[c]) / 3.0)
         };
+        // Every cluster's surface binned by the axis it faces most: its
+        // receivers, and, for small clusters, its surfels.
+        let bins_of = |c: &crate::scene::Cluster| {
+            let mut bins = [(Vec3::ZERO, Vec3::ZERO, 0f32, Vec3::ZERO); 6];
+            for t in c.first_tri..c.first_tri + c.tri_count {
+                let (cen, an, alb) = tri(t as usize);
+                let area = an.length();
+                if area <= 0.0 {
+                    continue;
+                }
+                let k = facing(an);
+                bins[k].0 += cen * area;
+                bins[k].1 += an;
+                bins[k].2 += area;
+                bins[k].3 += alb * area;
+            }
+            bins
+        };
+        let all_bins: Vec<[(Vec3, Vec3, f32, Vec3); 6]> = scene.clusters.iter().map(bins_of).collect();
         for (ci, c) in scene.clusters.iter().enumerate() {
+            // One level of detail only, or surfaces would be counted twice.
+            if !c.lod_drawn(1.0, |_, _| 1.0 / SURFEL_LOD_ERROR) {
+                continue;
+            }
             if c.radius <= SMALL_CLUSTER {
                 // Bin the cluster's triangles by the axis they face most.
                 let mut bins = [(Vec3::ZERO, Vec3::ZERO, 0f32, Vec3::ZERO); 6];
@@ -233,13 +260,7 @@ impl Bounce {
         }
         // Receivers sit off their surface along its normal by 2% of the
         // cluster's size, at most 2 mm.
-        let mut acc = vec![[(Vec3::ZERO, Vec3::ZERO, 0f32); 6]; scene.clusters.len()];
-        for s in &surfels {
-            let a = &mut acc[s.cluster as usize][facing(s.normal)];
-            a.0 += s.position * s.area;
-            a.1 += s.normal * s.area;
-            a.2 += s.area;
-        }
+        let acc: Vec<[(Vec3, Vec3, f32); 6]> = all_bins.iter().map(|b| b.map(|(p, n, a, _)| (p, n.normalize_or(Vec3::Y) * a, a))).collect();
         // A large cluster (big triangles: a floor, a wall, a table top) gets
         // a receiver at each of its vertices instead, and a pixel blends the
         // three of its triangle, so bounce light varies across the surface.
