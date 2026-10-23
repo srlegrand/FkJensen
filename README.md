@@ -73,7 +73,8 @@ values.
 A map only holds the geometry inside its light's reach: whatever can shadow
 a point the light reaches is nearer the light than that point. Maps are
 kept until their light moves or changes strength. `M` turns them off. The
-sky is not occluded yet.
+sky has no shadow map: what objects take of it is under Sky occlusion,
+below.
 
 **Bounce light.** Point-based colour bleeding (Christensen 2008), no rays
 (`src/bounce.rs`). The surfaces become a cloud of discs (surfels): one per
@@ -83,17 +84,23 @@ through their shadow maps: that lit cloud is the set of micro lights. The
 surfels sit in a tree whose nodes carry summed area, normal and mean
 radiance.
 
-Bounce light is gathered at receivers: one at each vertex of a large
-cluster (a floor, a wall), blended across its triangles, and
-one for each small cluster. A receiver walks the tree nearest first, taking
+Bounce light is gathered at receivers spread evenly over the surfaces,
+whatever their triangles (`src/samples.rs`): 15 cm apart on objects, and
+on the rest (the ground) from 15 cm next to an object growing by a
+quarter of the distance from it, since bounce light changes near things
+and little across open ground; a cluster smaller than its spacing gets
+one. A receiver walks the tree nearest first, taking
 near surfels one by one and far groups as one disc, and lays each onto a
 6 x 8 x 8 cube raster around itself: a small or far disc by its solid
 angle, a large near one by meeting each texel's direction with the disc.
 The raster fills nearest first, so a nearer surface hides what is behind
 it; a surfel seen from behind sends nothing but still hides what is
 beyond, so a receiver under the car does not see through it. The
-raster is folded into order-1 spherical harmonics, from which each pixel
-takes the irradiance for its own normal. One bounce. With bounce on, the
+raster is folded into order-1 spherical harmonics. A pixel blends the
+spherical harmonics of the receivers around its point, each within two of
+its spacings, weighted by distance and facing, and takes the irradiance
+for its own normal from the blend; every second pixel of a row uses its
+left neighbour's blend. One bounce. With bounce on, the
 sky's ground term is left out: the real ground is in the cloud.
 
 Light reach applies here too. A changed light relights only the surfels in
@@ -684,10 +691,10 @@ Painting the interface took about 7 ms a frame at 1920 x 1080 on the same
    the exposure throws it away; the highlight depends on the eye and is
    redone when the camera moves. Shading is two-sided: normals face the
    eye, and a triangle seen from its other side is shaded again.
-5. **Bounce gather** at visible receivers that have none, nearest the
-   camera first, within the time budget.
+5. **Bounce gather** at the receivers around visible clusters that are
+   not current, nearest the camera first, within the time budget.
 6. **Resolve.** Each pixel interpolates the shaded micropolygon under it
-   and adds bounce light from its receivers for its normal. While
+   and adds bounce light blended from the receivers around it. While
    visibility is kept, only pixels of clusters shaded or gathered this
    frame are resolved again; the rest of the picture is kept.
 
@@ -900,10 +907,13 @@ Not measured yet: a Raspberry Pi.
 - Bounce light: one bounce only. A large surfel near a receiver covers its
   raster through a disc enlarged by a third, so that tiled discs leave no
   gaps; the outline of a nearby surface counts a little more light than it
-  should. Small clusters have one receiver, so a cluster that wraps a tight
-  curve gets one set of spherical harmonics for all of it. Gathering is
-  the slowest pass of a first frame.
-- The sky is not occluded.
+  should. The surfels (what bounce comes from) are still one per large
+  triangle or a few per small cluster, so they still follow the mesh;
+  the receivers (where it arrives) no longer do. On the ground, receivers
+  are spread by distance from objects, so a wall or a step that is part
+  of the ground and not an object gets no finer receivers near it.
+  Blending receivers made the resolve of a full frame of the
+  high-resolution set 95 to 229 ms (2 cores).
 - The sun: its shadow cascades are fixed round the subject, not the camera,
   so a close look far from the subject gets coarse sun shadows; its disc is
   drawn larger than the real one so it reads; no moon, no atmosphere or

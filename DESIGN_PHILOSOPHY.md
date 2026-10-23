@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 23/10/2026: bounce receivers spread evenly over the surfaces, whatever their triangles: 15 cm apart on objects, growing with distance from objects on the ground, each pixel blending those around it. Per-vertex and per-cluster receivers are gone. The high-resolution set's first frame went from 4.3 s to 2.7 s on 2 cores (9,371 receivers gathered in 1.4 s, against 5,359 in 2.4 s).
 - 23/10/2026: occlusion between objects, at shading time: other objects' sample discs facing a point take away the sky they hide from it, directionally (Bunnell 2005), within each object's reach; only shaded points look it up. The ground darkens under and round the T-rex.
 - 23/10/2026: sky occlusion precomputed per model at import as order-2 spherical harmonics at its surface samples (precomputed radiance transfer), from a cube raster of the model's own sample discs, no rays; `SAMP` section, `fkj-import --sky` for older files. A sky change is a dot product a sample; a turned model turns its coefficients. Occlusion between objects is not in it yet.
 - 23/10/2026: surface samples: each object covered by points spread evenly in space by dart throwing on its finest level, the same spacing on a large triangle as on a dense sculpt, moved with it. The place for sky occlusion and bounce light to be kept, away from the mesh's topology.

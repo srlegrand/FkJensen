@@ -141,7 +141,7 @@ impl DebugView {
             DebugView::Sun => ("SUN", &["BLUE, GREEN, ORANGE: THE SHADOW CASCADE EACH POINT READS, FINEST FIRST", "DARK: IN THE SUN'S SHADOW; RED: FACES AWAY; GREY: SUN DOWN OR OFF"]),
             DebugView::ShadowMap => ("SHADOW MAP (SELECTED LIGHT)", &["SIX FACES, UNFOLDED; BRIGHTER IS NEARER THE LIGHT", "BLUE: NOTHING THERE WITHIN THE REACH"]),
             DebugView::Surfels => ("SURFELS", &["THE SURFACES AS DISCS, EACH LIT DIRECTLY", "THIS LIT CLOUD IS WHAT BOUNCE LIGHT IS GATHERED FROM"]),
-            DebugView::Receivers => ("BOUNCE RECEIVERS", &["GREEN: GATHERED; RED: WAITING FOR ITS TURN"]),
+            DebugView::Receivers => ("BOUNCE RECEIVERS", &["SPREAD EVENLY, WHATEVER THE TRIANGLES: 15 CM ON OBJECTS, WIDER AWAY FROM THEM", "GREEN: GATHERED; RED: WAITING FOR ITS TURN"]),
             DebugView::Samples => ("SURFACE SAMPLES", &["EACH OBJECT'S SURFACE AS EVEN DISCS, ONE COLOUR EACH, WHATEVER ITS TRIANGLES", "THE SAME SPACING ON A LARGE FLAT TRIANGLE AS ON A DENSE SCULPT"]),
             DebugView::SkyShare => ("SKY SHARE", &["WHITE: ALL OF THE SKY; BLACK: NONE. AN OBJECT'S OWN SHAPE, PRECOMPUTED AT ITS SAMPLES,", "TIMES WHAT OTHER OBJECTS' SAMPLE DISCS HIDE; BLUE: NOTHING TAKES ITS SKY"]),
             DebugView::MicroRaster => ("MICRO-RASTER, X4", &["THE CUBE OF 6 X 8 X 8 TEXELS SEEN BY THE RECEIVER UNDER THE CURSOR", "NEAREST SURFELS FILL IT FIRST; THEN IT FOLDS INTO 4 NUMBERS PER COLOUR"]),
@@ -328,7 +328,7 @@ pub fn draw(view: DebugView, ctx: &Ctx, frame: &mut Frame) {
                     // Full strength for this frame, fading over the next few.
                     let age = |s: u64| if s == 0 { 0.0 } else { (-((now - s.min(now)) as f32) / 1.5).exp() };
                     let r = age(ctx.peek.shaded_in(hh.cluster));
-                    let g = ctx.peek.bounce.map(|b| age(b.stamp[hh.cluster])).unwrap_or(0.0);
+                    let g = ctx.peek.bounce.map(|b| age(b.cluster_stamp[hh.cluster])).unwrap_or(0.0);
                     dim(i, 0.3) * (1.0 - r.max(g)) + rgb(238, 70, 70) * r + rgb(90, 200, 110) * g * (1.0 - r * 0.5)
                 }
                 DebugView::Albedo => albedo(ctx, &hh),
@@ -366,7 +366,7 @@ pub fn draw(view: DebugView, ctx: &Ctx, frame: &mut Frame) {
                 DebugView::Direct => shown(ctx, ctx.peek.radiance(ctx.scene, hh.cluster, hh.tri, hh.w, Part::All)),
                 DebugView::Highlight => shown(ctx, ctx.peek.radiance(ctx.scene, hh.cluster, hh.tri, hh.w, Part::Highlight) * 4.0),
                 DebugView::Bounce => match ctx.peek.bounce {
-                    Some(b) => shown(ctx, albedo(ctx, &hh) * b.irradiance_at(ctx.scene, hh.cluster, hh.tri, hh.w, hh.n) * std::f32::consts::FRAC_1_PI * 4.0),
+                    Some(b) => shown(ctx, albedo(ctx, &hh) * b.irradiance_at(hh.cluster, hh.p, hh.n) * std::f32::consts::FRAC_1_PI * 4.0),
                     None => Vec3::ZERO,
                 },
                 DebugView::LightCount => {
@@ -750,9 +750,9 @@ fn receivers(ctx: &Ctx, frame: &mut Frame) {
     };
     let (w, h) = (frame.width, frame.height);
     let (mut gathered, mut waiting) = (0usize, 0usize);
-    for ci in 0..ctx.scene.clusters.len() {
-        let ok = b.valid[ci];
-        for r in b.receivers_of(ci) {
+    for r in 0..b.receivers.len() {
+        let ok = b.valid[r];
+        {
             let p = b.receivers[r].0;
             let Some((sx, sy, iw)) = raster::project(ctx.cam, w, h, p) else { continue };
             let (x, y) = (sx as i32, sy as i32);
@@ -778,10 +778,10 @@ fn receivers(ctx: &Ctx, frame: &mut Frame) {
     text(frame, 16, h - 12 * u - 8, u, &format!("{gathered} GATHERED, {waiting} WAITING, IN VIEW"), Vec3::splat(0.9));
 }
 
-/// The receiver whose cluster is under (x, y), nearest the point seen.
+/// The receiver nearest the point seen at (x, y).
 fn receiver_at(ctx: &Ctx, frame: &Frame, b: &Bounce, x: usize, y: usize) -> Option<(usize, usize, Vec3)> {
     let hh = hit(ctx, frame, x, y)?;
-    let r = b.receivers_of(hh.cluster).min_by(|a, c| b.receivers[*a].0.distance_squared(hh.p).total_cmp(&b.receivers[*c].0.distance_squared(hh.p)))?;
+    let r = b.near(hh.cluster).iter().map(|&r| r as usize).filter(|&r| b.receivers[r].1.dot(hh.n) > 0.0).min_by(|a, c| b.receivers[*a].0.distance_squared(hh.p).total_cmp(&b.receivers[*c].0.distance_squared(hh.p)))?;
     Some((hh.cluster, r, hh.p))
 }
 
@@ -797,7 +797,8 @@ fn micro_raster(ctx: &Ctx, frame: &mut Frame) {
         return;
     };
     let reach = b.reach(cut(ctx));
-    let (rad, cov) = b.raster(r, ci, reach);
+    let _ = ci;
+    let (rad, cov) = b.raster(r, reach);
     let rp = b.receivers[r].0;
     // Mark the receiver.
     if let Some((sx, sy, _)) = raster::project(ctx.cam, w, h, rp) {
@@ -832,7 +833,7 @@ fn micro_raster(ctx: &Ctx, frame: &mut Frame) {
         }
     });
     // What the folded spherical harmonics give back: a white ball lit by them.
-    let sh = b.gather(r, ci, reach);
+    let sh = b.gather(r, reach);
     let radius = (cell as f32 * 0.42) as i32;
     let (bx, by) = ((x0 + 3 * cell + cell / 2) as i32, (y0 + 2 * cell + cell / 2) as i32);
     let inv_view = ctx.cam.view.inverse();

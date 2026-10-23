@@ -9,8 +9,9 @@
 //!
 //! The surfels sit in a tree whose nodes carry the summed area, the
 //! area-weighted normal and the mean radiance of what is under them. To find
-//! the bounce light arriving at a receiver (one per vertex of a large
-//! cluster, one for a small one), the
+//! the bounce light arriving at a receiver (points spread evenly over the
+//! surfaces, 15 cm apart on objects, wider on open ground; `samples.rs`),
+//! the
 //! tree is walked nearest first: near surfels are taken one by one, far
 //! groups as one disc each. Each is laid onto a tiny cube raster around
 //! the receiver, 6 x 8 x 8 texels: a small or far disc by its solid angle,
@@ -20,8 +21,8 @@
 //! A surfel seen from behind sends nothing but still hides what is beyond
 //! it, so a receiver under the chess board does not see through it. The raster
 //! is then folded into spherical harmonics (order 1, four coefficients per
-//! colour), from which the irradiance for any normal of the cluster comes
-//! cheaply when the pixel is resolved.
+//! colour). A pixel blends the receivers around its point, by distance and
+//! facing, and takes the irradiance for its normal from the blend.
 //!
 //! Light reach applies: nothing farther from a receiver than the reach of
 //! the brightest surfel in the scene is visited, and a light that changes
@@ -40,9 +41,15 @@ use crate::scene::Scene;
 /// A cluster smaller than this (bounding radius, metres) gives a few
 /// surfels binned by facing instead of one per triangle.
 const SMALL_CLUSTER: f32 = 0.15;
-/// Mean triangle area (m²) from which a cluster's receivers are its
-/// vertices.
-const LARGE_TRIANGLE: f32 = 0.01;
+/// Receivers on objects are spread this far apart (metres), whatever their
+/// triangles (`samples.rs`).
+const RECEIVER_SPACING: f32 = 0.15;
+/// Elsewhere (the ground) they grow apart by this share of their distance
+/// from the nearest object: bounce light changes near things, and little
+/// across open ground.
+const RECEIVER_GROWTH: f32 = 0.25;
+/// A receiver's light is blended over this many of its spacings.
+const RECEIVER_REACH: f32 = 2.0;
 /// The surfel cloud is made from the level of detail whose error is under
 /// this many metres: bounce light is soft, and finer levels would only add
 /// surfels.
@@ -97,20 +104,6 @@ pub fn sh_irradiance(sh: &Sh, n: Vec3) -> Vec3 {
 /// How far a receiver sits off its surface, for a cluster of radius `r`.
 fn nudge(r: f32) -> f32 {
     (r * 0.02).min(0.002)
-}
-
-/// Which of the six axis directions `n` is closest to.
-fn facing(n: Vec3) -> usize {
-    let a = n.abs();
-    if a.x >= a.y && a.x >= a.z {
-        if n.x >= 0.0 { 0 } else { 1 }
-    } else if a.y >= a.z {
-        if n.y >= 0.0 { 2 } else { 3 }
-    } else if n.z >= 0.0 {
-        4
-    } else {
-        5
-    }
 }
 
 /// The six cube faces: (axis, right, up).
@@ -177,22 +170,135 @@ pub struct Bounce {
     /// Outgoing radiance of each surfel from direct light, cd/m².
     pub radiance: Vec<Vec3>,
     nodes: Vec<Node>,
-    /// Receivers, cluster by cluster: position and mean normal.
+    /// Receivers: position (just off the surface) and normal.
     pub receivers: Vec<(Vec3, Vec3)>,
-    /// Cluster `c`'s receivers are `first_receiver[c]..first_receiver[c + 1]`.
-    pub first_receiver: Vec<u32>,
-    /// Whether a cluster's receivers are its vertices (else one per facing).
-    per_vertex: Vec<bool>,
-    /// For vertices of such clusters, their receiver.
-    vertex_receiver: Vec<u32>,
+    /// Per receiver: how far its light is blended, and the cluster it lies
+    /// on.
+    pub receiver_radius: Vec<f32>,
+    owner: Vec<u32>,
+    /// A tree over the receivers' reach, to find those around a cluster.
+    rnodes: Vec<RNode>,
+    rorder: Vec<u32>,
+    /// Receivers by the cells their reach meets, a grid per power of two
+    /// of reach (`levels`), to find those around a point.
+    grid: CellTable,
+    levels: Vec<i32>,
+    /// Per cluster: the receivers whose reach meets it, found when it is
+    /// first seen (`prepare`).
+    near: Vec<Option<Box<[u32]>>>,
+    /// Per cluster: which of `levels` its near receivers are at, a bit each.
+    near_levels: Vec<u64>,
+    /// Per receiver: its grid level's place in `levels`.
+    level_of: Vec<u8>,
     /// Bounding radius of each cluster.
     cluster_size: Vec<f32>,
     /// Bounce light at each receiver.
     pub sh: Vec<Sh>,
-    /// Per cluster: whether its receivers are current, and the frame they
-    /// were last gathered in.
+    /// Per receiver: whether it is current, and the frame it was last
+    /// gathered in (0: never).
     pub valid: Vec<bool>,
     pub stamp: Vec<u64>,
+    /// Per cluster: the frame its bounce light last changed.
+    pub cluster_stamp: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RNode {
+    centre: Vec3,
+    /// Holds every receiver's reach below.
+    radius: f32,
+    a: u32,
+    b: u32,
+    leaf: bool,
+}
+
+/// A cell of side 2^l.
+#[inline]
+fn cell_of(p: Vec3, l: i32) -> [i32; 3] {
+    let s = (-l as f32).exp2();
+    [(p.x * s).floor() as i32, (p.y * s).floor() as i32, (p.z * s).floor() as i32]
+}
+
+#[inline]
+fn grid_key(l: i32, c: [i32; 3]) -> u64 {
+    let f = |v: i32| (v + (1 << 18)) as u64 & 0x7_ffff;
+    ((l + 64) as u64 & 0x7f) << 57 | f(c[0]) | f(c[1]) << 19 | f(c[2]) << 38
+}
+
+/// Lists of receivers by key, in an open-addressed table.
+#[derive(Default)]
+struct CellTable {
+    table: Vec<(u64, u32, u32)>,
+    items: Vec<u32>,
+}
+
+impl CellTable {
+    fn new(mut entries: Vec<(u64, u32)>) -> CellTable {
+        entries.sort_unstable();
+        let mut runs: Vec<(u64, u32, u32)> = Vec::new();
+        for (at, &(k, _)) in entries.iter().enumerate() {
+            match runs.last_mut() {
+                Some(r) if r.0 == k => r.2 += 1,
+                _ => runs.push((k, at as u32, 1)),
+            }
+        }
+        let cap = (runs.len() * 2).next_power_of_two().max(16);
+        let mut table = vec![(u64::MAX, 0, 0); cap];
+        for r in runs {
+            let mut h = (r.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as usize & (cap - 1);
+            while table[h].0 != u64::MAX {
+                h = (h + 1) & (cap - 1);
+            }
+            table[h] = r;
+        }
+        CellTable { table, items: entries.into_iter().map(|e| e.1).collect() }
+    }
+
+    #[inline]
+    fn run(&self, key: u64) -> &[u32] {
+        let cap = self.table.len();
+        if cap == 0 {
+            return &[];
+        }
+        let mut h = (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as usize & (cap - 1);
+        loop {
+            let (k, a, n) = self.table[h];
+            if k == key {
+                return &self.items[a as usize..(a + n) as usize];
+            }
+            if k == u64::MAX {
+                return &[];
+            }
+            h = (h + 1) & (cap - 1);
+        }
+    }
+}
+
+fn build_rtree(order: &mut [u32], lo: usize, hi: usize, pos: &[(Vec3, Vec3)], reach: &[f32], nodes: &mut Vec<RNode>) -> u32 {
+    let idx = nodes.len() as u32;
+    nodes.push(RNode::default());
+    let (mut bmin, mut bmax) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+    for &r in &order[lo..hi] {
+        bmin = bmin.min(pos[r as usize].0);
+        bmax = bmax.max(pos[r as usize].0);
+    }
+    let centre = (bmin + bmax) * 0.5;
+    let radius = order[lo..hi].iter().map(|&r| pos[r as usize].0.distance(centre) + reach[r as usize]).fold(0.0, f32::max);
+    let mut node = RNode { centre, radius, ..Default::default() };
+    if hi - lo <= LEAF * 2 {
+        node.leaf = true;
+        node.a = lo as u32;
+        node.b = (hi - lo) as u32;
+    } else {
+        let ext = bmax - bmin;
+        let axis = if ext.x >= ext.y && ext.x >= ext.z { 0 } else if ext.y >= ext.z { 1 } else { 2 };
+        let mid = (lo + hi) / 2;
+        order[lo..hi].select_nth_unstable_by(mid - lo, |a, b| pos[*a as usize].0[axis].total_cmp(&pos[*b as usize].0[axis]));
+        node.a = build_rtree(order, lo, mid, pos, reach, nodes);
+        node.b = build_rtree(order, mid, hi, pos, reach, nodes);
+    }
+    nodes[idx as usize] = node;
+    idx
 }
 
 impl Bounce {
@@ -204,25 +310,6 @@ impl Bounce {
             let f = (pb - pa).cross(pc - pa);
             ((pa + pb + pc) / 3.0, f * 0.5, (scene.color(a) + scene.color(b) + scene.color(c)) / 3.0)
         };
-        // Every cluster's surface binned by the axis it faces most: its
-        // receivers, and, for small clusters, its surfels.
-        let bins_of = |c: &crate::scene::Cluster| {
-            let mut bins = [(Vec3::ZERO, Vec3::ZERO, 0f32, Vec3::ZERO); 6];
-            for t in c.first_tri..c.first_tri + c.tri_count {
-                let (cen, an, alb) = tri(c, t as usize);
-                let area = an.length();
-                if area <= 0.0 {
-                    continue;
-                }
-                let k = facing(an);
-                bins[k].0 += cen * area;
-                bins[k].1 += an;
-                bins[k].2 += area;
-                bins[k].3 += alb * area;
-            }
-            bins
-        };
-        let all_bins: Vec<[(Vec3, Vec3, f32, Vec3); 6]> = scene.clusters.iter().map(bins_of).collect();
         for (ci, c) in scene.clusters.iter().enumerate() {
             // One level of detail only, or surfaces would be counted twice.
             if !c.lod_drawn(1.0, |_, _| 1.0 / SURFEL_LOD_ERROR) {
@@ -269,62 +356,124 @@ impl Bounce {
                 }
             }
         }
-        // Receivers sit off their surface along its normal by 2% of the
-        // cluster's size, at most 2 mm.
-        let acc: Vec<[(Vec3, Vec3, f32); 6]> = all_bins.iter().map(|b| b.map(|(p, n, a, _)| (p, n.normalize_or(Vec3::Y) * a, a))).collect();
-        // A large cluster (big triangles: a floor, a wall, a table top) gets
-        // a receiver at each of its vertices instead, and a pixel blends the
-        // three of its triangle, so bounce light varies across the surface.
-        let mut receivers: Vec<(Vec3, Vec3)> = Vec::new();
-        let mut first_receiver = Vec::with_capacity(scene.clusters.len() + 1);
-        let mut per_vertex = Vec::with_capacity(scene.clusters.len());
-        let mut vertex_receiver = vec![u32::MAX; scene.vertex_count()];
-        for (bins, c) in acc.iter().zip(&scene.clusters) {
-            first_receiver.push(receivers.len() as u32);
-            // Large triangles (a floor, a wall, a table top) get a receiver
-            // per vertex; a cluster of small ones (a model) gets one.
-            let area: f32 = (c.first_tri..c.first_tri + c.tri_count)
-                .map(|t| {
-                    let [a, b, cc] = scene.tri_pos(c, t);
-                    (b - a).cross(cc - a).length() * 0.5
-                })
-                .sum::<f32>()
-                / c.tri_count.max(1) as f32;
-            let big = c.radius > SMALL_CLUSTER && area >= LARGE_TRIANGLE;
-            per_vertex.push(big);
-            if big {
-                // Vertices that share a position and normal (the corners of
-                // neighbouring quads) share a receiver.
-                let start = receivers.len();
-                for v in c.first_vertex..c.first_vertex + c.vertex_count {
-                    let n = scene.normal(v as usize);
-                    let p = scene.pos(c, v as usize) + n * nudge(c.radius);
-                    let found = (start..receivers.len()).find(|&r| receivers[r].0 == p && receivers[r].1 == n);
-                    vertex_receiver[v as usize] = match found {
-                        Some(r) => r as u32,
-                        None => {
-                            receivers.push((p, n));
-                            (receivers.len() - 1) as u32
-                        }
-                    };
+        // Receivers, spread evenly over the surfaces at the surfels' level
+        // of detail, whatever their triangles: RECEIVER_SPACING apart on
+        // objects; on the rest, wider with distance from the nearest
+        // object.
+        let at_lod = |c: &crate::scene::Cluster| c.lod_drawn(1.0, |_, _| 1.0 / SURFEL_LOD_ERROR);
+        let mut object_of = vec![u32::MAX; scene.clusters.len()];
+        let mut spheres: Vec<(Vec3, f32)> = Vec::new();
+        for (i, o) in scene.objects.iter().enumerate() {
+            if o.clusters.is_empty() {
+                continue;
+            }
+            object_of[o.clusters.clone()].fill(i as u32);
+            spheres.push(((o.lo + o.hi) * 0.5, (o.hi - o.lo).length() * 0.5));
+        }
+        let tris_of = |cs: &[usize]| -> Vec<(u32, u32)> { cs.iter().flat_map(|&c| (scene.clusters[c].first_tri..scene.clusters[c].first_tri + scene.clusters[c].tri_count).map(move |t| (c as u32, t))).collect() };
+        let spread = |cs: &[usize], h: f32| -> Vec<(Vec3, Vec3, f32, u32)> {
+            let tris = tris_of(cs);
+            let get = |k: usize| {
+                let (ci, t) = tris[k];
+                let c = &scene.clusters[ci as usize];
+                let v = scene.tri(c, t);
+                (ci, v.map(|v| scene.pos(c, v)), v.map(|v| scene.normal(v)))
+            };
+            let area: f32 = (0..tris.len()).map(|k| crate::samples::tri_area(get(k).1)).sum();
+            let mut out: Vec<(Vec3, Vec3, f32, u32)> = crate::samples::scatter(tris.len(), get, area, h).into_iter().map(|s| (s.position, s.normal, h, s.cluster)).collect();
+            if out.is_empty() && area > 0.0 {
+                // Smaller than one spacing: one receiver in its middle.
+                let (mut p, mut n) = (Vec3::ZERO, Vec3::ZERO);
+                for k in 0..tris.len() {
+                    let (_, q, m) = get(k);
+                    let a = crate::samples::tri_area(q);
+                    p += (q[0] + q[1] + q[2]) / 3.0 * a;
+                    n += (m[0] + m[1] + m[2]) * a;
                 }
-            } else {
-                // A small cluster: one receiver at the centre of its surfels.
-                // Its spherical harmonics hold every direction, so the
-                // surface's own curve picks the right light at each pixel.
-                let (mut p, mut n, mut a) = (Vec3::ZERO, Vec3::ZERO, 0.0);
-                for (bp, bn, ba) in bins {
-                    p += *bp;
-                    n += *bn;
-                    a += *ba;
-                }
-                if a > 0.0 {
-                    let n = n.normalize_or(Vec3::Y);
-                    receivers.push((p / a + n * nudge(c.radius), n));
+                out.push((p / area, n.normalize_or(Vec3::Y), h, cs[0] as u32));
+            }
+            out
+        };
+        let mut recv: Vec<(Vec3, Vec3, f32, u32)> = Vec::new();
+        for o in &scene.objects {
+            let cs: Vec<usize> = o.clusters.clone().filter(|&c| at_lod(&scene.clusters[c])).collect();
+            if !cs.is_empty() {
+                recv.extend(spread(&cs, RECEIVER_SPACING));
+            }
+        }
+        {
+            // The rest (the ground): spacing grows with distance from the
+            // nearest object, whatever the triangles.
+            let rest: Vec<usize> = (0..scene.clusters.len()).filter(|&c| object_of[c] == u32::MAX && at_lod(&scene.clusters[c])).collect();
+            let tris = tris_of(&rest);
+            let get = |k: usize| {
+                let (ci, t) = tris[k];
+                let c = &scene.clusters[ci as usize];
+                let v = scene.tri(c, t);
+                (ci, v.map(|v| scene.pos(c, v)), v.map(|v| scene.normal(v)))
+            };
+            let h = |p: Vec3| {
+                let d = spheres.iter().map(|(sc, sr)| (p.distance(*sc) - sr).max(0.0)).fold(f32::INFINITY, f32::min);
+                let d = if d.is_finite() { d } else { p.length() };
+                RECEIVER_SPACING + RECEIVER_GROWTH * d
+            };
+            let spread = crate::samples::scatter_varying(tris.len(), get, h);
+            // A cluster smaller than its spacing may get none: it gets one
+            // in its middle, so that nothing goes without bounce light.
+            let mut has = vec![false; scene.clusters.len()];
+            for r in &spread {
+                has[r.3 as usize] = true;
+            }
+            recv.extend(spread);
+            for &ci in &rest {
+                if !has[ci] {
+                    let c = &scene.clusters[ci];
+                    let (mut p, mut n, mut a) = (Vec3::ZERO, Vec3::ZERO, 0.0);
+                    for t in c.first_tri..c.first_tri + c.tri_count {
+                        let q = scene.tri_pos(c, t);
+                        let ar = crate::samples::tri_area(q);
+                        p += (q[0] + q[1] + q[2]) / 3.0 * ar;
+                        n += (q[1] - q[0]).cross(q[2] - q[0]);
+                        a += ar;
+                    }
+                    if a > 0.0 {
+                        recv.push((p / a, n.normalize_or(Vec3::Y), h(p / a).min(c.radius.max(RECEIVER_SPACING)), ci as u32));
+                    }
                 }
             }
         }
-        first_receiver.push(receivers.len() as u32);
+        let receivers: Vec<(Vec3, Vec3)> = recv.iter().map(|&(p, n, _, c)| (p + n * nudge(scene.clusters[c as usize].radius), n)).collect();
+        let receiver_radius: Vec<f32> = recv.iter().map(|r| r.2 * RECEIVER_REACH).collect();
+        let owner: Vec<u32> = recv.iter().map(|r| r.3).collect();
+        // Each receiver in the cells its reach meets, at the scale of its
+        // reach: at most four cells a side.
+        let mut entries: Vec<(u64, u32)> = Vec::new();
+        let mut levels: Vec<i32> = Vec::new();
+        for (r, (p, _)) in receivers.iter().enumerate() {
+            let rr = receiver_radius[r].max(1e-4);
+            // Cells half the reach: fewer receivers to try a point.
+            let l = rr.log2().ceil() as i32 - 1;
+            if !levels.contains(&l) {
+                levels.push(l);
+            }
+            let (a, b) = (cell_of(*p - Vec3::splat(rr), l), cell_of(*p + Vec3::splat(rr), l));
+            for z in a[2]..=b[2] {
+                for y in a[1]..=b[1] {
+                    for x in a[0]..=b[0] {
+                        entries.push((grid_key(l, [x, y, z]), r as u32));
+                    }
+                }
+            }
+        }
+        levels.sort_unstable();
+        let level_of: Vec<u8> = receiver_radius.iter().map(|&rr| levels.iter().position(|&l| l == rr.max(1e-4).log2().ceil() as i32 - 1).unwrap_or(0) as u8).collect();
+        let grid = CellTable::new(entries);
+        let mut rorder: Vec<u32> = (0..receivers.len() as u32).collect();
+        let mut rnodes = Vec::with_capacity(receivers.len() / LEAF + 1);
+        if !receivers.is_empty() {
+            let n = rorder.len();
+            build_rtree(&mut rorder, 0, n, &receivers, &receiver_radius, &mut rnodes);
+        }
 
         let mut nodes = Vec::with_capacity(surfels.len() / LEAF * 2 + 1);
         let n = surfels.len();
@@ -333,46 +482,131 @@ impl Bounce {
         let k = scene.clusters.len();
         let nr = receivers.len();
         let cluster_size = scene.clusters.iter().map(|c| c.radius).collect();
-        Bounce { surfels, radiance, nodes, receivers, first_receiver, per_vertex, vertex_receiver, cluster_size, sh: vec![[Vec3::ZERO; 4]; nr], valid: vec![false; k], stamp: vec![0; k] }
-    }
-
-    pub fn receivers_of(&self, ci: usize) -> std::ops::Range<usize> {
-        self.first_receiver[ci] as usize..self.first_receiver[ci + 1] as usize
-    }
-
-    /// Bounce irradiance at a point of triangle `tri` of cluster `ci` with
-    /// weights `w` over its vertices, facing `n`: blended from the
-    /// triangle's vertex receivers, or from the cluster's receiver whose
-    /// facing is closest.
-    pub fn irradiance_at(&self, scene: &Scene, ci: usize, tri: u32, w: [f32; 3], n: Vec3) -> Vec3 {
-        if self.per_vertex[ci] {
-            let vs = scene.tri(&scene.clusters[ci], tri);
-            let mut e = Vec3::ZERO;
-            for k in 0..3 {
-                let r = self.vertex_receiver[vs[k]] as usize;
-                e += sh_irradiance(&self.sh[r], n) * w[k];
-            }
-            return e;
+        Bounce {
+            surfels,
+            radiance,
+            nodes,
+            receivers,
+            receiver_radius,
+            owner,
+            rnodes,
+            rorder,
+            grid,
+            levels,
+            level_of,
+            near: vec![None; k],
+            near_levels: vec![0; k],
+            cluster_size,
+            sh: vec![[Vec3::ZERO; 4]; nr],
+            valid: vec![false; nr],
+            stamp: vec![0; nr],
+            cluster_stamp: vec![0; k],
         }
-        self.irradiance(ci, n)
     }
 
-    /// Bounce irradiance on a surface of cluster `ci` facing `n`, from the
-    /// receiver of that cluster whose facing is closest.
-    pub fn irradiance(&self, ci: usize, n: Vec3) -> Vec3 {
+    /// Find, for each of `clusters` not yet done, the receivers whose
+    /// reach meets it.
+    pub fn prepare(&mut self, scene: &Scene, clusters: &[u32]) {
+        use rayon::prelude::*;
+        let todo: Vec<u32> = clusters.iter().copied().filter(|&c| self.near[c as usize].is_none()).collect();
+        let found: Vec<(u32, Box<[u32]>)> = todo
+            .par_iter()
+            .map(|&ci| {
+                let c = &scene.clusters[ci as usize];
+                let mut out = Vec::new();
+                if !self.rnodes.is_empty() {
+                    let mut stack = vec![0u32];
+                    while let Some(i) = stack.pop() {
+                        let nd = &self.rnodes[i as usize];
+                        if nd.centre.distance(c.centre) > nd.radius + c.radius {
+                            continue;
+                        }
+                        if nd.leaf {
+                            for &r in &self.rorder[nd.a as usize..(nd.a + nd.b) as usize] {
+                                if self.receivers[r as usize].0.distance(c.centre) <= self.receiver_radius[r as usize] + c.radius {
+                                    out.push(r);
+                                }
+                            }
+                        } else {
+                            stack.push(nd.a);
+                            stack.push(nd.b);
+                        }
+                    }
+                }
+                (ci, out.into_boxed_slice())
+            })
+            .collect();
+        for (c, list) in found {
+            self.near_levels[c as usize] = list.iter().fold(0u64, |m, &r| m | 1u64 << self.level_of[r as usize].min(63));
+            self.near[c as usize] = Some(list);
+        }
+    }
+
+    /// The receivers around cluster `ci` (empty until `prepare`).
+    pub fn near(&self, ci: usize) -> &[u32] {
+        self.near.get(ci).and_then(|n| n.as_deref()).unwrap_or(&[])
+    }
+
+    /// Bounce irradiance at `p` facing `n` on cluster `ci`: the receivers
+    /// around it that have been gathered, weighted by distance within
+    /// their reach and by facing, their spherical harmonics blended.
+    pub fn irradiance_at(&self, ci: usize, p: Vec3, n: Vec3) -> Vec3 {
+        sh_irradiance(&self.blend(ci, p, n), n)
+    }
+
+    /// The blended spherical harmonics behind `irradiance_at`, to be used
+    /// again for a neighbouring point.
+    pub fn blend(&self, ci: usize, p: Vec3, n: Vec3) -> Sh {
+        let mut sh = [Vec3::ZERO; 4];
+        let mut ws = 0f32;
         let mut best: Option<(f32, usize)> = None;
-        for r in self.receivers_of(ci) {
-            let d = self.receivers[r].1.dot(n);
-            if best.is_none_or(|(bd, _)| d > bd) {
-                best = Some((d, r));
+        let mut take = |r: usize| {
+            if self.stamp[r] == 0 {
+                return;
+            }
+            let (rp, rn) = self.receivers[r];
+            let f = rn.dot(n);
+            if f <= 0.0 {
+                return;
+            }
+            let d2 = rp.distance_squared(p);
+            let rr = self.receiver_radius[r];
+            if d2 >= rr * rr {
+                if best.is_none_or(|(bd, _)| d2 < bd) {
+                    best = Some((d2, r));
+                }
+                return;
+            }
+            let a = 1.0 - d2 / (rr * rr);
+            let w = a * a * f;
+            for k in 0..4 {
+                sh[k] += self.sh[r][k] * w;
+            }
+            ws += w;
+        };
+        let near = self.near(ci);
+        if near.len() <= 24 {
+            for &r in near {
+                take(r as usize);
+            }
+        } else {
+            // Many around: only those whose reach meets the cell the point
+            // is in, at each scale of reach.
+            let mut m = self.near_levels[ci];
+            while m != 0 {
+                let l = self.levels[m.trailing_zeros() as usize];
+                m &= m - 1;
+                let c = cell_of(p, l);
+                for &r in self.grid.run(grid_key(l, c)) {
+                    take(r as usize);
+                }
             }
         }
-        best.map(|(_, r)| sh_irradiance(&self.sh[r], n)).unwrap_or(Vec3::ZERO)
-    }
-
-    /// Gather bounce light at every receiver of cluster `ci`.
-    pub fn gather_cluster(&self, ci: usize, reach: f32) -> Vec<Sh> {
-        self.receivers_of(ci).map(|r| self.gather(r, ci, reach)).collect()
+        if ws > 0.0 {
+            sh.map(|v| v / ws)
+        } else {
+            best.map(|(_, r)| self.sh[r]).unwrap_or([Vec3::ZERO; 4])
+        }
     }
 
     /// Recompute node radiance sums after surfel radiance changed.
@@ -405,9 +639,9 @@ impl Bounce {
         (m / cut.max(1e-12)).sqrt()
     }
 
-    /// Bounce light arriving at receiver `r` of cluster `ci`.
-    pub fn gather(&self, r: usize, ci: usize, reach: f32) -> Sh {
-        let (rad, cov) = self.raster(r, ci, reach);
+    /// Bounce light arriving at receiver `r`.
+    pub fn gather(&self, r: usize, reach: f32) -> Sh {
+        let (rad, cov) = self.raster(r, reach);
         let tex = texels();
         let mut sh = [Vec3::ZERO; 4];
         for (t, (dir, om)) in tex.iter().enumerate() {
@@ -427,8 +661,9 @@ impl Bounce {
     /// The receiver's cube raster before it is folded: radiance and
     /// coverage per texel, faces in the order of `FACES` (+X, -X, +Y, -Y,
     /// +Z, -Z), each `MICRO` x `MICRO`, rows from the face's lower edge.
-    pub fn raster(&self, r: usize, ci: usize, reach: f32) -> ([Vec3; 6 * MICRO * MICRO], [f32; 6 * MICRO * MICRO]) {
+    pub fn raster(&self, r: usize, reach: f32) -> ([Vec3; 6 * MICRO * MICRO], [f32; 6 * MICRO * MICRO]) {
         let x = self.receivers[r].0;
+        let ci = self.owner[r] as usize;
         let own_size = self.cluster_size[ci].min(0.05);
         let nudge = nudge(self.cluster_size[ci]);
         let tex = texels();
@@ -679,8 +914,7 @@ mod tests {
         let floor: Vec<usize> = (0..b.receivers.len()).filter(|&r| b.receivers[r].0.y < 0.1 && b.receivers[r].1.y > 0.9 && b.receivers[r].0.x > -1.5).collect();
         assert!(!floor.is_empty());
         for &r in &floor {
-            let ci = (0..s.clusters.len()).find(|&c| b.receivers_of(c).contains(&r)).unwrap();
-            let e = sh_irradiance(&b.gather(r, ci, 100.0), Vec3::Y);
+            let e = sh_irradiance(&b.gather(r, 100.0), Vec3::Y);
             assert!(e.x > 0.5, "floor receiver {r} at {} gets {e}", b.receivers[r].0);
             assert!(e.x > e.y * 5.0, "red: {e}");
         }
@@ -696,15 +930,18 @@ mod tests {
             b2.radiance[i] = if red { Vec3::new(10.0, 0.5, 0.5) } else { Vec3::ZERO };
         }
         b2.refit();
-        let patch = (0..s2.clusters.len()).find(|&c| b2.receivers[b2.receivers_of(c).start].0.x > 1.5).unwrap();
-        let e = b2.irradiance(patch, Vec3::Y);
-        let mut b2 = b2;
-        let sh = b2.gather_cluster(patch, 100.0);
-        for (k, r) in b2.receivers_of(patch).enumerate() {
-            b2.sh[r] = sh[k];
-        }
+        let patch = (0..s2.clusters.len()).find(|&c| s2.clusters[c].centre.x > 1.5).unwrap();
+        b2.prepare(&s2, &[patch as u32]);
+        let at = s2.clusters[patch].centre;
+        let e = b2.irradiance_at(patch, at, Vec3::Y);
         assert_eq!(e, Vec3::ZERO, "nothing gathered yet");
-        let e = b2.irradiance(patch, Vec3::Y);
+        let mine: Vec<u32> = b2.near(patch).to_vec();
+        assert!(!mine.is_empty());
+        for r in mine {
+            b2.sh[r as usize] = b2.gather(r as usize, 100.0);
+            b2.stamp[r as usize] = 1;
+        }
+        let e = b2.irradiance_at(patch, at, Vec3::Y);
         assert!(e.x < 0.05, "the dark wall hides the red one: {e}");
     }
 
@@ -723,9 +960,10 @@ mod tests {
         let cut = 0.1;
         let r = b.reach(cut);
         assert!(r < 400.0, "{r}");
-        let far = (0..s.clusters.len()).find(|&c| b.receivers[b.receivers_of(c).start].0.z < -400.0).unwrap();
-        for sh in b.gather_cluster(far, r) {
-            assert_eq!(sh_irradiance(&sh, Vec3::Z), Vec3::ZERO);
+        let far: Vec<usize> = (0..b.receivers.len()).filter(|&k| b.receivers[k].0.z < -400.0).collect();
+        assert!(!far.is_empty());
+        for k in far {
+            assert_eq!(sh_irradiance(&b.gather(k, r), Vec3::Z), Vec3::ZERO);
         }
     }
 
@@ -741,13 +979,40 @@ mod tests {
             b.radiance[i] = if b.surfels[i].position.y < 0.5 { Vec3::ONE } else { Vec3::ZERO };
         }
         b.refit();
-        let ci = (0..s.clusters.len()).find(|&c| b.receivers[b.receivers_of(c).start].0.y > 0.9).unwrap();
-        // The receiver of the card's face that looks down.
-        let r = b.receivers_of(ci).find(|&r| b.receivers[r].1.y < -0.9).unwrap();
-        let e = sh_irradiance(&b.gather(r, ci, 1000.0), -Vec3::Y).x;
+        // A receiver of the card, whose face looks down.
+        let r = (0..b.receivers.len()).find(|&r| b.receivers[r].0.y > 0.9 && b.receivers[r].1.y < -0.9).unwrap();
+        let e = sh_irradiance(&b.gather(r, 1000.0), -Vec3::Y).x;
         assert!((e / std::f32::consts::PI - 1.0).abs() < 0.15, "{e}");
         // And facing up, it gets almost nothing from below.
-        let up = sh_irradiance(&b.gather(r, ci, 1000.0), Vec3::Y).x;
+        let up = sh_irradiance(&b.gather(r, 1000.0), Vec3::Y).x;
         assert!(up < 0.35, "{up}");
+    }
+
+    /// Receivers follow area, not triangles: an object made of two
+    /// triangles gets them 15 cm apart, as one of thousands does; ground
+    /// that is no object gets them closer near an object than far from it.
+    #[test]
+    fn receivers_are_spread_by_area_not_triangles() {
+        let count_on = |n: usize| {
+            let mut s = Scene::new();
+            quad(&mut s, Vec3::new(0.0, 1.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -1.0), Vec3::splat(0.5), n);
+            let k = s.clusters.len();
+            s.add_object("card".into(), 0..k, Vec3::ZERO, Vec3::ZERO);
+            Bounce::new(&s).receivers.len()
+        };
+        let (coarse, fine) = (count_on(1), count_on(40));
+        assert!(coarse > 60, "{coarse}");
+        assert!((coarse as f32 / fine as f32 - 1.0).abs() < 0.1, "{coarse} on 2 triangles, {fine} on 3,200");
+        // Ground of 20 m quads round a small object at the origin.
+        let mut s = Scene::new();
+        quad(&mut s, Vec3::ZERO, Vec3::new(60.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -60.0), Vec3::splat(0.5), 6);
+        let first = s.clusters.len();
+        quad(&mut s, Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.3, 0.0, 0.0), Vec3::new(0.0, 0.0, -0.3), Vec3::splat(0.5), 1);
+        let k = s.clusters.len();
+        s.add_object("box".into(), first..k, Vec3::ZERO, Vec3::ZERO);
+        let b = Bounce::new(&s);
+        let ground = |lo: f32, hi: f32| (0..b.receivers.len()).filter(|&r| b.receivers[r].0.y < 0.1 && { let d = b.receivers[r].0.length(); d >= lo && d < hi }).count() as f32 / (std::f32::consts::PI * (hi * hi - lo * lo));
+        let (near, far) = (ground(0.0, 8.0), ground(40.0, 55.0));
+        assert!(near > far * 4.0, "{near} per m² near, {far} far");
     }
 }

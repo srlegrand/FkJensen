@@ -122,6 +122,57 @@ pub fn scatter(count: usize, tri: impl Fn(usize) -> (u32, [Vec3; 3], [Vec3; 3]) 
     out
 }
 
+/// Spread points over `count` triangles with a spacing that varies over
+/// space, `h(p)` metres at p: each triangle is cut in four until its
+/// pieces are no longer than three spacings, and each piece gets points at
+/// random in proportion to its area over the spacing squared, as many as
+/// dart throwing leaves. Not a Poisson disk (pieces do not see each
+/// other's points), but as even on a large triangle as on many small ones.
+/// Returns (position, normal, spacing, cluster).
+pub fn scatter_varying(count: usize, tri: impl Fn(usize) -> (u32, [Vec3; 3], [Vec3; 3]) + Sync, h: impl Fn(Vec3) -> f32 + Sync) -> Vec<(Vec3, Vec3, f32, u32)> {
+    use rayon::prelude::*;
+    // Points per square spacing that dart throwing reaches.
+    const FILL: f32 = 0.55;
+    (0..count)
+        .into_par_iter()
+        .with_min_len(256)
+        .flat_map_iter(|i| {
+            let (cluster, p, n) = tri(i);
+            let face = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or(Vec3::Y);
+            let mut out = Vec::new();
+            // Pieces as barycentric corners of the triangle.
+            let mut stack: Vec<([Vec3; 3], u32)> = vec![([Vec3::X, Vec3::Y, Vec3::Z], 0)];
+            let mut k = 0u64;
+            let at = |b: Vec3| p[0] * b.x + p[1] * b.y + p[2] * b.z;
+            while let Some((b, depth)) = stack.pop() {
+                let q = b.map(at);
+                let c = (q[0] + q[1] + q[2]) / 3.0;
+                let hc = h(c).max(1e-4);
+                let long = (q[1] - q[0]).length().max((q[2] - q[1]).length()).max((q[0] - q[2]).length());
+                if long > 3.0 * hc && depth < 16 {
+                    let m = [(b[0] + b[1]) * 0.5, (b[1] + b[2]) * 0.5, (b[2] + b[0]) * 0.5];
+                    stack.push(([b[0], m[0], m[2]], depth + 1));
+                    stack.push(([m[0], b[1], m[1]], depth + 1));
+                    stack.push(([m[2], m[1], b[2]], depth + 1));
+                    stack.push(([m[0], m[1], m[2]], depth + 1));
+                    continue;
+                }
+                let e = tri_area(q) * FILL / (hc * hc);
+                k += 1;
+                let m = e.floor() as u64 + (rand(i as u64 ^ (k << 32), 7) < e.fract()) as u64;
+                for j in 0..m {
+                    let (r1, r2) = (rand(i as u64 ^ (k << 32), 2 * j + 11).sqrt(), rand(i as u64 ^ (k << 32), 2 * j + 12));
+                    let w = b[0] * (1.0 - r1) + b[1] * (r1 * (1.0 - r2)) + b[2] * (r1 * r2);
+                    let pos = at(w);
+                    let nrm = (n[0] * w.x + n[1] * w.y + n[2] * w.z).normalize_or(face);
+                    out.push((pos, nrm, hc, cluster));
+                }
+            }
+            out.into_iter()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

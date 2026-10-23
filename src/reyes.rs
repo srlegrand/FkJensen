@@ -481,7 +481,7 @@ impl Renderer {
     /// gathered.
     #[cfg(test)]
     pub fn bounce_stamps(&self) -> Option<&[u64]> {
-        self.bounce.as_ref().map(|b| &b.stamp[..])
+        self.bounce.as_ref().map(|b| &b.cluster_stamp[..])
     }
 
     #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
@@ -762,9 +762,10 @@ impl Renderer {
                 if all {
                     b.valid.iter_mut().for_each(|v| *v = false);
                 } else {
-                    for (ci, c) in scene.clusters.iter().enumerate() {
-                        if spheres.iter().any(|(p, r)| p.distance(c.centre) <= c.radius + r + bounce_reach) {
-                            b.valid[ci] = false;
+                    for (r, v) in b.valid.iter_mut().enumerate() {
+                        let p = b.receivers[r].0;
+                        if spheres.iter().any(|(c, rr)| c.distance(p) <= rr + bounce_reach) {
+                            *v = false;
                         }
                     }
                 }
@@ -1253,26 +1254,35 @@ impl Renderer {
         if settings.bounce && settings.view == View::Shaded {
             let b = self.bounce.as_mut().expect("made above");
             let bounce_reach = b.reach(cut);
-            let mut todo: Vec<u32> = self.visible.iter().copied().filter(|&c| !b.valid[c as usize]).collect();
-            todo.sort_by(|a, c| scene.clusters[*a as usize].centre.distance_squared(eye).total_cmp(&scene.clusters[*c as usize].centre.distance_squared(eye)));
+            // The receivers around what is visible that are not current.
+            b.prepare(scene, &self.visible);
+            let mut todo: Vec<u32> = self.visible.iter().flat_map(|&c| b.near(c as usize).iter().copied()).filter(|&r| !b.valid[r as usize]).collect();
+            todo.sort_unstable();
+            todo.dedup();
+            todo.sort_by(|a, c| b.receivers[*a as usize].0.distance_squared(eye).total_cmp(&b.receivers[*c as usize].0.distance_squared(eye)));
             let mut done = 0;
-            for batch in todo.chunks(32) {
+            for batch in todo.chunks(64) {
                 if let Some(ms) = settings.bounce_budget_ms {
                     if tg.elapsed().as_secs_f32() * 1000.0 > ms {
                         break;
                     }
                 }
                 let bref = &*b;
-                let results: Vec<(u32, Vec<bounce::Sh>)> = batch.par_iter().map(|&c| (c, bref.gather_cluster(c as usize, bounce_reach))).collect();
-                for (c, shs) in results {
-                    let first = b.first_receiver[c as usize] as usize;
-                    for (k, sh) in shs.into_iter().enumerate() {
-                        b.sh[first + k] = sh;
-                    }
-                    b.valid[c as usize] = true;
-                    b.stamp[c as usize] = frame_no;
+                let results: Vec<(u32, bounce::Sh)> = batch.par_iter().map(|&r| (r, bref.gather(r as usize, bounce_reach))).collect();
+                for (r, sh) in results {
+                    b.sh[r as usize] = sh;
+                    b.valid[r as usize] = true;
+                    b.stamp[r as usize] = frame_no;
                 }
                 done += batch.len();
+            }
+            // Clusters whose bounce light changed are resolved again.
+            if done > 0 {
+                for &c in &self.visible {
+                    if b.near(c as usize).iter().any(|&r| b.stamp[r as usize] == frame_no) {
+                        b.cluster_stamp[c as usize] = frame_no;
+                    }
+                }
             }
             frame.stats.receivers_updated = done;
             frame.stats.receivers_pending = todo.len() - done;
@@ -1300,9 +1310,13 @@ impl Renderer {
         let setups = &frame.setups;
         let bounce = if settings.bounce { self.bounce.as_ref() } else { None };
         self.base.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+            // The bounce blend of the pixel to the left, used again by
+            // every second pixel of the same cluster: bounce light changes
+            // slowly, and blending is the dearest part of a pixel.
+            let mut last: Option<(usize, u32, bounce::Sh)> = None;
             for x in 0..width {
                 let id = tri_id[y * width + x];
-                let changed = |c: usize| cache[c].stamp == frame_no || bounce.is_some_and(|b| b.stamp[c] == frame_no);
+                let changed = |c: usize| cache[c].stamp == frame_no || bounce.is_some_and(|b| b.cluster_stamp[c] == frame_no);
                 if !full_resolve && (id == NO_TRI || !changed(setups[id as usize].cluster as usize)) {
                     // Nothing under this pixel changed: keep it.
                     continue;
@@ -1339,7 +1353,15 @@ impl Renderer {
                         n = -n;
                     }
                     let albedo = scene.color(i0) * w[0] + scene.color(i1) * w[1] + scene.color(i2) * w[2];
-                    radiance += albedo * b.irradiance_at(scene, s.cluster as usize, s.tri, w, n) * std::f32::consts::FRAC_1_PI;
+                    let sh = match last {
+                        Some((lx, lc, sh)) if x % 2 == 1 && lx + 1 == x && lc == s.cluster => sh,
+                        _ => {
+                            let sh = b.blend(s.cluster as usize, p, n);
+                            last = Some((x, s.cluster, sh));
+                            sh
+                        }
+                    };
+                    radiance += albedo * bounce::sh_irradiance(&sh, n) * std::f32::consts::FRAC_1_PI;
                 }
                 row[x] = raster::pack(raster::tonemap(radiance * exposure));
             }
