@@ -964,7 +964,7 @@ pub fn unproject(frame: &Frame, scene: &Scene, x: usize, y: usize) -> Option<(Ve
     let c = &scene.clusters[s.cluster as usize];
     let [i0, i1, i2] = scene.tri(c, s.tri);
     let p = scene.pos(c, i0) * w0 + scene.pos(c, i1) * w1 + scene.pos(c, i2) * w2;
-    let n = (scene.normal(i0) * w0 + scene.normal(i1) * w1 + scene.normal(i2) * w2).normalize_or(Vec3::Y);
+    let n = (scene.normal(c, i0) * w0 + scene.normal(c, i1) * w1 + scene.normal(c, i2) * w2).normalize_or(Vec3::Y);
     Some((p, n))
 }
 

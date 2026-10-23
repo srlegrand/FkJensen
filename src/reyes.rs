@@ -982,7 +982,7 @@ impl Renderer {
                         bits &= bits - 1;
                         let v = fv + u;
                         let side = if e.vback & (1u128 << u) != 0 { -1.0 } else { 1.0 };
-                        batch.push(scene.pos(c, v), scene.normal(v) * side, scene.color(v));
+                        batch.push(scene.pos(c, v), scene.normal(c, v) * side, scene.color(v));
                         vdest.push(u);
                     }
                     let mut bits = tbits;
@@ -997,7 +997,7 @@ impl Renderer {
                         gdest.push((d.offset as usize, (nu + 1) * (nv + 1)));
                         dims.push((nu, nv));
                         let (s0, su, sv) = d.screen_affine();
-                        let (n0, n1, n2) = (scene.normal(i0), scene.normal(i1), scene.normal(i2));
+                        let (n0, n1, n2) = (scene.normal(c, i0), scene.normal(c, i1), scene.normal(c, i2));
                         let (c0, c1, c2) = (scene.color(i0), scene.color(i1), scene.color(i2));
                         // Eight points of a row at a time.
                         use crate::simd::F;
@@ -1051,7 +1051,7 @@ impl Renderer {
                         let u = bits.trailing_zeros() as usize;
                         bits &= bits - 1;
                         let v = fv + u;
-                        let back = scene.normal(v).dot(eye - scene.pos(c, v)) < 0.0;
+                        let back = scene.normal(c, v).dot(eye - scene.pos(c, v)) < 0.0;
                         let bit = 1u128 << u;
                         if e.vdone & bit == 0 || ((e.vback & bit != 0) != back) {
                             vdiff |= bit;
@@ -1065,7 +1065,7 @@ impl Renderer {
                         bits &= bits - 1;
                         let [i0, i1, i2] = scene.tri(c, c.first_tri + u as u32);
                         let (p0, p1, p2) = (scene.pos(c, i0), scene.pos(c, i1), scene.pos(c, i2));
-                        let fnrm = scene.normal(i0) + scene.normal(i1) + scene.normal(i2);
+                        let fnrm = scene.normal(c, i0) + scene.normal(c, i1) + scene.normal(c, i2);
                         let back = fnrm.dot(eye - (p0 + p1 + p2) / 3.0) < 0.0;
                         let bit = 1u128 << u;
                         if e.done & bit == 0 || ((e.back & bit != 0) != back) {
@@ -1348,7 +1348,7 @@ impl Renderer {
                     // with the normal turned to the eye.
                     let [i0, i1, i2] = scene.tri(c, s.tri);
                     let p = scene.pos(c, i0) * w[0] + scene.pos(c, i1) * w[1] + scene.pos(c, i2) * w[2];
-                    let mut n = (scene.normal(i0) * w[0] + scene.normal(i1) * w[1] + scene.normal(i2) * w[2]).normalize_or(Vec3::Y);
+                    let mut n = (scene.normal(c, i0) * w[0] + scene.normal(c, i1) * w[1] + scene.normal(c, i2) * w[2]).normalize_or(Vec3::Y);
                     if n.dot(eye - p) < 0.0 {
                         n = -n;
                     }

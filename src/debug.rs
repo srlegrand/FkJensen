@@ -192,7 +192,7 @@ fn hit(ctx: &Ctx, frame: &Frame, x: usize, y: usize) -> Option<Hit> {
     let c = &sc.clusters[s.cluster as usize];
     let [i0, i1, i2] = sc.tri(c, s.tri);
     let p = sc.pos(c, i0) * w[0] + sc.pos(c, i1) * w[1] + sc.pos(c, i2) * w[2];
-    let mut n = (sc.normal(i0) * w[0] + sc.normal(i1) * w[1] + sc.normal(i2) * w[2]).normalize_or(Vec3::Y);
+    let mut n = (sc.normal(c, i0) * w[0] + sc.normal(c, i1) * w[1] + sc.normal(c, i2) * w[2]).normalize_or(Vec3::Y);
     if n.dot(ctx.cam.eye - p) < 0.0 {
         n = -n;
     }

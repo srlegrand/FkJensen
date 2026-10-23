@@ -373,8 +373,12 @@ impl App {
         // The selection and its manipulator.
         let k = self.render_scale.max(0.25);
         if let Selection::Object(i) = self.selection {
-            let (lo, hi) = self.scene.object_bounds(i);
-            manip::draw_box(&mut self.frame, &cam, lo, hi, Vec3::new(0.35, 0.95, 0.55));
+            // Each box turns with its object; a group shows those under it.
+            for j in std::iter::once(i).chain(self.scene.descendants(i)) {
+                if !self.scene.objects[j].clusters.is_empty() {
+                    manip::draw_corners(&mut self.frame, &cam, &self.scene.objects[j].corners(), Vec3::new(0.35, 0.95, 0.55));
+                }
+            }
         }
         if let Some((pivot, tool)) = self.gizmo() {
             let hot = self.manip.as_ref().map(|m| m.handle).or(self.hot);

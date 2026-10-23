@@ -119,9 +119,12 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
     m.u32(0);
     m.v3(scene.bounds_min);
     m.v3(scene.bounds_max);
-    // Geometry is held as the file stores it (`scene.rs`): written as is.
-    for c in &scene.clusters {
-        let (lo, step) = (c.qlo, c.qstep);
+    // Geometry is held as the file stores it (`scene.rs`) and written as
+    // is, except that of objects moved by their transform: it is written
+    // where it now stands, quantised in its new box.
+    let world = |c: &Cluster| -> Vec<Vec3> { scene.cluster_pos(c).collect() };
+    let boxes: Vec<(Vec3, Vec3)> = scene.clusters.iter().map(|c| if c.in_place() { (c.qlo, c.qstep) } else { crate::scene::quant_box(&world(c)) }).collect();
+    for (c, &(lo, step)) in scene.clusters.iter().zip(&boxes) {
         m.u32(c.first_vertex);
         m.u16(c.vertex_count as u16);
         m.u16(c.tri_count as u16);
@@ -140,7 +143,14 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
         // The 8-bit axis can be off by about 0.6 degrees: widen the cone.
         m.f32(if c.cone_cos > 0.0 { (c.cone_cos.acos() + 0.012).cos() } else { -1.0 });
     }
-    for e in &scene.qnrm {
+    // Normals, turned with their object.
+    let mut nrm: Vec<[u16; 2]> = scene.qnrm.clone();
+    for c in scene.clusters.iter().filter(|c| c.turned) {
+        for v in c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize {
+            nrm[v] = oct_encode(scene.normal(c, v));
+        }
+    }
+    for e in &nrm {
         m.u16(e[0]);
         m.u16(e[1]);
     }
@@ -148,10 +158,18 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
         m.0.extend_from_slice(c);
         m.u8(255);
     }
-    for c in &scene.clusters {
-        for q in &scene.qpos[c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize] {
-            for v in q {
-                m.u16(*v);
+    for (c, &(lo, step)) in scene.clusters.iter().zip(&boxes) {
+        if c.in_place() {
+            for q in &scene.qpos[c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize] {
+                for v in q {
+                    m.u16(*v);
+                }
+            }
+        } else {
+            for p in world(c) {
+                for v in crate::scene::quantise(p, lo, step) {
+                    m.u16(v);
+                }
             }
         }
     }
@@ -551,10 +569,9 @@ fn read_mesh(b: &[u8], scene: &mut Scene) -> Result<(), String> {
             radius,
             cone_axis: ax.normalize_or(Vec3::Y),
             cone_cos,
-            qlo: lo,
-            qstep: step,
             ..Default::default()
         });
+        scene.clusters.last_mut().unwrap().set_quant(lo, step);
     }
     // Held as stored: copied, not decoded.
     scene.qnrm.reserve(n_verts);
@@ -666,7 +683,7 @@ fn expand_instances(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Resu
                 let ps: Vec<Vec3> = scene.cluster_pos(&c).map(|p| m.transform_point3(p)).collect();
                 let (qlo, qstep) = crate::scene::quant_box(&ps);
                 for (v, p) in vr.clone().zip(&ps) {
-                    let nn = nm.transform_vector3(scene.normal(v)).normalize_or(Vec3::Y);
+                    let nn = nm.transform_vector3(scene.normal(&c, v)).normalize_or(Vec3::Y);
                     let col = scene.qcol[v];
                     scene.qpos.push(crate::scene::quantise(*p, qlo, qstep));
                     scene.qnrm.push(oct_encode(nn));
@@ -704,11 +721,10 @@ fn expand_instances(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Resu
                     } else {
                         -1.0
                     },
-                    qlo,
-                    qstep,
                     ..c
                 });
                 let last = scene.clusters.last_mut().unwrap();
+                last.set_quant(qlo, qstep);
                 last.move_lod(|p| m.transform_point3(p), scale);
                 // Hold the copy's quantised positions.
                 let r = ps.iter().map(|p| crate::scene::dequantise(crate::scene::quantise(*p, qlo, qstep), qlo, qstep).distance(last.centre)).fold(0.0, f32::max);
@@ -739,7 +755,7 @@ fn read_objects(b: &[u8], version: u32, scene: &mut Scene, stored_clusters: usiz
             return Err("OBJS refers past the stored clusters or objects".into());
         }
         let clusters = if count == 0 { scene.clusters.len()..scene.clusters.len() } else { first..first + count };
-        objects.push(crate::scene::Object { name, clusters, pivot, rotation, scale: if scale > 0.0 { scale } else { 1.0 }, lo: pivot, hi: pivot, parent: parent.checked_sub(1) });
+        objects.push(crate::scene::Object::new(name, clusters, pivot, rotation, if scale > 0.0 { scale } else { 1.0 }, parent.checked_sub(1)));
     }
     scene.objects = objects;
     // A parent chain that loops (a damaged file) is cut at the top.

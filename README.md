@@ -548,19 +548,26 @@ a yellow ring, and a dashed line drops from it to the ground with a dot
 where it lands. A disc goes dim when it is behind geometry. Clicking a disc
 selects the light and starts dragging it. A rig holds 64 lights at most.
 
-Selecting and moving work as in Maya. Clicking a model selects it (a box
-round it, its manipulator at its pivot, the middle of its base): W shows
+Selecting and moving work as in Maya. Clicking a model selects it (its
+box, turned and scaled with it, its manipulator at its pivot, the middle
+of its base): W shows
 arrows along X, Y and Z and a square that moves it facing the camera, E a
 ring about each axis (world axes), R a uniform scale (a model scales the
 same on every axis, and a turn never mirrors it, so its texture tiles stay
 valid). A ring follows the pointer in its own plane, or round the pivot
 on screen when it is seen nearly edge on. Q hides the manipulator. A light selected with the move
-manipulator gets the arrows too. While a model is dragged its vertices are
-rewritten, its shading dropped, everything else lit again and the shadow
-maps made again each frame; bounce light is made again when it is let go.
-With the high-resolution T-rex, a drag frame took 1.2 to 1.5 s on 2 cores
-of the Xeon (23/10/2026), most of it the four shadow maps, and the release
-frame 2.2 s. On KDE, Alt and the left button move windows by default; set
+manipulator gets the arrows too. Each object has a transform, from its
+geometry as stored to where it stands: moving it changes the transform
+and its clusters' bounds, never its vertices, which are read through the
+transform (`Scene::pos`, `Scene::normal`). Saving writes it where it
+stands. While a model is dragged its shading is dropped, what is in its
+shadows and its reach is lit again and the shadow maps are drawn again
+where it was and is; bounce light is made again when it is let go. With
+the high-resolution T-rex on 2 cores of the Xeon (23/10/2026), moving it
+went from 880 to 980 ms (every vertex of every level rewritten) to 18 to
+20 ms, and a drag frame is 870 to 1,010 ms, all of it rendering: shadow
+maps 150 to 170 ms, visibility 130 to 170 ms, shading 240 to 340 ms, the
+resolve 180 to 210 ms. On KDE, Alt and the left button move windows by default; set
 the window manager's modifier to Meta for Alt to tumble here.
 
 ![Dragging a lamp on the earlier set (20/10/2026): the shadows follow](docs/light_drag.png)

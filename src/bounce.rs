@@ -377,7 +377,7 @@ impl Bounce {
                 let (ci, t) = tris[k];
                 let c = &scene.clusters[ci as usize];
                 let v = scene.tri(c, t);
-                (ci, v.map(|v| scene.pos(c, v)), v.map(|v| scene.normal(v)))
+                (ci, v.map(|v| scene.pos(c, v)), v.map(|v| scene.normal(c, v)))
             };
             let area: f32 = (0..tris.len()).map(|k| crate::samples::tri_area(get(k).1)).sum();
             let mut out: Vec<(Vec3, Vec3, f32, u32)> = crate::samples::scatter(tris.len(), get, area, h).into_iter().map(|s| (s.position, s.normal, h, s.cluster)).collect();
@@ -410,7 +410,7 @@ impl Bounce {
                 let (ci, t) = tris[k];
                 let c = &scene.clusters[ci as usize];
                 let v = scene.tri(c, t);
-                (ci, v.map(|v| scene.pos(c, v)), v.map(|v| scene.normal(v)))
+                (ci, v.map(|v| scene.pos(c, v)), v.map(|v| scene.normal(c, v)))
             };
             let h = |p: Vec3| {
                 let d = spheres.iter().map(|(sc, sr)| (p.distance(*sc) - sr).max(0.0)).fold(f32::INFINITY, f32::min);

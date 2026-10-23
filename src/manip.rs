@@ -197,11 +197,11 @@ fn square(frame: &mut Frame, cam: &Camera, p: Vec3, half: f32, col: Vec3, outlin
     }
 }
 
-/// Draw the twelve edges of a box.
-pub fn draw_box(frame: &mut Frame, cam: &Camera, lo: Vec3, hi: Vec3, col: Vec3) {
-    let c = |i: usize| Vec3::new(if i & 1 == 0 { lo.x } else { hi.x }, if i & 2 == 0 { lo.y } else { hi.y }, if i & 4 == 0 { lo.z } else { hi.z });
+/// Draw the twelve edges of a box given by its corners, corner i at the
+/// high end of x, y, z where bits 0, 1, 2 of i are set (`Object::corners`).
+pub fn draw_corners(frame: &mut Frame, cam: &Camera, c: &[Vec3; 8], col: Vec3) {
     for (a, b) in [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)] {
-        raster::draw_line(frame, cam, c(a), c(b), col, false);
+        raster::draw_line(frame, cam, c[a], c[b], col, false);
     }
 }
 

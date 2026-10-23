@@ -146,9 +146,17 @@ pub struct Cluster {
     pub parent_error: f32,
     pub parent_centre: Vec3,
     pub parent_radius: f32,
-    /// Its vertices' quantisation box: a position is `qlo + q * qstep`.
+    /// Its vertices' quantisation box, as stored: a stored position is
+    /// `qlo + q * qstep`.
     pub qlo: Vec3,
     pub qstep: Vec3,
+    /// From a quantised position to the world: the box, then its object's
+    /// transform (`Object::xf`). Moving an object changes this, not its
+    /// vertices.
+    pub xf: glam::Affine3A,
+    /// Its object's rotation, for normals, and whether it has one.
+    pub turn: glam::Quat,
+    pub turned: bool,
 }
 
 impl Default for Cluster {
@@ -171,11 +179,28 @@ impl Default for Cluster {
             parent_radius: 0.0,
             qlo: Vec3::ZERO,
             qstep: Vec3::ZERO,
+            xf: glam::Affine3A::IDENTITY,
+            turn: glam::Quat::IDENTITY,
+            turned: false,
         }
     }
 }
 
 impl Cluster {
+    /// Set its quantisation box, with no object transform.
+    pub fn set_quant(&mut self, lo: Vec3, step: Vec3) {
+        self.qlo = lo;
+        self.qstep = step;
+        self.xf = glam::Affine3A::from_scale_rotation_translation(step, glam::Quat::IDENTITY, lo);
+        self.turn = glam::Quat::IDENTITY;
+        self.turned = false;
+    }
+
+    /// Whether its vertices are where they are stored (no object transform).
+    pub fn in_place(&self) -> bool {
+        !self.turned && self.xf == glam::Affine3A::from_scale_rotation_translation(self.qstep, glam::Quat::IDENTITY, self.qlo)
+    }
+
     /// Whether this cluster is the one to draw for a view in which an error
     /// of one metre at a sphere looks `scale(centre, radius)` units big
     /// (pixels, texels), when errors up to `threshold` units may show: its
@@ -259,11 +284,32 @@ pub struct Object {
     /// order (Maya's xyz), and uniform scale since placed.
     pub rotation: Vec3,
     pub scale: f32,
-    /// Bounds of its finest level's vertices.
+    /// Bounds of its finest level's vertices, in the world (round its
+    /// oriented box).
     pub lo: Vec3,
     pub hi: Vec3,
+    /// From its geometry as stored to the world. Its vertices are never
+    /// rewritten when it moves: this changes.
+    pub xf: glam::Affine3A,
+    /// Bounds of its finest level as stored: with `xf`, its oriented box.
+    pub box_lo: Vec3,
+    pub box_hi: Vec3,
     /// The group it is in, if any (an index into `Scene::objects`).
     pub parent: Option<usize>,
+}
+
+impl Object {
+    /// A new object of clusters `clusters` whose geometry is stored where it
+    /// stands.
+    pub fn new(name: String, clusters: std::ops::Range<usize>, pivot: Vec3, rotation: Vec3, scale: f32, parent: Option<usize>) -> Object {
+        Object { name, clusters, pivot, rotation, scale, lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent }
+    }
+
+    /// The eight corners of its oriented box, in the world.
+    pub fn corners(&self) -> [Vec3; 8] {
+        let (a, b) = (self.box_lo, self.box_hi);
+        std::array::from_fn(|i| self.xf.transform_point3(Vec3::new(if i & 1 == 0 { a.x } else { b.x }, if i & 2 == 0 { a.y } else { b.y }, if i & 4 == 0 { a.z } else { b.z })))
+    }
 }
 
 /// The rotation of Euler angles `r` (radians), X first, then Y, then Z.
@@ -308,12 +354,15 @@ impl Scene {
     /// Position of vertex `v` of cluster `c`.
     #[inline]
     pub fn pos(&self, c: &Cluster, v: usize) -> Vec3 {
-        dequantise(self.qpos[v], c.qlo, c.qstep)
+        let q = self.qpos[v];
+        c.xf.transform_point3(Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32))
     }
 
+    /// Normal of vertex `v` of cluster `c`.
     #[inline]
-    pub fn normal(&self, v: usize) -> Vec3 {
-        oct_decode(self.qnrm[v])
+    pub fn normal(&self, c: &Cluster, v: usize) -> Vec3 {
+        let n = oct_decode(self.qnrm[v]);
+        if c.turned { c.turn * n } else { n }
     }
 
     /// Linear RGB albedo.
@@ -340,7 +389,7 @@ impl Scene {
     /// Cluster `c`'s vertex positions, in order.
     #[inline]
     pub fn cluster_pos<'a>(&'a self, c: &'a Cluster) -> impl Iterator<Item = Vec3> + 'a {
-        self.qpos[c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize].iter().map(|q| dequantise(*q, c.qlo, c.qstep))
+        self.qpos[c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize].iter().map(|q| c.xf.transform_point3(Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32)))
     }
 
     /// Every vertex position, decoded, in order (for tests and tools).
@@ -356,7 +405,13 @@ impl Scene {
 
     /// Every normal, decoded, in order.
     pub fn normals(&self) -> Vec<Vec3> {
-        (0..self.qnrm.len()).map(|v| self.normal(v)).collect()
+        let mut out = vec![Vec3::Y; self.qnrm.len()];
+        for c in &self.clusters {
+            for v in c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize {
+                out[v] = self.normal(c, v);
+            }
+        }
+        out
     }
 
     /// Every colour, decoded, in order.
@@ -383,7 +438,7 @@ impl Scene {
         let qpos = &self.qpos;
         self.clusters[range].par_iter_mut().for_each(|c| {
             let fv = c.first_vertex as usize;
-            let r = qpos[fv..fv + c.vertex_count as usize].iter().map(|q| dequantise(*q, c.qlo, c.qstep).distance(c.centre)).fold(0.0, f32::max);
+            let r = qpos[fv..fv + c.vertex_count as usize].iter().map(|q| c.xf.transform_point3(Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32)).distance(c.centre)).fold(0.0, f32::max);
             c.radius = c.radius.max(r);
         });
     }
@@ -398,9 +453,17 @@ impl Scene {
     }
 
     /// Move every vertex of clusters `range` by `f` and turn every normal
-    /// by `q`, quantising each cluster again in its new box.
+    /// by `q`, quantising each cluster again in its new box: the result is
+    /// stored where it stands (any object transform baked in). For whole
+    /// scenes at load; objects move by their transform instead.
     pub fn map_vertices(&mut self, range: std::ops::Range<usize>, f: impl Fn(Vec3) -> Vec3 + Sync, q: Option<glam::Quat>) {
         use rayon::prelude::*;
+        // Normals of turned clusters take their turn too.
+        let turns: Vec<(std::ops::Range<usize>, glam::Quat)> = self.clusters[range.clone()]
+            .iter()
+            .filter(|c| c.turned || q.is_some())
+            .map(|c| (c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize, q.unwrap_or(glam::Quat::IDENTITY) * c.turn))
+            .collect();
         let (Some(first), Some(last)) = (self.clusters.get(range.start).copied(), range.end.checked_sub(1).and_then(|e| self.clusters.get(e)).copied()) else { return };
         let fv = first.first_vertex as usize;
         let end = (last.first_vertex + last.vertex_count) as usize;
@@ -417,16 +480,18 @@ impl Scene {
             at = (c.first_vertex + c.vertex_count) as usize;
         }
         self.clusters[range].par_iter_mut().zip(pos_runs).for_each(|(c, run)| {
-            let ps: Vec<Vec3> = run.iter().map(|q| f(dequantise(*q, c.qlo, c.qstep))).collect();
+            let ps: Vec<Vec3> = run.iter().map(|q| f(c.xf.transform_point3(Vec3::new(q[0] as f32, q[1] as f32, q[2] as f32)))).collect();
             let (lo, step) = quant_box(&ps);
             for (q, p) in run.iter_mut().zip(&ps) {
                 *q = quantise(*p, lo, step);
             }
-            c.qlo = lo;
-            c.qstep = step;
+            c.set_quant(lo, step);
         });
-        if let Some(q) = q {
-            self.qnrm[fv..end].par_iter_mut().for_each(|n| *n = oct_encode(q * oct_decode(*n)));
+        let _ = (fv, end);
+        for (r, t) in turns {
+            for n in &mut self.qnrm[r] {
+                *n = oct_encode(t * oct_decode(*n));
+            }
         }
     }
 
@@ -558,7 +623,7 @@ impl Scene {
             let (ci, t) = tris[k];
             let c = &self.clusters[ci as usize];
             let v = self.tri(c, t);
-            (ci, v.map(|v| self.pos(c, v)), v.map(|v| self.normal(v)))
+            (ci, v.map(|v| self.pos(c, v)), v.map(|v| self.normal(c, v)))
         };
         let area: f32 = {
             use rayon::prelude::*;
@@ -586,7 +651,7 @@ impl Scene {
     /// Make clusters `clusters` an object turning about `pivot`, already
     /// turned by `rotation` (Euler angles, radians).
     pub fn add_object(&mut self, name: String, clusters: std::ops::Range<usize>, pivot: Vec3, rotation: Vec3) -> usize {
-        self.objects.push(Object { name, clusters, pivot, rotation, scale: 1.0, lo: Vec3::ZERO, hi: Vec3::ZERO, parent: None });
+        self.objects.push(Object::new(name, clusters, pivot, rotation, 1.0, None));
         let i = self.objects.len() - 1;
         self.refresh_bounds(i);
         i
@@ -595,7 +660,7 @@ impl Scene {
     /// Make an empty group at `pivot`.
     pub fn add_group(&mut self, name: String, pivot: Vec3) -> usize {
         let n = self.clusters.len();
-        self.objects.push(Object { name, clusters: n..n, pivot, rotation: Vec3::ZERO, scale: 1.0, lo: pivot, hi: pivot, parent: None });
+        self.objects.push(Object::new(name, n..n, pivot, Vec3::ZERO, 1.0, None));
         self.objects.len() - 1
     }
 
@@ -639,7 +704,8 @@ impl Scene {
         std::iter::once(i).chain(self.descendants(i)).map(|j| self.objects[j].clusters.clone()).filter(|r| !r.is_empty()).collect()
     }
 
-    /// Measure an object's bounds again from its finest level's vertices.
+    /// Measure an object's box again from its finest level's vertices,
+    /// as stored, and its bounds in the world from it.
     pub fn refresh_bounds(&mut self, i: usize) {
         use rayon::prelude::*;
         let range = self.objects[i].clusters.clone();
@@ -647,8 +713,11 @@ impl Scene {
             let p = self.objects[i].pivot;
             self.objects[i].lo = p;
             self.objects[i].hi = p;
+            self.objects[i].box_lo = p;
+            self.objects[i].box_hi = p;
             return;
         }
+        let back = self.objects[i].xf.inverse();
         let finest = self.clusters[range.clone()].iter().map(|c| c.lod_level).min().unwrap_or(0);
         let (lo, hi) = self.clusters[range]
             .par_iter()
@@ -656,12 +725,30 @@ impl Scene {
             .map(|c| {
                 let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
                 for p in self.cluster_pos(c) {
+                    let p = back.transform_point3(p);
                     lo = lo.min(p);
                     hi = hi.max(p);
                 }
                 (lo, hi)
             })
             .reduce(|| (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |a, b| (a.0.min(b.0), a.1.max(b.1)));
+        self.objects[i].box_lo = lo;
+        self.objects[i].box_hi = hi;
+        self.world_bounds(i);
+    }
+
+    /// An object's bounds in the world, round its oriented box.
+    fn world_bounds(&mut self, i: usize) {
+        let o = &self.objects[i];
+        if o.clusters.is_empty() {
+            let p = o.pivot;
+            self.objects[i].lo = p;
+            self.objects[i].hi = p;
+            return;
+        }
+        let cs = o.corners();
+        let lo = cs.iter().fold(Vec3::INFINITY, |a, p| a.min(*p));
+        let hi = cs.iter().fold(Vec3::NEG_INFINITY, |a, p| a.max(*p));
         self.objects[i].lo = lo;
         self.objects[i].hi = hi;
     }
@@ -715,17 +802,27 @@ impl Scene {
             ob.pivot = pivot;
             ob.rotation = rotation;
             ob.scale = scale;
-            self.refresh_bounds(i);
+            self.world_bounds(i);
             return;
         }
-        self.map_vertices(o.clusters.clone(), map, Some(q));
-        for c in &mut self.clusters[o.clusters.clone()] {
-            c.centre = map(c.centre);
-            c.radius *= k;
-            c.cone_axis = q * c.cone_axis;
-            c.move_lod(map, k);
+        // The vertices stay as stored; the object's transform and its
+        // clusters' bounds move.
+        let d = glam::Affine3A::from_translation(pivot) * glam::Affine3A::from_scale_rotation_translation(Vec3::splat(k), q, Vec3::ZERO) * glam::Affine3A::from_translation(-o.pivot);
+        {
+            use rayon::prelude::*;
+            self.clusters[o.clusters.clone()].par_iter_mut().for_each(|c| {
+                c.xf = d * c.xf;
+                c.turn = (q * c.turn).normalize();
+                c.turned = true;
+                c.centre = map(c.centre);
+                // A hair wider: the bounds move by arithmetic, not by
+                // measuring the vertices again.
+                c.radius = c.radius * k * (1.0 + 1e-5) + 1e-6;
+                c.cone_axis = q * c.cone_axis;
+                c.move_lod(map, k);
+            });
         }
-        self.fit_spheres(o.clusters.clone());
+        self.objects[i].xf = d * o.xf;
         let r = self.samples_in(o.clusters.clone());
         for s in &mut self.samples[r] {
             s.position = map(s.position);
@@ -737,7 +834,7 @@ impl Scene {
         ob.pivot = pivot;
         ob.rotation = rotation;
         ob.scale = scale;
-        self.refresh_bounds(i);
+        self.world_bounds(i);
         let (lo, hi) = (self.objects[i].lo, self.objects[i].hi);
         self.bounds_min = self.bounds_min.min(lo);
         self.bounds_max = self.bounds_max.max(hi);
@@ -787,10 +884,9 @@ impl Scene {
                 vertex_count: c.vertices.len() as u32,
                 first_tri,
                 tri_count: c.local_tris.len() as u32,
-                qlo,
-                qstep,
                 ..Default::default()
             };
+            cl.set_quant(qlo, qstep);
             self.finish_cluster(&mut cl);
             self.clusters.push(cl);
         }
@@ -825,8 +921,6 @@ impl Scene {
                 vertex_count: verts.len() as u32,
                 first_tri,
                 tri_count: lc.tris.len() as u32,
-                qlo,
-                qstep,
                 lod_level: lc.level,
                 lod_error: lc.error,
                 lod_centre: lc.sphere.0,
@@ -836,6 +930,7 @@ impl Scene {
                 parent_radius: lc.parent_sphere.1,
                 ..Default::default()
             };
+            cl.set_quant(qlo, qstep);
             self.finish_cluster(&mut cl);
             self.clusters.push(cl);
         }
@@ -1036,7 +1131,7 @@ pub mod tests {
             for v in c.first_vertex..c.first_vertex + c.vertex_count {
                 let q = src_of[&v] as usize;
                 assert!((s.pos(c, v as usize) - p[q]).abs().cmple(c.qstep * 0.5 + Vec3::splat(1e-6)).all());
-                assert!(s.normal(v as usize).dot(normals[q]) > 0.999_999);
+                assert!(s.normal(c, v as usize).dot(normals[q]) > 0.999_999);
                 assert!((s.color(v as usize) - colors[q]).abs().max_element() < 0.01);
                 assert!(s.pos(c, v as usize).distance(c.centre) <= c.radius);
             }
@@ -1070,6 +1165,46 @@ pub mod tests {
         s.append(other);
         assert_eq!(s.samples_in(0..first).len(), before);
         assert!(s.samples_in(first..s.clusters.len()).len() > 1000);
+    }
+
+    /// Moving an object changes its transform, not its stored vertices;
+    /// its points, normals and oriented box follow, and a file saved after
+    /// the move holds it where it stands.
+    #[test]
+    fn objects_move_by_their_transform() {
+        let (p, idx) = uv_sphere(24);
+        let stretched: Vec<Vec3> = p.iter().map(|v| *v * Vec3::new(2.0, 0.5, 1.0)).collect();
+        let mut s = Scene::new();
+        s.push_mesh(&stretched, &[], &[], &idx);
+        let o = s.add_object("egg".into(), 0..s.clusters.len(), Vec3::ZERO, Vec3::ZERO);
+        let (stored, before, normals) = (s.qpos.clone(), s.positions(), s.normals());
+        let q = euler_quat(Vec3::new(0.3, 0.9, -0.4));
+        let to = Vec3::new(1.0, 2.0, 3.0);
+        s.set_object(o, to, Vec3::new(0.3, 0.9, -0.4), 1.5);
+        assert_eq!(s.qpos, stored, "vertices are not rewritten");
+        for ((a, b), (na, nb)) in before.iter().zip(s.positions()).zip(normals.iter().zip(s.normals())) {
+            assert!((q * (*a * 1.5) + to).distance(b) < 1e-4);
+            assert!((q * *na).dot(nb) > 0.9999);
+        }
+        // The box turns with it: its corners are the stored box's, moved.
+        let ob = &s.objects[o];
+        assert!((ob.box_hi - Vec3::new(2.0, 0.5, 1.0)).abs().max_element() < 0.01, "{}", ob.box_hi);
+        let far = ob.corners()[7];
+        assert!(far.distance(q * (ob.box_hi * 1.5) + to) < 1e-4);
+        for c in &s.clusters {
+            for p in s.cluster_pos(c) {
+                assert!(p.distance(c.centre) <= c.radius + 1e-4);
+            }
+        }
+        // Saved and read again: where it stands, as stored geometry.
+        let (t, _) = crate::fkj::read(&crate::fkj::write(&s, &[])).unwrap();
+        assert!(t.clusters.iter().all(|c| c.in_place()));
+        for (a, b) in s.positions().iter().zip(t.positions()) {
+            assert!(a.distance(b) < 1e-4, "{a} {b}");
+        }
+        for (a, b) in s.normals().iter().zip(t.normals()) {
+            assert!(a.dot(b) > 0.9999);
+        }
     }
 
     /// Moving an object quantises it again in its new boxes: a move and its
