@@ -41,9 +41,10 @@ pub enum DebugView {
     Surfels,
     Receivers,
     MicroRaster,
+    Samples,
 }
 
-pub const ALL: [DebugView; 24] = [
+pub const ALL: [DebugView; 25] = [
     DebugView::Final,
     DebugView::Clusters,
     DebugView::Lod,
@@ -68,6 +69,7 @@ pub const ALL: [DebugView; 24] = [
     DebugView::Surfels,
     DebugView::Receivers,
     DebugView::MicroRaster,
+    DebugView::Samples,
 ];
 
 impl DebugView {
@@ -97,6 +99,7 @@ impl DebugView {
             DebugView::Surfels => "surfels",
             DebugView::Receivers => "receivers",
             DebugView::MicroRaster => "micro-raster",
+            DebugView::Samples => "samples",
         }
     }
 
@@ -136,6 +139,7 @@ impl DebugView {
             DebugView::ShadowMap => ("SHADOW MAP (SELECTED LIGHT)", &["SIX FACES, UNFOLDED; BRIGHTER IS NEARER THE LIGHT", "BLUE: NOTHING THERE WITHIN THE REACH"]),
             DebugView::Surfels => ("SURFELS", &["THE SURFACES AS DISCS, EACH LIT DIRECTLY", "THIS LIT CLOUD IS WHAT BOUNCE LIGHT IS GATHERED FROM"]),
             DebugView::Receivers => ("BOUNCE RECEIVERS", &["GREEN: GATHERED; RED: WAITING FOR ITS TURN"]),
+            DebugView::Samples => ("SURFACE SAMPLES", &["EACH OBJECT'S SURFACE AS EVEN DISCS, ONE COLOUR EACH, WHATEVER ITS TRIANGLES", "THE SAME SPACING ON A LARGE FLAT TRIANGLE AS ON A DENSE SCULPT"]),
             DebugView::MicroRaster => ("MICRO-RASTER, X4", &["THE CUBE OF 6 X 8 X 8 TEXELS SEEN BY THE RECEIVER UNDER THE CURSOR", "NEAREST SURFELS FILL IT FIRST; THEN IT FOLDS INTO 4 NUMBERS PER COLOUR"]),
         }
     }
@@ -432,6 +436,7 @@ pub fn draw(view: DebugView, ctx: &Ctx, frame: &mut Frame) {
         }
         DebugView::Surfels => surfels(ctx, frame),
         DebugView::Receivers => receivers(ctx, frame),
+        DebugView::Samples => samples(ctx, frame),
         DebugView::MicroRaster => micro_raster(ctx, frame),
         _ => {}
     }
@@ -661,6 +666,62 @@ fn surfels(ctx: &Ctx, frame: &mut Frame) {
     }
     let u = ui(frame);
     text(frame, 16, h - 12 * u - 8, u, &format!("{} SURFELS, EACH LIT BY THE SKY AND THE POINT LIGHTS IN REACH", b.surfels.len()), Vec3::splat(0.9));
+}
+
+fn samples(ctx: &Ctx, frame: &mut Frame) {
+    let (w, h) = (frame.width, frame.height);
+    for c in frame.color.iter_mut() {
+        *c = raster::pack(Vec3::splat(0.004));
+    }
+    let f = focal_px(ctx.cam, h);
+    let mut zbuf = vec![0f32; w * h];
+    let vp: Mat4 = ctx.cam.proj * ctx.cam.view;
+    let mut shown = 0usize;
+    for (k, s) in ctx.scene.samples.iter().enumerate() {
+        let view_dir = (ctx.cam.eye - s.position).normalize_or(Vec3::Y);
+        let facing = s.normal.dot(view_dir);
+        if facing <= 0.0 {
+            continue;
+        }
+        let c = vp * s.position.extend(1.0);
+        if c.w <= ctx.cam.near {
+            continue;
+        }
+        let iw = 1.0 / c.w;
+        let (sx, sy) = ((c.x * iw * 0.5 + 0.5) * w as f32, (0.5 - c.y * iw * 0.5) * h as f32);
+        // Drawn a little smaller than the area it stands for, so the
+        // spacing shows.
+        let r = ((s.area / std::f32::consts::PI).sqrt() * 0.7 * f * iw).min(200.0);
+        if sx + r < 0.0 || sy + r < 0.0 || sx - r > w as f32 || sy - r > h as f32 {
+            continue;
+        }
+        shown += 1;
+        let hue = (k as u32).wrapping_mul(2_654_435_761);
+        let base = Vec3::new((hue & 255) as f32, ((hue >> 8) & 255) as f32, ((hue >> 16) & 255) as f32) / 255.0 * 0.8 + Vec3::splat(0.2);
+        let col = raster::pack(base * (0.35 + 0.65 * facing));
+        let ri = r.ceil().max(0.0) as i32;
+        let tilt = facing.max(0.15);
+        for dy in -ri..=ri {
+            for dx in -ri..=ri {
+                let d2 = (dx * dx + dy * dy) as f32;
+                if d2 > (r * r * (0.5 + 0.5 * tilt)).max(0.25) {
+                    continue;
+                }
+                let (x, y) = (sx as i32 + dx, sy as i32 + dy);
+                if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                    continue;
+                }
+                let i = y as usize * w + x as usize;
+                if zbuf[i] > iw {
+                    continue;
+                }
+                zbuf[i] = iw;
+                frame.color[i] = col;
+            }
+        }
+    }
+    let u = ui(frame);
+    text(frame, 16, h - 12 * u - 8, u, &format!("{} SAMPLES, {} FACING THE CAMERA", ctx.scene.samples.len(), shown), Vec3::splat(0.9));
 }
 
 fn receivers(ctx: &Ctx, frame: &mut Frame) {
@@ -956,8 +1017,8 @@ mod tests {
         for v in ALL {
             assert_eq!(DebugView::from_name(v.name()), Some(v));
         }
-        assert_eq!(DebugView::Final.step(-1), DebugView::MicroRaster);
-        assert_eq!(DebugView::MicroRaster.step(1), DebugView::Final);
+        assert_eq!(DebugView::Final.step(-1), DebugView::Samples);
+        assert_eq!(DebugView::Samples.step(1), DebugView::Final);
     }
 
     #[test]

@@ -239,6 +239,9 @@ pub struct Scene {
     /// What can be selected and moved: runs of clusters with a pivot.
     /// Geometry outside every object (the ground, the mountains) stays put.
     pub objects: Vec<Object>,
+    /// Points spread evenly over each object's surface (`samples.rs`), in
+    /// order of their cluster, moved with it.
+    pub samples: Vec<crate::samples::Sample>,
 }
 
 /// A model in the scene: its clusters (and so its vertices, which they
@@ -451,6 +454,9 @@ impl Scene {
             c.move_lod(|p| p + d, 1.0);
         }
         self.fit_spheres(0..self.clusters.len());
+        for s in &mut self.samples {
+            s.position += d;
+        }
         for l in &mut self.lights {
             l.position += d;
         }
@@ -476,6 +482,11 @@ impl Scene {
             c.move_lod(|p| q * (p * scale) + d, scale);
         }
         self.fit_spheres(0..self.clusters.len());
+        for s in &mut self.samples {
+            s.position = q * (s.position * scale) + d;
+            s.normal = q * s.normal;
+            s.area *= scale * scale;
+        }
         for l in &mut self.lights {
             l.position = q * (l.position * scale) + d;
         }
@@ -509,6 +520,55 @@ impl Scene {
         self.bounds_min = self.bounds_min.min(other.bounds_min);
         self.bounds_max = self.bounds_max.max(other.bounds_max);
         self.lights.extend(other.lights);
+        self.samples.extend(other.samples.iter().map(|s| crate::samples::Sample { cluster: s.cluster + cbase as u32, ..*s }));
+    }
+
+    /// The samples lying on clusters `clusters`.
+    pub fn samples_in(&self, clusters: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let a = self.samples.partition_point(|s| (s.cluster as usize) < clusters.start);
+        let b = self.samples.partition_point(|s| (s.cluster as usize) < clusters.end);
+        a..b
+    }
+
+    /// Spread samples over object `i`'s finest level (`samples.rs`),
+    /// replacing any it had. Returns how many and their spacing.
+    pub fn scatter_samples(&mut self, i: usize) -> (usize, f32) {
+        let range = self.objects[i].clusters.clone();
+        let old = self.samples_in(range.clone());
+        self.samples.drain(old.clone());
+        if range.is_empty() {
+            return (0, 0.0);
+        }
+        let finest = self.clusters[range.clone()].iter().map(|c| c.lod_level).min().unwrap_or(0);
+        // Every finest-level triangle, as (cluster, triangle).
+        let tris: Vec<(u32, u32)> = range.clone().filter(|&c| self.clusters[c].lod_level == finest).flat_map(|c| (self.clusters[c].first_tri..self.clusters[c].first_tri + self.clusters[c].tri_count).map(move |t| (c as u32, t))).collect();
+        let get = |k: usize| {
+            let (ci, t) = tris[k];
+            let c = &self.clusters[ci as usize];
+            let v = self.tri(c, t);
+            (ci, v.map(|v| self.pos(c, v)), v.map(|v| self.normal(v)))
+        };
+        let area: f32 = {
+            use rayon::prelude::*;
+            (0..tris.len()).into_par_iter().map(|k| crate::samples::tri_area(get(k).1) as f64).sum::<f64>() as f32
+        };
+        let h = crate::samples::spacing_for(area);
+        let new = crate::samples::scatter(tris.len(), get, area, h);
+        let n = new.len();
+        self.samples.splice(old.start..old.start, new);
+        (n, h)
+    }
+
+    /// Samples for every object that has none.
+    pub fn scatter_missing_samples(&mut self) {
+        for i in 0..self.objects.len() {
+            let r = self.objects[i].clusters.clone();
+            if !r.is_empty() && self.samples_in(r).is_empty() {
+                let t = std::time::Instant::now();
+                let (n, h) = self.scatter_samples(i);
+                eprintln!("{}: {n} surface samples {:.1} cm apart in {:.2} s", self.objects[i].name, h * 100.0, t.elapsed().as_secs_f64());
+            }
+        }
     }
 
     /// Make clusters `clusters` an object turning about `pivot`, already
@@ -654,6 +714,12 @@ impl Scene {
             c.move_lod(map, k);
         }
         self.fit_spheres(o.clusters.clone());
+        let r = self.samples_in(o.clusters.clone());
+        for s in &mut self.samples[r] {
+            s.position = map(s.position);
+            s.normal = q * s.normal;
+            s.area *= k * k;
+        }
         let ob = &mut self.objects[i];
         ob.pivot = pivot;
         ob.rotation = rotation;
@@ -964,6 +1030,33 @@ pub mod tests {
         }
         let n = s.vertex_count() * 13 + s.triangle_count() * 3;
         assert_eq!(s.geometry_bytes(), n + s.clusters.len() * std::mem::size_of::<Cluster>());
+    }
+
+    /// An object's samples lie on its surface and move with it; a model
+    /// added after it keeps its own.
+    #[test]
+    fn samples_follow_their_object() {
+        let (p, idx) = uv_sphere(48);
+        let mut s = Scene::new();
+        s.push_mesh(&p, &[], &[], &idx);
+        let o = s.add_object("ball".into(), 0..s.clusters.len(), Vec3::ZERO, Vec3::ZERO);
+        let (n, h) = s.scatter_samples(o);
+        assert!(n > 1000, "{n}");
+        assert_eq!(h, crate::samples::MIN_SPACING);
+        let on_sphere = |s: &Scene, c: Vec3, r: f32| s.samples.iter().all(|x| (x.position.distance(c) - r).abs() < 0.01 && x.normal.dot((x.position - c).normalize()) > 0.95);
+        assert!(on_sphere(&s, Vec3::ZERO, 1.0));
+        s.set_object(o, Vec3::new(3.0, 1.0, 0.0), Vec3::new(0.4, 0.0, 0.2), 2.0);
+        assert!(on_sphere(&s, Vec3::new(3.0, 1.0, 0.0), 2.0));
+        assert!((s.samples.iter().map(|x| x.area).sum::<f32>() - 16.0 * std::f32::consts::PI).abs() < 0.5);
+        let mut other = Scene::new();
+        other.push_mesh(&p, &[], &[], &idx);
+        let k = other.add_object("other".into(), 0..other.clusters.len(), Vec3::ZERO, Vec3::ZERO);
+        other.scatter_samples(k);
+        let before = s.samples.len();
+        let first = s.clusters.len();
+        s.append(other);
+        assert_eq!(s.samples_in(0..first).len(), before);
+        assert!(s.samples_in(first..s.clusters.len()).len() > 1000);
     }
 
     /// Moving an object quantises it again in its new boxes: a move and its

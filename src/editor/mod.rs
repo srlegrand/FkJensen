@@ -331,6 +331,7 @@ impl Editor {
         let n = model.clusters.len();
         model.objects.clear();
         model.add_object(name.clone(), 0..n, glam::Vec3::ZERO, glam::Vec3::ZERO);
+        model.scatter_missing_samples();
         let tris = model.triangle_count();
         let first = self.app.scene.objects.len();
         self.app.scene.append(model);

@@ -106,6 +106,20 @@ bounce off.
 
 ![Bounce light on the earlier set (a café, 20/10/2026), lit by one 30,000 lm lamp above the awning, without and with bounce: the shadowed shopfront picks up light from the lit pavement](docs/bounce.png)
 
+**Surface samples** (`src/samples.rs`). Each object's surface is also
+covered by points spread evenly in space, the same distance apart
+whatever its triangles: a floor of two triangles gets as many over a
+square metre as a sculpt of a million. They are placed by dart throwing
+on the finest level of detail: candidates scattered over the triangles by
+area, taken in random order, each kept unless a kept one on the same side
+of the surface is closer than the spacing, so both sides of a claw keep
+theirs. The spacing is 1 cm, or wider so that a model has at most 150,000:
+the high-resolution T-rex gets 79,361 at 2.0 cm, the car 82,769 at 2.2 cm,
+in about a second each on 2 cores at load. They move with their object.
+Nothing reads them yet; they are where sky occlusion and bounce light are
+to be kept, so that their detail no longer follows the mesh. The ground
+and the mountains have none yet. `--debug-view samples` shows them.
+
 ### Light reach
 
 A light has no radius, but the distance beyond which it can no longer be
@@ -336,6 +350,7 @@ build leaves them out.
 | `shadow-map` | the selected light's cube map, unfolded |
 | `surfels` | the surfel cloud as lit discs |
 | `receivers` | bounce receivers: gathered or waiting |
+| `samples` | each object's surface samples, one colour each |
 | `micro-raster` | the 6 x 8 x 8 cube raster of the receiver under the cursor, x4, and what its spherical harmonics give back |
 
 ## Without a display server

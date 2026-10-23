@@ -34,6 +34,8 @@ mod fkj;
 mod scene;
 #[path = "../../../src/texture.rs"]
 mod texture;
+#[path = "../../../src/samples.rs"]
+mod samples;
 #[path = "../../../src/lod.rs"]
 mod lod;
 

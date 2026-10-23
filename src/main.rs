@@ -51,6 +51,7 @@ mod lod;
 mod manip;
 mod raster;
 mod reyes;
+mod samples;
 mod scene;
 mod shadow;
 mod simd;
@@ -948,6 +949,7 @@ fn prepare_opened(scene: &mut Scene, path: &Path) {
         let n = scene.clusters.len();
         scene.add_object(name, 0..n, Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5), Vec3::ZERO);
     }
+    scene.scatter_missing_samples();
     if scene.focus.is_none() {
         scene.focus = (0..scene.objects.len()).filter(|&i| !scene.objects[i].clusters.is_empty()).map(|i| scene.object_bounds(i)).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
     }
@@ -1007,6 +1009,7 @@ fn built_in_with(highres: bool) -> Result<Scene, String> {
         scene.focus = Some((lo, hi));
     }
     scene.lights = world::set_lights();
+    scene.scatter_missing_samples();
     eprintln!(
         "built-in set: {} triangles, {} clusters, {} lights, {:.1} km across",
         scene.triangle_count(),
