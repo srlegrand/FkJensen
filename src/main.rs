@@ -41,6 +41,7 @@ mod fkj;
 mod hardware;
 mod lights;
 mod lod;
+mod manip;
 mod raster;
 mod reyes;
 mod scene;
@@ -75,6 +76,15 @@ const DEFAULT_SKY_LUX: f32 = 30.0;
 
 const CONTROLS: &str = "\
 Controls
+  Selecting and moving (as in Maya)
+  click                  select a model or a light; click empty space to clear
+  Q / W / E / R          select / move / rotate / scale manipulator
+  drag an arrow          move along that axis (X red, Y green, Z blue)
+  drag the centre        move facing the camera (move), scale (scale)
+  drag the ring          turn about the vertical (rotate)
+  F                      frame the selection (the subject when none)
+  A                      frame the subject from afar
+
   Lights: point lights in lumens, 1 lm to 2,000,000 lm, the sun and the sky
   left drag on a light   move it, facing the camera (stays at its depth)
     + Ctrl               move it level, over the set (keeps its height)
@@ -85,7 +95,7 @@ Controls
   2 (hold) + click       put the selected light above that surface
   Tab                    select next light     Delete   remove selected light
   + / -                  lumens x1.25          C        cycle colour
-  L                      show / hide lights    R        reset to the scene's lights
+  L                      show / hide lights    Ctrl+R   reset to the scene's lights
   T / Shift+T            time of day later / earlier (15 min): sun, sky, exposure
   Y / Shift+Y            sun brighter / dimmer (0 to 1000, steps of 50)
   J / Shift+J            lighting contrast up / down: flat overcast to overhead
@@ -98,10 +108,10 @@ Controls
   Z / Shift+Z            render resolution finer / coarser (x1.25)
   V / Shift+V            next / previous visual debug view (--visual-debug)
 
-  Camera
-  left drag              orbit                 middle drag / shift+left   pan
-  right drag             look (fly)            wheel                      dolly
-  W A S D Q E            fly (shift: faster)   F    wide view / close on the subject
+  Camera (as in Maya)
+  Alt + left drag        tumble                Alt + middle drag / middle drag   track
+  Alt + right drag       dolly                 wheel                             dolly
+  right drag             look; with W A S D Q E held, fly (shift: faster)
 
   View
   [ / ]                  exposure              0    exposure from the sky
@@ -116,6 +126,30 @@ Controls
 type VisualDebug = Option<debug::DebugView>;
 #[cfg(not(target_pointer_width = "64"))]
 type VisualDebug = Option<()>;
+
+/// What is selected.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Selection {
+    Nothing,
+    Object(usize),
+    Light(usize),
+}
+
+/// A manipulator handle being dragged, and how things were when it was
+/// taken.
+struct ManipDrag {
+    target: Selection,
+    tool: manip::Tool,
+    handle: manip::Handle,
+    pivot: Vec3,
+    yaw: f32,
+    scale: f32,
+    /// Where the pointer took the handle: along the axis, on the plane, the
+    /// angle on the ground plane, or the pointer's x.
+    grab: Vec3,
+    /// The handle's length in the world when taken.
+    len: f32,
+}
 
 /// A light being dragged with the mouse.
 struct Drag {
@@ -140,6 +174,13 @@ struct App {
     /// scaled up when presented.
     render_scale: f32,
     drag: Option<Drag>,
+    /// The manipulator shown (Q W E R) and what it acts on.
+    tool: manip::Tool,
+    selection: Selection,
+    manip: Option<ManipDrag>,
+    /// The handle under the pointer.
+    hot: Option<manip::Handle>,
+    alt: bool,
     /// Set by Esc.
     quit: bool,
     /// Size of what the frame is shown on (window or framebuffer).
@@ -193,6 +234,11 @@ impl App {
             cam,
             rig,
             drag: None,
+            tool: manip::Tool::Move,
+            selection: Selection::Nothing,
+            manip: None,
+            hot: None,
+            alt: false,
             quit: false,
             output: (0, 0),
             point_budget: None,
@@ -216,13 +262,22 @@ impl App {
 
     fn open(&mut self, path: PathBuf) {
         match load_file(&path) {
-            Ok(scene) => {
+            Ok(mut scene) => {
+                // A file dropped on the window is one object.
+                if scene.objects.is_empty() && !scene.clusters.is_empty() {
+                    let (lo, hi) = (scene.bounds_min, scene.bounds_max);
+                    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    let n = scene.clusters.len();
+                    scene.add_object(name, 0..n, Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5), 0.0);
+                }
                 self.scene = scene;
                 self.scene_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.wide = true;
                 frame_camera(&mut self.cam, &self.scene, self.wide);
                 self.rig = LightRig::new(default_rig(&self.scene));
                 self.drag = None;
+                self.manip = None;
+                self.selection = Selection::Nothing;
             }
             Err(e) => eprintln!("{e}"),
         }
@@ -284,6 +339,148 @@ impl App {
                 }
             }
         }
+        // The selection and its manipulator.
+        let k = self.render_scale.max(0.25);
+        if let Selection::Object(i) = self.selection {
+            let (lo, hi) = self.scene.object_bounds(i);
+            manip::draw_box(&mut self.frame, &cam, lo, hi, Vec3::new(0.35, 0.95, 0.55));
+        }
+        if let Some((pivot, tool)) = self.gizmo() {
+            let hot = self.manip.as_ref().map(|m| m.handle).or(self.hot);
+            manip::draw(&mut self.frame, &cam, tool, pivot, hot, k);
+        }
+    }
+
+    /// Where the manipulator is and which one: lights only move.
+    fn gizmo(&self) -> Option<(Vec3, manip::Tool)> {
+        match self.selection {
+            Selection::Object(i) => self.scene.objects.get(i).map(|o| (o.pivot, self.tool)),
+            Selection::Light(i) if self.tool == manip::Tool::Move && self.rig.show => self.rig.lights.get(i).map(|l| (l.position, self.tool)),
+            _ => None,
+        }
+        .filter(|(_, t)| *t != manip::Tool::Select)
+    }
+
+    /// The handle under the pointer, if any.
+    fn pick_handle(&self) -> Option<manip::Handle> {
+        let (pivot, tool) = self.gizmo()?;
+        let cam = self.render_camera();
+        manip::pick(&cam, &self.frame, tool, pivot, glam::Vec2::new(self.mouse.0, self.mouse.1), self.render_scale.max(0.25))
+    }
+
+    fn start_manip(&mut self, handle: manip::Handle) {
+        let Some((pivot, tool)) = self.gizmo() else { return };
+        let cam = self.render_camera();
+        let len = manip::handle_length(&cam, self.frame.height, pivot);
+        let (x, y) = self.mouse;
+        let (yaw, scale) = match self.selection {
+            Selection::Object(i) => (self.scene.objects[i].yaw, self.scene.objects[i].scale),
+            _ => (0.0, 1.0),
+        };
+        let grab = match (tool, handle) {
+            (_, manip::Handle::Axis(k)) => Vec3::splat(manip::along_axis(&cam, &self.frame, x, y, pivot, manip::AXES[k]).unwrap_or(0.0)),
+            (manip::Tool::Move, manip::Handle::Centre) => manip::on_plane(&cam, &self.frame, x, y, pivot, (pivot - cam.eye).normalize_or(Vec3::Z)).unwrap_or(pivot),
+            (_, manip::Handle::Ring) => {
+                let q = manip::on_plane(&cam, &self.frame, x, y, pivot, Vec3::Y).unwrap_or(pivot + Vec3::X) - pivot;
+                Vec3::splat(q.z.atan2(q.x))
+            }
+            _ => Vec3::splat(x),
+        };
+        self.manip = Some(ManipDrag { target: self.selection, tool, handle, pivot, yaw, scale, grab, len });
+    }
+
+    fn update_manip(&mut self) {
+        let Some(m) = &self.manip else { return };
+        let cam = self.render_camera();
+        let (x, y) = self.mouse;
+        let (mut pivot, mut yaw, mut scale) = (m.pivot, m.yaw, m.scale);
+        match (m.tool, m.handle) {
+            (manip::Tool::Move, manip::Handle::Axis(k)) => {
+                if let Some(t) = manip::along_axis(&cam, &self.frame, x, y, m.pivot, manip::AXES[k]) {
+                    pivot = m.pivot + manip::AXES[k] * (t - m.grab.x);
+                }
+            }
+            (manip::Tool::Move, manip::Handle::Centre) => {
+                if let Some(q) = manip::on_plane(&cam, &self.frame, x, y, m.pivot, (m.pivot - cam.eye).normalize_or(Vec3::Z)) {
+                    pivot = m.pivot + (q - m.grab);
+                }
+            }
+            (manip::Tool::Rotate, _) => {
+                if let Some(q) = manip::on_plane(&cam, &self.frame, x, y, m.pivot, Vec3::Y) {
+                    let q = q - m.pivot;
+                    yaw = m.yaw - (q.z.atan2(q.x) - m.grab.x);
+                }
+            }
+            (manip::Tool::Scale, manip::Handle::Axis(k)) => {
+                if let Some(t) = manip::along_axis(&cam, &self.frame, x, y, m.pivot, manip::AXES[k]) {
+                    scale = m.scale * (1.0 + (t - m.grab.x) / m.len).max(0.01);
+                }
+            }
+            (manip::Tool::Scale, _) => scale = m.scale * ((x - m.grab.x) / (120.0 * self.render_scale.max(0.25))).exp(),
+            _ => {}
+        }
+        match m.target {
+            Selection::Object(i) => {
+                self.scene.set_object(i, pivot, yaw, scale);
+                self.renderer.moved(self.scene.objects[i].clusters.clone(), false);
+            }
+            Selection::Light(i) => {
+                if let Some(l) = self.rig.lights.get_mut(i) {
+                    l.position = pivot;
+                }
+            }
+            Selection::Nothing => {}
+        }
+    }
+
+    /// The pointer let go of a manipulator.
+    fn end_manip(&mut self) {
+        if let Some(m) = self.manip.take() {
+            if let Selection::Object(i) = m.target {
+                // Bounce light is made again now the object has settled.
+                self.renderer.moved(self.scene.objects[i].clusters.clone(), true);
+            }
+        }
+    }
+
+    /// Select what is under the pointer: a light, else a model, else
+    /// nothing. Returns the light, for dragging.
+    fn select_at_pointer(&mut self) -> Option<usize> {
+        if self.rig.show {
+            let cam = self.render_camera();
+            if let Some(i) = self.rig.pick(&cam, self.frame.width, self.frame.height, self.mouse.0, self.mouse.1, self.render_scale) {
+                self.rig.selected = i;
+                self.selection = Selection::Light(i);
+                return Some(i);
+            }
+        }
+        let (x, y) = (self.mouse.0 as usize, self.mouse.1 as usize);
+        let id = if x < self.frame.width && y < self.frame.height { self.frame.tri_id[y * self.frame.width + x] } else { raster::NO_TRI };
+        self.selection = if id == raster::NO_TRI {
+            Selection::Nothing
+        } else {
+            let c = self.frame.setups[id as usize].cluster as usize;
+            self.scene.object_of(c).map(Selection::Object).unwrap_or(Selection::Nothing)
+        };
+        None
+    }
+
+    /// Frame the selection, or the subject when nothing is selected.
+    fn frame_selection(&mut self) {
+        match self.selection {
+            Selection::Object(i) => {
+                let (lo, hi) = self.scene.object_bounds(i);
+                self.cam.frame((lo + hi) * 0.5, ((hi - lo).length() * 0.5).max(1e-3));
+            }
+            Selection::Light(i) => {
+                if let Some(l) = self.rig.lights.get(i) {
+                    let r = self.scene.focus_radius() * 0.15;
+                    self.cam.frame(l.position, r);
+                }
+            }
+            // The whole scene runs to the mountains: the subject instead.
+            Selection::Nothing => self.cam.frame(self.scene.focus_centre(), self.scene.focus_radius()),
+        }
     }
 
     fn present(&mut self) {
@@ -340,7 +537,9 @@ impl App {
         if k.contains(&KeyCode::KeyA) { local.x -= 1.0 }
         if k.contains(&KeyCode::KeyE) { local.y += 1.0 }
         if k.contains(&KeyCode::KeyQ) { local.y -= 1.0 }
-        if local != Vec3::ZERO {
+        // Flying is for while the right button looks round; the keys are
+        // the manipulators otherwise.
+        if local != Vec3::ZERO && self.buttons[2] {
             self.cam.fly(local, dt, self.shift);
         }
         // Light nudge keys, held: relative to the view, flattened to the
@@ -497,14 +696,20 @@ impl App {
         let dy = self.raw_mouse.1 - self.last_mouse.1;
         self.last_mouse = self.raw_mouse;
         let h = self.frame.height as f32 / self.render_scale;
-        if self.drag.is_some() {
+        if self.manip.is_some() {
+            self.update_manip();
+        } else if self.drag.is_some() {
             self.update_drag();
-        } else if self.buttons[0] && !self.shift {
+        } else if self.alt && self.buttons[0] {
             self.cam.orbit(dx, dy);
-        } else if self.buttons[1] || (self.buttons[0] && self.shift) {
+        } else if self.alt && self.buttons[2] {
+            self.cam.dolly((dx + dy) * 0.02);
+        } else if self.buttons[1] {
             self.cam.pan(dx, dy, h);
         } else if self.buttons[2] {
             self.cam.look(dx, dy);
+        } else if !self.buttons[0] {
+            self.hot = self.pick_handle();
         }
     }
 
@@ -513,6 +718,7 @@ impl App {
         self.buttons[idx] = pressed;
         if idx == 0 && !pressed {
             self.drag = None;
+            self.end_manip();
         }
         if pressed && idx == 0 {
             if self.keys.contains(&KeyCode::Digit1) {
@@ -521,17 +727,20 @@ impl App {
             } else if self.keys.contains(&KeyCode::Digit2) {
                 self.place_light(true);
                 self.buttons[0] = false;
-            } else if self.rig.show {
-                let cam = self.render_camera();
-                if let Some(i) = self.rig.pick(&cam, self.frame.width, self.frame.height, self.mouse.0, self.mouse.1, self.render_scale) {
-                    self.rig.selected = i;
-                    self.drag = Some(Drag { light: i, anchor: self.rig.lights[i].position, plane: self.drag_plane() });
-                }
+            } else if self.alt {
+                // Tumbling.
+            } else if let Some(h) = self.pick_handle().filter(|_| !self.ctrl) {
+                self.start_manip(h);
+            } else if let Some(i) = self.select_at_pointer() {
+                self.drag = Some(Drag { light: i, anchor: self.rig.lights[i].position, plane: self.drag_plane() });
             }
         }
     }
 
     fn on_wheel(&mut self, steps: f32) {
+        if self.manip.is_some() {
+            return;
+        }
         if let Some(d) = &self.drag {
             let eye = self.cam.eye();
             if let Some(l) = self.rig.lights.get_mut(d.light) {
@@ -570,6 +779,7 @@ impl App {
                 self.ctrl = pressed;
                 self.reanchor_drag();
             }
+            KeyCode::AltLeft | KeyCode::AltRight => self.alt = pressed,
             _ => {}
         }
         if !pressed {
@@ -577,18 +787,35 @@ impl App {
         }
         match code {
             KeyCode::Escape => self.quit = true,
-            KeyCode::KeyF => {
-                self.wide = !self.wide;
-                frame_camera(&mut self.cam, &self.scene, self.wide);
+            // While the right button is held these keys fly.
+            KeyCode::KeyQ | KeyCode::KeyW | KeyCode::KeyE | KeyCode::KeyA if self.buttons[2] => {}
+            KeyCode::KeyQ => self.tool = manip::Tool::Select,
+            KeyCode::KeyW => self.tool = manip::Tool::Move,
+            KeyCode::KeyE => self.tool = manip::Tool::Rotate,
+            KeyCode::KeyR if !self.ctrl => self.tool = manip::Tool::Scale,
+            KeyCode::KeyF => self.frame_selection(),
+            KeyCode::KeyA => {
+                self.wide = true;
+                frame_camera(&mut self.cam, &self.scene, true);
             }
             KeyCode::KeyB => self.settings.cull_backfaces = !self.settings.cull_backfaces,
             KeyCode::KeyG => self.settings.wireframe = !self.settings.wireframe,
             KeyCode::KeyL => self.rig.show = !self.rig.show,
-            KeyCode::KeyR => self.rig = LightRig::new(default_rig(&self.scene)),
-            KeyCode::Tab => self.rig.select_next(),
+            KeyCode::KeyR => {
+                self.rig = LightRig::new(default_rig(&self.scene));
+                self.selection = Selection::Nothing;
+            }
+            KeyCode::Tab => {
+                self.rig.select_next();
+                self.selection = Selection::Light(self.rig.selected);
+            }
             KeyCode::Delete | KeyCode::Backspace => {
-                self.drag = None;
-                self.rig.remove_selected();
+                if let Selection::Light(_) = self.selection {
+                    self.drag = None;
+                    self.manip = None;
+                    self.rig.remove_selected();
+                    self.selection = Selection::Nothing;
+                }
             }
             KeyCode::Equal | KeyCode::NumpadAdd => self.rig.scale_selected(1.25),
             KeyCode::Minus | KeyCode::NumpadSubtract => self.rig.scale_selected(0.8),
@@ -833,6 +1060,9 @@ fn add_models(scene: &mut Scene, highres: bool) -> Option<(Vec3, Vec3)> {
         match load_file(&path) {
             Ok(mut m) => {
                 m.place(yaw.to_radians(), 1.0, at);
+                let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let n = m.clusters.len();
+                m.add_object(name, 0..n, at, yaw.to_radians());
                 let (lo, hi) = (m.bounds_min, m.bounds_max);
                 bounds = Some(match bounds {
                     Some((a, b)) => (a.min(lo), b.max(hi)),
@@ -1363,6 +1593,109 @@ fn fb_loop(app: &mut App, fb: &mut fbdev::Framebuffer, mut poll: impl FnMut() ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ball on a floor, the ball an object, in an app with no window,
+    /// rendered once at 320 x 180.
+    fn ball_app() -> App {
+        let mut scene = Scene::new();
+        scene.push_mesh(&[Vec3::new(-5.0, 0.0, -5.0), Vec3::new(5.0, 0.0, -5.0), Vec3::new(5.0, 0.0, 5.0), Vec3::new(-5.0, 0.0, 5.0)], &[], &[], &[0, 2, 1, 0, 3, 2]);
+        let first = scene.clusters.len();
+        let (p, idx) = scene::tests::uv_sphere(24);
+        let ball: Vec<Vec3> = p.iter().map(|v| *v * 0.5 + Vec3::new(0.0, 0.5, 0.0)).collect();
+        scene.push_mesh(&ball, &[], &[], &idx);
+        let n = scene.clusters.len();
+        scene.add_object("ball".into(), first..n, Vec3::ZERO, 0.0);
+        scene.focus = Some((Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 1.0, 1.0)));
+        let mut app = App::new(scene, "ball".into());
+        app.cam.look_from(Vec3::new(2.0, 2.5, 4.0), Vec3::new(0.0, 0.4, 0.0));
+        app.settings.bounce = false;
+        app.output = (320, 180);
+        app.fit_frame(320, 180);
+        app.render();
+        app
+    }
+
+    fn screen_of(app: &App, p: Vec3) -> (f32, f32) {
+        let (x, y, _) = raster::project(&app.render_camera(), app.frame.width, app.frame.height, p).unwrap();
+        (x, y)
+    }
+
+    /// Clicking the ball selects it; dragging the move tool's X arrow moves
+    /// it along X only; clicking the floor clears the selection; F frames it.
+    #[test]
+    fn select_and_move_with_the_manipulator() {
+        let mut app = ball_app();
+        let (x, y) = screen_of(&app, Vec3::new(0.0, 0.5, 0.0));
+        app.on_cursor(x, y);
+        app.on_button(0, true);
+        app.on_button(0, false);
+        assert_eq!(app.selection, Selection::Object(0));
+        app.key(KeyCode::KeyW, true);
+        app.key(KeyCode::KeyW, false);
+        app.render();
+        // Take the X arrow two thirds along, drag it further along X.
+        let len = manip::handle_length(&app.render_camera(), app.frame.height, Vec3::ZERO);
+        let (ax, ay) = screen_of(&app, Vec3::X * len * 0.66);
+        app.on_cursor(ax, ay);
+        assert_eq!(app.hot, Some(manip::Handle::Axis(0)));
+        app.on_button(0, true);
+        let (bx, by) = screen_of(&app, Vec3::X * (len * 0.66 + 1.0));
+        app.on_cursor(bx, by);
+        app.on_button(0, false);
+        let p = app.scene.objects[0].pivot;
+        assert!((p.x - 1.0).abs() < 0.05 && p.y.abs() < 1e-4 && p.z.abs() < 1e-4, "{p}");
+        app.render();
+        // The floor: nothing selected.
+        let (fx, fy) = screen_of(&app, Vec3::new(-3.0, 0.0, -1.0));
+        app.on_cursor(fx, fy);
+        app.on_button(0, true);
+        app.on_button(0, false);
+        assert_eq!(app.selection, Selection::Nothing);
+        // Select again and frame it.
+        app.selection = Selection::Object(0);
+        app.key(KeyCode::KeyF, true);
+        assert!(app.cam.target.distance(Vec3::new(1.0, 0.5, 0.0)) < 0.2, "{}", app.cam.target);
+    }
+
+    /// Rotate and scale turn and grow the object about its pivot; Alt and
+    /// the left button tumble without selecting.
+    #[test]
+    fn rotate_scale_and_tumble() {
+        let mut app = ball_app();
+        app.selection = Selection::Object(0);
+        app.key(KeyCode::KeyE, true);
+        app.render();
+        let len = manip::handle_length(&app.render_camera(), app.frame.height, Vec3::ZERO);
+        let (rx, ry) = screen_of(&app, Vec3::new(len, 0.0, 0.0));
+        app.on_cursor(rx, ry);
+        assert_eq!(app.hot, Some(manip::Handle::Ring));
+        app.on_button(0, true);
+        let (sx, sy) = screen_of(&app, Vec3::new(0.0, 0.0, -len));
+        app.on_cursor(sx, sy);
+        app.on_button(0, false);
+        let yaw = app.scene.objects[0].yaw;
+        assert!((yaw - std::f32::consts::FRAC_PI_2).abs() < 0.1, "{yaw}");
+        app.key(KeyCode::KeyR, true);
+        app.render();
+        let (cx, cy) = screen_of(&app, Vec3::ZERO);
+        app.on_cursor(cx, cy);
+        assert_eq!(app.hot, Some(manip::Handle::Centre));
+        app.on_button(0, true);
+        app.on_cursor(cx + 120.0, cy);
+        app.on_button(0, false);
+        let k = app.scene.objects[0].scale;
+        assert!((k - std::f32::consts::E).abs() < 0.1, "{k}");
+        // Alt + left drag tumbles and keeps the selection.
+        let yaw_cam = app.cam.yaw;
+        app.key(KeyCode::AltLeft, true);
+        app.on_cursor(10.0, 10.0);
+        app.on_button(0, true);
+        app.on_cursor(60.0, 10.0);
+        app.on_button(0, false);
+        app.key(KeyCode::AltLeft, false);
+        assert_ne!(app.cam.yaw, yaw_cam);
+        assert_eq!(app.selection, Selection::Object(0));
+    }
 
     #[test]
     fn light_argument_parses() {

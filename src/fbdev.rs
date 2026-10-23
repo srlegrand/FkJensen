@@ -213,6 +213,8 @@ fn key_code(code: u16) -> Option<KeyCode> {
         51 => Comma,
         52 => Period,
         54 => ShiftRight,
+        56 => AltLeft,
+        100 => AltRight,
         78 => NumpadAdd,
         74 => NumpadSubtract,
         97 => ControlRight,

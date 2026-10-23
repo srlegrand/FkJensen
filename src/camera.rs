@@ -1,8 +1,8 @@
 //! An orbit camera that can also fly.
 //!
-//! Orbit: drag with the left button, pan with the middle button (or Shift +
-//! left), dolly with the wheel or the right button. Fly: W A S D Q E move,
-//! the right button looks. F frames the scene.
+//! As in Maya: Alt + left button tumbles, Alt + middle (or middle alone)
+//! tracks, Alt + right or the wheel dollies, F frames the selection. The
+//! right button alone looks round, and with W A S D Q E held flies.
 
 use glam::{Mat4, Vec3};
 

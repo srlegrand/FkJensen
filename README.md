@@ -420,17 +420,26 @@ of each pass in milliseconds.
 
 ## Controls
 
-    Lights: point lights in lumens, 1 lm to 2,000,000 lm, plus the sky
+    Selecting and moving (as in Maya)
+    click                  select a model or a light; click empty space to clear
+    Q / W / E / R          select / move / rotate / scale manipulator
+    drag an arrow          move along that axis (X red, Y green, Z blue)
+    drag the centre        move facing the camera (move), scale (scale)
+    drag the ring          turn about the vertical (rotate)
+    F                      frame the selection (the subject when none)
+    A                      frame the subject from afar
+
+    Lights: point lights in lumens, 1 lm to 2,000,000 lm, the sun and the sky
     left drag on a light   move it, facing the camera (stays at its depth)
-      + Ctrl               move it level (keeps its height)
+      + Ctrl               move it level, over the set (keeps its height)
       + wheel              push it away / pull it closer
     arrows                 nudge the selected light, relative to the view
     Page Up / Page Down    raise / lower the selected light (Shift: 5x)
-    1 (hold) + click       add an 800 lm light above the surface under the cursor
+    1 (hold) + click       add a light above the surface under the cursor
     2 (hold) + click       put the selected light above that surface
     Tab                    select next light     Delete   remove selected light
     + / -                  lumens x1.25          C        cycle colour
-    L                      show / hide lights    R        reset to the scene's lights
+    L                      show / hide lights    Ctrl+R   reset to the scene's lights
     T / Shift+T            time of day later / earlier (15 min): sun, sky, exposure
     Y / Shift+Y            sun brighter / dimmer (0 to 1000, steps of 50)
     J / Shift+J            lighting contrast up / down: flat overcast to overhead
@@ -443,10 +452,10 @@ of each pass in milliseconds.
     Z / Shift+Z            render resolution finer / coarser (x1.25)
     V / Shift+V            next / previous visual debug view (--visual-debug)
 
-    Camera
-    left drag              orbit                 middle drag / shift+left   pan
-    right drag             look (fly)            wheel                      dolly
-    W A S D Q E            fly (shift: faster)   F    wide view / close on the subject
+    Camera (as in Maya)
+    Alt + left drag        tumble                Alt + middle drag / middle drag   track
+    Alt + right drag       dolly                 wheel                             dolly
+    right drag             look; with W A S D Q E held, fly (shift: faster)
 
     View
     [ / ]                  exposure              0    exposure from the sky
@@ -458,8 +467,21 @@ of each pass in milliseconds.
 Lights are drawn as discs in their colour; the selected one is larger, has
 a yellow ring, and a dashed line drops from it to the ground with a dot
 where it lands. A disc goes dim when it is behind geometry. Clicking a disc
-selects the light and starts dragging it; clicking anywhere else orbits. A
-rig holds 64 lights at most.
+selects the light and starts dragging it. A rig holds 64 lights at most.
+
+Selecting and moving work as in Maya. Clicking a model selects it (a box
+round it, its manipulator at its pivot, the middle of its base): W shows
+arrows along X, Y and Z and a square that moves it facing the camera, E a
+ring that turns it about the vertical, R a uniform scale (a model only
+turns about the vertical and scales the same on every axis, so its texture
+tiles stay valid). Q hides the manipulator. A light selected with the move
+manipulator gets the arrows too. While a model is dragged its vertices are
+rewritten, its shading dropped, everything else lit again and the shadow
+maps made again each frame; bounce light is made again when it is let go.
+With the high-resolution T-rex, a drag frame took 1.2 to 1.5 s on 2 cores
+of the Xeon (23/10/2026), most of it the four shadow maps, and the release
+frame 2.2 s. On KDE, Alt and the left button move windows by default; set
+the window manager's modifier to Meta for Alt to tumble here.
 
 ![Dragging a lamp on the earlier set (20/10/2026): the shadows follow](docs/light_drag.png)
 

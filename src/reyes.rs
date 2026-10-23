@@ -245,6 +245,14 @@ impl ClusterShade {
         self.vback = 0;
     }
 
+    /// Light changed: everything kept is shaded again, grids kept.
+    fn forget_light(&mut self) {
+        self.done = 0;
+        self.spec_done = 0;
+        self.vdone = 0;
+        self.vspec_done = 0;
+    }
+
     /// Drops every grid and its memory, keeping the vertices.
     fn forget_grids(&mut self) {
         for st in &mut self.state {
@@ -401,6 +409,25 @@ impl Renderer {
     }
 
     /// Memory held by the shading cache and the shadow maps, in bytes.
+    /// Clusters `moved` were moved (an object's geometry rewritten): their
+    /// shading is dropped, everything else is lit again (its shadows may
+    /// have changed), and the shadow maps and visibility are made again.
+    /// Bounce light is made again too when `bounce`; while an object is
+    /// being dragged it is left, and redone when the drag ends.
+    pub fn moved(&mut self, moved: std::ops::Range<usize>, bounce: bool) {
+        for c in moved {
+            if let Some(e) = self.cache.get_mut(c) {
+                *e = ClusterShade::empty();
+            }
+        }
+        self.prev_global = None;
+        self.sun_key = None;
+        self.vis_key = None;
+        if bounce {
+            self.bounce = None;
+        }
+    }
+
     pub fn memory(&self) -> usize {
         let shade: usize = self.cache.iter().map(|c| c.bytes()).sum();
         let shadows: usize = self.shadows.iter().flatten().map(|s| s.bytes()).sum();
@@ -435,8 +462,7 @@ impl Renderer {
         if global_changed {
             full_resolve = true;
             for c in &mut self.cache {
-                c.done = 0;
-                c.spec_done = 0;
+                c.forget_light();
             }
             self.shadows = (0..lights.len()).map(|_| None).collect();
         } else {
@@ -453,8 +479,7 @@ impl Renderer {
             if !spheres.is_empty() {
                 self.cache.par_iter_mut().zip(scene.clusters.par_iter()).for_each(|(e, c)| {
                     if spheres.iter().any(|(p, r)| p.distance(c.centre) <= c.radius + r) {
-                        e.done = 0;
-                        e.spec_done = 0;
+                        e.forget_light();
                     }
                 });
             }
@@ -1295,6 +1320,38 @@ mod tests {
         assert!(f.stats.cache_bytes <= budget, "{} bytes", f.stats.cache_bytes);
         let lit = f.color.iter().filter(|p| (**p & 0xff) > 10).count();
         assert!(lit > w * h / 2, "{lit} pixels drawn");
+    }
+
+    /// Moving an object, then changing the sky: each time the kept picture
+    /// is the one a fresh render gives (the moved clusters are diced again,
+    /// everything is lit again, shadows and bounce are made again).
+    #[test]
+    fn moving_an_object_and_relighting_match_a_fresh_render() {
+        let (mut scene, lights) = world();
+        let (p, idx) = crate::scene::tests::uv_sphere(24);
+        let first = scene.clusters.len();
+        let ball: Vec<Vec3> = p.iter().map(|v| *v * 0.3 + Vec3::new(0.0, 0.6, 0.0)).collect();
+        scene.push_mesh(&ball, &[], &[Vec3::new(0.8, 0.3, 0.2)], &idx);
+        let n = scene.clusters.len();
+        scene.add_object("ball".into(), first..n, Vec3::new(0.0, 0.3, 0.0), 0.0);
+        let (w, h) = (200, 112);
+        let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.6, 0.0), 4.0, 0.15);
+        let mut settings = RenderSettings::new(Sky::new(30.0, true));
+        let mut r = Renderer::new();
+        let mut f = Frame::new(w, h);
+        r.render(&scene, &cam, &lights, &settings, &mut f);
+        let before = f.color.clone();
+        scene.set_object(0, Vec3::new(0.6, 0.3, 0.2), 0.5, 1.4);
+        r.moved(scene.objects[0].clusters.clone(), true);
+        r.render(&scene, &cam, &lights, &settings, &mut f);
+        assert_ne!(f.color, before, "the picture changed");
+        let mut fresh = Frame::new(w, h);
+        render(&scene, &cam, &lights, &settings, &mut fresh);
+        assert!(worst(&f, &fresh) <= 1, "after the move: {}", worst(&f, &fresh));
+        settings.sky = Sky::new(300.0, true);
+        r.render(&scene, &cam, &lights, &settings, &mut f);
+        render(&scene, &cam, &lights, &settings, &mut fresh);
+        assert!(worst(&f, &fresh) <= 1, "after the sky changed: {}", worst(&f, &fresh));
     }
 
     /// A card between a light and the floor darkens the floor under it.

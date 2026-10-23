@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 23/10/2026: models are objects that can be selected and moved with Maya's manipulators (W move, E rotate about the vertical, R uniform scale), and the camera navigates as in Maya (Alt + left tumble, Alt + middle track, Alt + right dolly, F frame selected). Moving a model rewrites its vertices; nothing about light is kept on the model, so the renderer only drops what it had kept for it.
 - 23/10/2026: levels of detail. fkj-import builds each model into a cluster hierarchy (groups of four clusters simplified to half by quadric edge collapse, borders locked; own Rust simplifier, no C++), every level with its own tiles, in a `LODS` section (.fkj version 2). The renderer draws the coarsest level whose error looks no bigger than the micropolygon spacing, so geometry density follows the machine's plan with shading; shadow maps by their texels, surfels at 2 cm.
 - 23/10/2026: the machine's plan sets the micropolygon spacing: the window aims at 30 frames a second, spacing micropolygons 2 to 8 pixels apart before lowering resolution; stills shade 1 to 2 pixels apart. `--shading-rate PX` overrides it.
 - 22/10/2026: a window frame no longer holds the last frame's setup records while making new ones (about 1 GB with the high-resolution T-rex, which ran an 8 GB laptop out of memory), and the texture and shading caches are sized from what the set leaves of available memory, not all of it.

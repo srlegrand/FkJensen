@@ -163,6 +163,27 @@ pub struct Scene {
     /// Per-triangle texture tiles, streamed (`texture.rs`); empty when the
     /// scene has only vertex colours.
     pub textures: crate::texture::Textures,
+    /// What can be selected and moved: runs of clusters with a pivot.
+    /// Geometry outside every object (the ground, the mountains) stays put.
+    pub objects: Vec<Object>,
+}
+
+/// A model in the scene: its clusters (and so its vertices, which they
+/// hold in one run), and how it has been placed. Geometry is kept in world
+/// space; moving an object rewrites its vertices.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Object {
+    pub name: String,
+    pub clusters: std::ops::Range<usize>,
+    /// The point it turns and scales about: the middle of its base when
+    /// placed.
+    pub pivot: Vec3,
+    /// Turn about the vertical, radians, and uniform scale, since placed.
+    pub yaw: f32,
+    pub scale: f32,
+    /// Bounds of its finest level's vertices.
+    pub lo: Vec3,
+    pub hi: Vec3,
 }
 
 impl Scene {
@@ -250,9 +271,10 @@ impl Scene {
         self.bounds_max = hi;
     }
 
-    /// Append another scene's geometry, lights and texture tiles.
+    /// Append another scene's geometry, lights, texture tiles and objects.
     pub fn append(&mut self, other: Scene) {
         let cbase = self.clusters.len();
+        self.objects.extend(other.objects.iter().map(|o| Object { clusters: o.clusters.start + cbase..o.clusters.end + cbase, ..o.clone() }));
         let other_clusters = other.clusters.len();
         if !other.textures.is_empty() || !self.textures.is_empty() {
             self.textures.append(&other.textures, cbase, other_clusters);
@@ -267,6 +289,82 @@ impl Scene {
         self.bounds_min = self.bounds_min.min(other.bounds_min);
         self.bounds_max = self.bounds_max.max(other.bounds_max);
         self.lights.extend(other.lights);
+    }
+
+    /// Make clusters `clusters` an object turning about `pivot`, already
+    /// turned by `yaw`.
+    pub fn add_object(&mut self, name: String, clusters: std::ops::Range<usize>, pivot: Vec3, yaw: f32) -> usize {
+        self.objects.push(Object { name, clusters, pivot, yaw, scale: 1.0, lo: Vec3::ZERO, hi: Vec3::ZERO });
+        let i = self.objects.len() - 1;
+        self.refresh_bounds(i);
+        i
+    }
+
+    /// Measure an object's bounds again from its finest level's vertices.
+    fn refresh_bounds(&mut self, i: usize) {
+        use rayon::prelude::*;
+        let range = self.objects[i].clusters.clone();
+        let finest = self.clusters[range.clone()].iter().map(|c| c.lod_level).min().unwrap_or(0);
+        let (lo, hi) = self.clusters[range]
+            .par_iter()
+            .filter(|c| c.lod_level == finest)
+            .map(|c| {
+                let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+                for p in &self.positions[c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize] {
+                    lo = lo.min(*p);
+                    hi = hi.max(*p);
+                }
+                (lo, hi)
+            })
+            .reduce(|| (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)), |a, b| (a.0.min(b.0), a.1.max(b.1)));
+        self.objects[i].lo = lo;
+        self.objects[i].hi = hi;
+    }
+
+    /// The object holding cluster `c`, if any.
+    pub fn object_of(&self, c: usize) -> Option<usize> {
+        self.objects.iter().position(|o| o.clusters.contains(&c))
+    }
+
+    /// Bounds of an object.
+    pub fn object_bounds(&self, i: usize) -> (Vec3, Vec3) {
+        (self.objects[i].lo, self.objects[i].hi)
+    }
+
+    /// Place object `i` at `pivot`, turned to `yaw` and scaled to `scale`
+    /// (absolute, from how it was first placed): its vertices, normals,
+    /// clusters and levels of detail move with it. Turning about the
+    /// vertical and scaling the same on every axis keep each triangle's
+    /// corners in order, so its texture tile stays valid.
+    pub fn set_object(&mut self, i: usize, pivot: Vec3, yaw: f32, scale: f32) {
+        use rayon::prelude::*;
+        let o = self.objects[i].clone();
+        let scale = scale.max(1e-4);
+        let (dyaw, k) = (yaw - o.yaw, scale / o.scale);
+        if pivot == o.pivot && dyaw == 0.0 && k == 1.0 {
+            return;
+        }
+        let q = glam::Quat::from_rotation_y(dyaw);
+        let map = |p: Vec3| q * ((p - o.pivot) * k) + pivot;
+        let cs = &self.clusters[o.clusters.clone()];
+        let (Some(first), Some(last)) = (cs.first(), cs.last()) else { return };
+        let verts = first.first_vertex as usize..(last.first_vertex + last.vertex_count) as usize;
+        self.positions[verts.clone()].par_iter_mut().for_each(|p| *p = map(*p));
+        self.normals[verts].par_iter_mut().for_each(|n| *n = q * *n);
+        for c in &mut self.clusters[o.clusters.clone()] {
+            c.centre = map(c.centre);
+            c.radius *= k;
+            c.cone_axis = q * c.cone_axis;
+            c.move_lod(map, k);
+        }
+        let ob = &mut self.objects[i];
+        ob.pivot = pivot;
+        ob.yaw = yaw;
+        ob.scale = scale;
+        self.refresh_bounds(i);
+        let (lo, hi) = self.object_bounds(i);
+        self.bounds_min = self.bounds_min.min(lo);
+        self.bounds_max = self.bounds_max.max(hi);
     }
 
     /// Append a mesh already in world space, cutting it into clusters.
@@ -577,6 +675,43 @@ pub mod tests {
         assert_eq!(seen.len(), idx.len() / 3);
         // Clusters should be well filled, not one triangle each.
         assert!(s.clusters.len() * 40 < idx.len() / 3 * 2, "{} clusters for {} triangles", s.clusters.len(), idx.len() / 3);
+    }
+
+    /// Moving, turning and scaling an object moves its vertices, normals
+    /// and clusters together, keeps its triangles' shapes, and leaves the
+    /// rest of the scene where it was.
+    #[test]
+    fn objects_move_turn_and_scale() {
+        let (p, idx) = uv_sphere(32);
+        let mut s = Scene::new();
+        s.push_mesh(&[Vec3::new(-50.0, 0.0, -50.0), Vec3::new(50.0, 0.0, -50.0), Vec3::new(0.0, 0.0, 50.0)], &[], &[], &[0, 1, 2]);
+        let ground = s.positions.clone();
+        let first = s.clusters.len();
+        let lifted: Vec<Vec3> = p.iter().map(|v| *v + Vec3::Y).collect();
+        s.push_mesh(&lifted, &[], &[], &idx);
+        s.add_object("ball".into(), first..s.clusters.len(), Vec3::ZERO, 0.0);
+        let before = s.positions.clone();
+        let (yaw, k, to) = (0.7f32, 2.0f32, Vec3::new(3.0, 0.0, -2.0));
+        s.set_object(0, to, yaw, k);
+        let q = glam::Quat::from_rotation_y(yaw);
+        let vbase = s.clusters[first].first_vertex as usize;
+        for v in vbase..s.positions.len() {
+            let want = q * (before[v] * k) + to;
+            assert!(s.positions[v].distance(want) < 1e-4);
+        }
+        assert_eq!(&s.positions[..ground.len()], &ground[..], "the ground stays put");
+        for c in &s.clusters[first..] {
+            for v in c.first_vertex..c.first_vertex + c.vertex_count {
+                assert!(s.positions[v as usize].distance(c.centre) <= c.radius + 1e-4);
+            }
+        }
+        // And back, from the absolute placement.
+        s.set_object(0, Vec3::ZERO, 0.0, 1.0);
+        for v in vbase..s.positions.len() {
+            assert!(s.positions[v].distance(before[v]) < 1e-4);
+        }
+        assert_eq!(s.object_of(first), Some(0));
+        assert_eq!(s.object_of(0), None);
     }
 
     #[test]
