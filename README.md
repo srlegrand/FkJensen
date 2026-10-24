@@ -637,11 +637,14 @@ with egui, on the CPU like everything else: egui's triangles are filled by
   width and height; Viewport pixels follows the viewport, times the
   resolution percentage, as the plain window does.
 - **While an object is dragged** (manipulator or attribute editor), it
-  moves in 2.5D as a model does in ZBrush while sculpting: its shading
-  goes with it, lit as where the drag began, and the rest of the scene
-  keeps its light, shadow maps and its shadow where it was; only the
-  pixels round it are made again. When it is let go it is lit where it
-  stands (baked). It is drawn with micropolygons "Moving: micropolygons"
+  moves in 2.5D as a model does in ZBrush while sculpting. On the drag's
+  first frame the scene is drawn once without it and the object once on
+  its own, lit as where the drag began; each step then only moves the
+  object's picture (a point per pixel, with its depth) and draws it over
+  the rest, nearest first. When it has turned about 11 degrees or grown
+  or shrunk 1.3 times on screen its picture is drawn again. The rest of
+  the scene keeps its light, shadow maps and the object's shadow where it
+  was. When it is let go it is lit where it stands (baked). It is drawn with micropolygons "Moving: micropolygons"
   times further apart (3 at start) and a level of detail allowed
   "Moving: geometry error" times the error (3 at start); 1 turns either
   off. "Light each drag step" lights every step where it is instead.

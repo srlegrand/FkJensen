@@ -65,6 +65,12 @@ pub struct Stats {
     pub tris_drawn: usize,
     /// Whether visibility was kept from the last frame (camera unchanged).
     pub visibility_kept: bool,
+    /// While an object is dragged: the points of its picture moved over
+    /// the rest, and whether that picture was captured this frame.
+    pub layer_points: usize,
+    pub layer_captured: bool,
+    /// Moving that picture and drawing it over the rest, ms.
+    pub layer_ms: f32,
     /// Shading points shaded this frame (the rest came from the cache).
     pub points_shaded: u64,
     /// Shading points the frame used.
@@ -616,6 +622,17 @@ pub fn dice_level_at(edge_px: f32, rate: f32) -> u8 {
     ((edge_px / rate).log2().ceil() as i32).clamp(0, MAX_DICE_LEVEL as i32) as u8
 }
 
+/// Which clusters `visibility` draws.
+#[derive(Clone, Copy, Debug)]
+pub enum Part<'a> {
+    All,
+    /// All but these.
+    Without(&'a [std::ops::Range<usize>]),
+    /// Only these, with their level of detail allowed this many times the
+    /// error.
+    Only(&'a [std::ops::Range<usize>], f32),
+}
+
 /// Pixels per side of a block of the hierarchical depth buffer. 4 culls
 /// twice what 8 does in the close view of the built-in set (a block holds
 /// its farthest depth, so a block on an outline holds the background).
@@ -627,8 +644,7 @@ pub const HIZ_BLOCK: usize = 4;
 ///
 /// Of clusters with levels of detail, only those whose error looks no
 /// bigger than `lod_px` pixels and whose replacement's does are drawn
-/// (`Cluster::lod_drawn`); `lod_px * moving_detail` for the clusters in
-/// `moving`.
+/// (`Cluster::lod_drawn`). `part` picks which clusters are drawn at all.
 ///
 /// Occlusion culling in two passes (as Nanite does): the clusters that
 /// owned a pixel last frame (`prev`, one entry per cluster, non-zero when
@@ -640,7 +656,7 @@ pub const HIZ_BLOCK: usize = 4;
 /// less useful. Without `prev` (the first frame) everything is drawn in
 /// one pass.
 #[allow(clippy::too_many_arguments)]
-pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile: usize, lod_px: f32, moving: (&[std::ops::Range<usize>], f32), prev: Option<&[u128]>, frame: &mut Frame) -> Vec<u8> {
+pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile: usize, lod_px: f32, part: Part<'_>, prev: Option<&[u128]>, frame: &mut Frame) -> Vec<u8> {
     // The last frame's setup records go before the new ones are made: with
     // the high-resolution T-rex they are about 1 GB.
     frame.setups = Vec::new();
@@ -659,7 +675,13 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile
         .into_par_iter()
         .filter(|&i| {
             let c = &scene.clusters[i as usize];
-            let px = if moving.0.iter().any(|r| r.contains(&(i as usize))) { lod_px * moving.1.max(1.0) } else { lod_px };
+            let px = match part {
+                Part::All => lod_px,
+                Part::Without(r) if r.iter().any(|r| r.contains(&(i as usize))) => return false,
+                Part::Without(_) => lod_px,
+                Part::Only(r, detail) if r.iter().any(|r| r.contains(&(i as usize))) => lod_px * detail.max(1.0),
+                Part::Only(..) => return false,
+            };
             c.lod_drawn(px, &lod_scale) && !cluster_hidden(c, &planes, eye, cull)
         })
         .collect();

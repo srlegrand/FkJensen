@@ -805,7 +805,7 @@ pub fn shot(app: App, w: usize, h: usize, out: &str, import: Option<PathBuf>, be
     if bench_move && !ed.app.scene.objects.is_empty() {
         let line = |ed: &Editor, what: &str| {
             let s = ed.app.frame.stats;
-            eprintln!("{what}: {} (layout and paint at {w} x {h}); renderer: visibility {:.0}, shade {:.0}, resolve {:.0}, shadows {:.0} ms", ed.times.line(), s.setup_ms + s.bin_ms + s.raster_ms, s.shade_ms, s.resolve_ms, s.shadow_ms);
+            eprintln!("{what}: {} (layout and paint at {w} x {h}); renderer: visibility {:.0}, shade {:.0}, resolve {:.0}, shadows {:.0}, layer {:.0} ms{}", ed.times.line(), s.setup_ms + s.bin_ms + s.raster_ms, s.shade_ms, s.resolve_ms, s.shadow_ms, s.layer_ms, if s.layer_captured { " (captured)" } else { "" });
         };
         ed.select(Selection::Object(0));
         ed.frame(raw(), w, h);

@@ -355,6 +355,29 @@ struct VisKey {
     moving: u64,
 }
 
+/// A dragged object's layer turns this far (radians) or grows or
+/// shrinks this many times on screen before it is captured again.
+const LAYER_TURN: f32 = 0.2;
+const LAYER_GROW: f32 = 1.3;
+
+/// The picture without the dragged object, for the view `key`.
+struct Background {
+    key: (Mat4, usize, usize),
+    color: Vec<u32>,
+    depth: Vec<f32>,
+    /// Its triangle ids; the frame keeps the setup records they index.
+    tri_id: Vec<u32>,
+}
+
+/// The dragged object alone: each pixel it covered as a point in the
+/// world and its colour, captured when it had been moved by `ahead` from
+/// where the drag began, `distance` from the eye.
+struct Layer {
+    ahead: glam::Affine3A,
+    distance: f32,
+    points: Vec<(Vec3, u32)>,
+}
+
 /// An object being dragged (`Renderer::dragged`).
 struct Drag {
     clusters: Vec<std::ops::Range<usize>>,
@@ -364,6 +387,8 @@ struct Drag {
     /// From where it is to where it was when the drag began, and its turn.
     back: glam::Affine3A,
     turn: glam::Quat,
+    background: Option<Background>,
+    layer: Option<Layer>,
 }
 
 /// Cluster `c` taken back by `back` (turning by `turn`): where it was when
@@ -378,30 +403,6 @@ fn carry(c: &crate::scene::Cluster, back: glam::Affine3A, turn: glam::Quat) -> c
     h.radius = c.radius * k * (1.0 + 1e-5) + 1e-6;
     h.cone_axis = turn * c.cone_axis;
     h
-}
-
-/// The pixels the boxes `boxes` cover on screen, a pixel wider: x0, y0,
-/// x1, y1, ends excluded. None when a box reaches behind the near plane.
-fn screen_rect(cam: &Camera, width: usize, height: usize, boxes: &[(Vec3, Vec3)]) -> Option<(usize, usize, usize, usize)> {
-    let vp = cam.proj * cam.view;
-    let (mut lo, mut hi) = (glam::Vec2::splat(f32::INFINITY), glam::Vec2::splat(f32::NEG_INFINITY));
-    for &(a, b) in boxes {
-        for k in 0..8 {
-            let p = Vec3::new(if k & 1 == 0 { a.x } else { b.x }, if k & 2 == 0 { a.y } else { b.y }, if k & 4 == 0 { a.z } else { b.z });
-            let q = vp * p.extend(1.0);
-            if q.w < cam.near {
-                return None;
-            }
-            let s = glam::Vec2::new((q.x / q.w * 0.5 + 0.5) * width as f32, (0.5 - q.y / q.w * 0.5) * height as f32);
-            lo = lo.min(s);
-            hi = hi.max(s);
-        }
-    }
-    let x0 = (lo.x - 2.0).floor().clamp(0.0, width as f32) as usize;
-    let y0 = (lo.y - 2.0).floor().clamp(0.0, height as f32) as usize;
-    let x1 = (hi.x + 2.0).ceil().clamp(0.0, width as f32) as usize;
-    let y1 = (hi.y + 2.0).ceil().clamp(0.0, height as f32) as usize;
-    Some((x0, y0, x1.max(x0), y1.max(y0)))
 }
 
 static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
@@ -448,9 +449,6 @@ pub struct Renderer {
     rate_scale: f32,
     /// The object being dragged, if any (`dragged`).
     drag: Option<Drag>,
-    /// Boxes the dragged object was in and is in since the last frame:
-    /// only the pixels they cover are resolved again.
-    drag_boxes: Vec<(Vec3, Vec3)>,
     /// Each sample's share of the sky, for the sky contrast it was made for.
     sky_share: Option<(SkyShare, u32)>,
     /// Each surfel's share of the sky, for the shares above.
@@ -544,7 +542,6 @@ impl Renderer {
             frame_no: 0,
             rate_scale: 1.0,
             drag: None,
-            drag_boxes: Vec::new(),
             sky_share: None,
             surfel_share: Vec::new(),
         }
@@ -556,9 +553,11 @@ impl Renderer {
     /// are now to where they were when the drag began. Nothing about light
     /// is redone for it: its shading goes with it, as lit where it began
     /// (points that come into view are lit there too), and the rest of the
-    /// scene keeps its shading and shadow maps. It is drawn coarser
-    /// (`RenderSettings::moving_rate`, `moving_detail`) and only the pixels
-    /// it covered or covers are resolved again. `drag_ended` bakes it.
+    /// scene keeps its shading and shadow maps. The scene without it and
+    /// the object alone are drawn once, the object coarser
+    /// (`RenderSettings::moving_rate`, `moving_detail`), and each frame
+    /// moves the object's picture with it over the rest (`render_drag`).
+    /// `drag_ended` bakes it.
     pub fn dragged(&mut self, clusters: Vec<std::ops::Range<usize>>, from: (Vec3, Vec3), to: (Vec3, Vec3), back: glam::Affine3A) {
         let (_, turn, _) = back.to_scale_rotation_translation();
         match &mut self.drag {
@@ -568,16 +567,14 @@ impl Renderer {
                 d.back = back;
                 d.turn = turn.normalize();
             }
-            None => self.drag = Some(Drag { clusters, start: from, now: to, back, turn: turn.normalize() }),
+            None => self.drag = Some(Drag { clusters, start: from, now: to, back, turn: turn.normalize(), background: None, layer: None }),
         }
-        self.drag_boxes.push(from);
-        self.drag_boxes.push(to);
+        self.vis_key = None;
     }
 
     /// The drag ended: the object is lit where it stands, as `moved` from
     /// where the drag began, and bounce light is made again.
     pub fn drag_ended(&mut self) {
-        self.drag_boxes.clear();
         self.bounce = None;
         if let Some(d) = self.drag.take() {
             self.vis_key = None;
@@ -633,14 +630,15 @@ impl Renderer {
         self.vis_key = None;
     }
 
-    /// What the coarser drawing of moving clusters depends on, for the
-    /// visibility key.
-    fn moving_key(&self, settings: &RenderSettings) -> u64 {
+    /// Which clusters a pass draws, for the visibility key.
+    fn part_key(part: raster::Part<'_>) -> u64 {
         use std::hash::{Hash, Hasher};
-        let Some(d) = &self.drag else { return 0 };
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        d.clusters.hash(&mut h);
-        settings.moving_detail.to_bits().hash(&mut h);
+        match part {
+            raster::Part::All => return 0,
+            raster::Part::Without(r) => (1u8, r).hash(&mut h),
+            raster::Part::Only(r, k) => (2u8, r, k.to_bits()).hash(&mut h),
+        }
         h.finish() | 1
     }
 
@@ -651,6 +649,163 @@ impl Renderer {
     }
 
     pub fn render(&mut self, scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &RenderSettings, frame: &mut Frame) {
+        if self.drag.is_some() && settings.view == View::Shaded {
+            self.render_drag(scene, cam, lights, settings, frame);
+        } else {
+            self.render_pass(scene, cam, lights, settings, frame, None);
+        }
+    }
+
+    /// A frame while an object is dragged: the layer of the object, as
+    /// captured, moved with it and drawn over the scene without it, by
+    /// depth. Both are captured on the drag's first frame; the layer again
+    /// when the object has turned or grown on screen too far for it.
+    fn render_drag(&mut self, scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &RenderSettings, frame: &mut Frame) {
+        let (w, h) = (frame.width, frame.height);
+        let vp = cam.proj * cam.view;
+        let Some(d) = self.drag.as_ref() else { return };
+        let ahead = d.back.inverse();
+        let clusters = d.clusters.clone();
+        let view_key = (vp, w, h);
+        let mut captured = false;
+        let mut stats: Option<raster::Stats> = None;
+        if d.background.as_ref().is_none_or(|b| b.key != view_key) {
+            // The scene without the object.
+            self.vis_key = None;
+            self.render_pass(scene, cam, lights, settings, frame, Some(raster::Part::Without(&clusters)));
+            let bg = Background { key: view_key, color: frame.color.clone(), depth: frame.depth.clone(), tri_id: frame.tri_id.clone() };
+            stats = Some(frame.stats);
+            let d = self.drag.as_mut().unwrap();
+            d.background = Some(bg);
+            d.layer = None;
+        }
+        let d = self.drag.as_ref().unwrap();
+        // How far the object has turned and grown on screen since the
+        // layer was captured.
+        let centre = (d.now.0 + d.now.1) * 0.5;
+        let stale = match &d.layer {
+            None => true,
+            Some(l) => {
+                let rel = ahead * l.ahead.inverse();
+                let (k, q, _) = rel.to_scale_rotation_translation();
+                let grow = k.x * l.distance / centre.distance(cam.eye).max(1e-4);
+                q.angle_between(glam::Quat::IDENTITY) > LAYER_TURN || !(1.0 / LAYER_GROW..=LAYER_GROW).contains(&grow)
+            }
+        };
+        if stale {
+            // The object alone, lit as where the drag began.
+            self.vis_key = None;
+            let mut f = Frame::new(w, h);
+            self.render_pass(scene, cam, lights, settings, &mut f, Some(raster::Part::Only(&clusters, settings.moving_detail)));
+            let mut points = Vec::new();
+            for (i, &id) in f.tri_id.iter().enumerate() {
+                if id == NO_TRI {
+                    continue;
+                }
+                let st = &f.setups[id as usize];
+                let c = &scene.clusters[st.cluster as usize];
+                let (x, y) = (i % w, i / w);
+                let b = raster::barycentrics(st, x as f32 + 0.5, y as f32 + 0.5);
+                let bw = [0, 1, 2].map(|k| b[0] * st.bary[0][k] + b[1] * st.bary[1][k] + b[2] * st.bary[2][k]);
+                let [i0, i1, i2] = scene.tri(c, st.tri);
+                let p = scene.pos(c, i0) * bw[0] + scene.pos(c, i1) * bw[1] + scene.pos(c, i2) * bw[2];
+                points.push((p, f.color[i]));
+            }
+            stats = Some(match stats {
+                None => f.stats,
+                Some(mut b) => {
+                    b.points_shaded += f.stats.points_shaded;
+                    b.points_used += f.stats.points_used;
+                    b.setup_ms += f.stats.setup_ms;
+                    b.raster_ms += f.stats.raster_ms;
+                    b.shade_ms += f.stats.shade_ms;
+                    b.resolve_ms += f.stats.resolve_ms;
+                    b.tris_drawn += f.stats.tris_drawn;
+                    b
+                }
+            });
+            let d = self.drag.as_mut().unwrap();
+            d.layer = Some(Layer { ahead, distance: centre.distance(cam.eye), points });
+            captured = true;
+            self.vis_key = None;
+        }
+        // The scene without it, then the layer moved with it, nearest
+        // first by depth.
+        let d = self.drag.as_ref().unwrap();
+        let (bg, layer) = (d.background.as_ref().unwrap(), d.layer.as_ref().unwrap());
+        let t = std::time::Instant::now();
+        frame.color.copy_from_slice(&bg.color);
+        frame.depth.copy_from_slice(&bg.depth);
+        frame.tri_id.copy_from_slice(&bg.tri_id);
+        let rel = ahead * layer.ahead.inverse();
+        let m = vp * glam::Mat4::from(rel);
+        let (hw, hh) = (w as f32 * 0.5, h as f32 * 0.5);
+        // The layer's points into a picture of its own, each to the pixel
+        // its centre falls in, nearest first.
+        let mut lcol = vec![0u32; w * h];
+        let mut ldep = vec![0f32; w * h];
+        for &(p, col) in &layer.points {
+            let q = m * p.extend(1.0);
+            if q.w < cam.near {
+                continue;
+            }
+            let inv = 1.0 / q.w;
+            let (x, y) = (((q.x * inv + 1.0) * hw).floor(), ((1.0 - q.y * inv) * hh).floor());
+            if x < 0.0 || y < 0.0 || x >= w as f32 || y >= h as f32 {
+                continue;
+            }
+            let k = y as usize * w + x as usize;
+            if inv > ldep[k] {
+                ldep[k] = inv;
+                lcol[k] = col;
+            }
+        }
+        // Gaps a pixel wide where it grew or turned: an empty pixel between
+        // two of its pixels, across or down, takes the nearer one.
+        for _ in 0..2 {
+            let (sc, sd) = (lcol.clone(), ldep.clone());
+            lcol.par_chunks_mut(w).zip(ldep.par_chunks_mut(w)).enumerate().for_each(|(y, (cr, dr))| {
+                if y == 0 || y + 1 >= h {
+                    return;
+                }
+                for x in 1..w - 1 {
+                    if dr[x] > 0.0 {
+                        continue;
+                    }
+                    let k = y * w + x;
+                    for (a, b) in [(k - 1, k + 1), (k - w, k + w)] {
+                        if sd[a] > 0.0 && sd[b] > 0.0 {
+                            let near = if sd[a] >= sd[b] { a } else { b };
+                            dr[x] = (sd[a] + sd[b]) * 0.5;
+                            cr[x] = sc[near];
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        // Over the scene without it, by depth.
+        frame.color.par_chunks_mut(w).zip(frame.depth.par_chunks_mut(w)).zip(frame.tri_id.par_chunks_mut(w)).enumerate().for_each(|(y, ((cr, dr), tr))| {
+            for x in 0..w {
+                let k = y * w + x;
+                if ldep[k] > dr[x] {
+                    dr[x] = ldep[k];
+                    cr[x] = lcol[k];
+                    tr[x] = NO_TRI;
+                }
+            }
+        });
+        frame.stats = stats.unwrap_or_default();
+        frame.stats.clusters_in = scene.clusters.len();
+        frame.stats.layer_captured = captured;
+        frame.stats.layer_points = layer.points.len();
+        frame.stats.layer_ms = t.elapsed().as_secs_f32() * 1000.0;
+        frame.vis_stamp = 0;
+    }
+
+    /// One frame of the scene, or of `part` of it.
+    fn render_pass(&mut self, scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &RenderSettings, frame: &mut Frame, part: Option<raster::Part<'_>>) {
+        let part = part.unwrap_or(raster::Part::All);
         let n_lights = lights.len().min(64);
         let lights = &lights[..n_lights];
         let key = (scene.qpos.as_ptr() as usize, scene.qpos.len(), scene.clusters.len());
@@ -972,25 +1127,19 @@ impl Renderer {
         frame.stats.bounce_ms = tb.elapsed().as_secs_f32() * 1000.0;
 
         // Visibility, unless the camera and the frame are as they were.
-        let vk = VisKey { occlusion: settings.occlusion, tile: settings.tile, view: cam.view, proj: cam.proj, size: (frame.width, frame.height), cull: settings.cull_backfaces, wireframe: settings.wireframe, lod_px: settings.lod_px().to_bits(), moving: self.moving_key(settings) };
-        let same_view = self.vis_key == Some(vk) && frame.vis_stamp == self.vis_stamp && self.vis_stamp != 0;
-        // Pixels a dragged object covered or covers, when only it moved.
-        let drag_rect = if same_view && !self.drag_boxes.is_empty() { screen_rect(cam, frame.width, frame.height, &self.drag_boxes) } else { None };
-        let dragged_only = same_view && drag_rect.is_some();
-        if same_view && self.drag_boxes.is_empty() {
+        let vk = VisKey { occlusion: settings.occlusion, tile: settings.tile, view: cam.view, proj: cam.proj, size: (frame.width, frame.height), cull: settings.cull_backfaces, wireframe: settings.wireframe, lod_px: settings.lod_px().to_bits(), moving: Self::part_key(part) };
+        if self.vis_key == Some(vk) && frame.vis_stamp == self.vis_stamp && self.vis_stamp != 0 {
             frame.stats.visibility_kept = true;
             frame.stats.clusters_in = scene.clusters.len();
             frame.stats.clusters_drawn = self.levels.iter().filter(|l| **l != NOT_VISIBLE).count();
             frame.stats.tris_in = scene.triangle_count();
             frame.stats.tris_drawn = frame.setups.len();
         } else {
-            if !dragged_only {
-                full_resolve = true;
-            }
+            full_resolve = true;
             // What owned a pixel last frame is drawn first, to hide the rest
             // behind.
             let prev = (settings.occlusion && self.need.len() == scene.clusters.len()).then_some(&self.need[..]);
-            self.levels = raster::visibility(scene, cam, settings.cull_backfaces, settings.wireframe, settings.tile, settings.lod_px(), (self.drag.as_ref().map(|d| &d.clusters[..]).unwrap_or(&[]), settings.moving_detail), prev, frame);
+            self.levels = raster::visibility(scene, cam, settings.cull_backfaces, settings.wireframe, settings.tile, settings.lod_px(), part, prev, frame);
             self.vis_key = Some(vk);
             self.vis_stamp = NEXT_STAMP.fetch_add(1, Ordering::Relaxed);
             frame.vis_stamp = self.vis_stamp;
@@ -1537,8 +1686,6 @@ impl Renderer {
         }
         self.base_view = Some(view);
         frame.stats.full_resolve = full_resolve;
-        let drag_rect = if full_resolve { None } else { drag_rect };
-        self.drag_boxes.clear();
         let cache = &self.cache;
         let tri_id = &frame.tri_id;
         let setups = &frame.setups;
@@ -1551,8 +1698,7 @@ impl Renderer {
             for x in 0..width {
                 let id = tri_id[y * width + x];
                 let changed = |c: usize| cache[c].stamp == frame_no || bounce.is_some_and(|b| b.cluster_stamp[c] == frame_no);
-                let in_rect = drag_rect.is_some_and(|(x0, y0, x1, y1)| x >= x0 && x < x1 && y >= y0 && y < y1);
-                if !full_resolve && !in_rect && (id == NO_TRI || !changed(setups[id as usize].cluster as usize)) {
+                if !full_resolve && (id == NO_TRI || !changed(setups[id as usize].cluster as usize)) {
                     // Nothing under this pixel changed: keep it.
                     continue;
                 }
@@ -2569,9 +2715,10 @@ mod tests {
         assert!(worst(&f, &fresh) <= 1, "after the sky changed: {}", worst(&f, &fresh));
     }
 
-    /// While an object is dragged its shading goes with it and the rest is
-    /// kept: almost nothing is shaded and only the pixels round it are
-    /// resolved. Once let go it is lit where it stands, as a fresh render.
+    /// While an object is dragged its picture goes with it over the rest:
+    /// nothing is shaded or resolved after the first frame, until it has
+    /// turned too far, when its picture is captured again. Once let go it
+    /// is lit where it stands, as a fresh render.
     #[test]
     fn a_dragged_object_carries_its_light_until_let_go() {
         let (mut scene, lights) = world();
@@ -2588,20 +2735,38 @@ mod tests {
         let mut f = Frame::new(w, h);
         r.render(&scene, &cam, &lights, &settings, &mut f);
         let full = f.stats.points_shaded;
+        // The same drag drawn in 3D, carrying its shading, to compare.
+        let mut r3 = Renderer::new();
+        let mut f3 = Frame::new(w, h);
+        r3.render(&scene, &cam, &lights, &settings, &mut f3);
         let start = scene.objects[0].clone();
         let mut last = Vec::new();
-        for step in 1..=3 {
+        for step in 1..=4 {
             let from = scene.object_bounds(0);
-            let (pivot, turn) = (start.pivot + Vec3::new(0.04 * step as f32, 0.0, 0.0), Vec3::new(0.0, 0.2 * step as f32, 0.0));
+            // The last step turns past what the picture can follow.
+            let yaw = if step < 4 { 0.03 * step as f32 } else { 0.6 };
+            let (pivot, turn) = (start.pivot + Vec3::new(0.04 * step as f32, 0.0, 0.0), Vec3::new(0.0, yaw, 0.0));
             scene.set_object(0, pivot, turn, 1.0);
             let to = scene.object_bounds(0);
             let ahead = glam::Affine3A::from_translation(pivot) * glam::Affine3A::from_rotation_translation(crate::scene::euler_quat(turn), Vec3::ZERO) * glam::Affine3A::from_translation(-start.pivot);
             r.dragged(vec![first..n], from, to, ahead.inverse());
             r.render(&scene, &cam, &lights, &settings, &mut f);
-            if step > 1 {
-                assert!(!f.stats.full_resolve, "step {step}");
-                assert!(f.stats.points_shaded * 20 < full, "step {step}: {} points shaded, {full} in full", f.stats.points_shaded);
+            r3.dragged(vec![first..n], from, to, ahead.inverse());
+            r3.render_pass(&scene, &cam, &lights, &settings, &mut f3, None);
+            // Where the ball is in both, the moved picture is the ball as
+            // drawn in 3D; it differs only along its outline and where its
+            // shadow was.
+            let ball_px = f3.tri_id.iter().filter(|&&id| id != NO_TRI && (first..n).contains(&(f3.setups[id as usize].cluster as usize))).count();
+            let off = f.color.iter().zip(&f3.color).filter(|(a, b)| (0..3).any(|k| ((**a >> (8 * k)) & 255).abs_diff((**b >> (8 * k)) & 255) > 12)).count();
+            assert!(off * 10 < ball_px, "step {step}: {off} pixels off of {ball_px} on the ball");
+            assert_eq!(f.stats.layer_captured, step == 1 || step == 4, "step {step}");
+            assert!(f.stats.layer_points > 500);
+            if step == 2 || step == 3 {
+                assert_eq!(f.stats.points_shaded, 0, "step {step}");
                 assert!(f.color.iter().zip(&last).filter(|(a, b)| a != b).count() * 3 < w * h, "only round the ball changed");
+            }
+            if step == 4 {
+                assert!(f.stats.points_shaded * 20 < full, "{} points shaded, {full} in full", f.stats.points_shaded);
             }
             last = f.color.clone();
         }

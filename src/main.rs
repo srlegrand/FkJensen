@@ -1782,7 +1782,7 @@ fn main() {
                     s.points_used,
                     s.gather_ms,
                     s.resolve_ms,
-                    if s.full_resolve { "" } else { " (round the model only)" }
+                    if s.layer_points > 0 { format!("; its picture ({} points{}) moved over the rest in {:.1} ms", s.layer_points, if s.layer_captured { ", captured" } else { "" }, s.layer_ms) } else { String::new() }
                 );
             }
             let drag_out = out.replace(".png", "_dragging.png");
