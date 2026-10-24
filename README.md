@@ -384,7 +384,7 @@ build leaves them out.
     cargo run --release -- --png out.png --debug-view reshaded --bench-drag
     cargo run --release -- --png out.png --close --debug-view shadow-map --select 2
 
-`--select N` picks the light the light views show (1 is the first).
+`--select N` picks the light the light views show (1 is the first). In the editor the views are under Render settings > Show, in menus by subject.
 
 ![Six of the views: clusters, micropolygons, light reach, a shadow map unfolded, the surfel cloud, dicing levels](docs/debug_views.png)
 

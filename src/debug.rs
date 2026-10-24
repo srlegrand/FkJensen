@@ -48,6 +48,9 @@ pub enum DebugView {
     SkySh,
 }
 
+/// The editor's menus of views, in order.
+pub const GROUPS: [&str; 6] = ["Geometry and visibility", "Shading", "Light", "Shadows", "Sky occlusion and spherical harmonics", "Bounce light"];
+
 pub const ALL: [DebugView; 29] = [
     DebugView::Final,
     DebugView::Clusters,
@@ -113,6 +116,27 @@ impl DebugView {
             DebugView::BentNormal => "bent-normal",
             DebugView::SkySh => "sky-sh",
         }
+    }
+
+    /// The editor's menu it is in.
+    pub fn group(self) -> &'static str {
+        use DebugView::*;
+        match self {
+            Final => "Picture",
+            Clusters | Lod | Triangles | Depth | Normals | Buckets => "Geometry and visibility",
+            Dice | Micropolygons | Reshaded | Albedo | Tiles => "Shading",
+            Sky | Direct | Highlight | LightCount | Reach => "Light",
+            Shadow | Sun | ShadowMap => "Shadows",
+            Ao | SkyShare | BentNormal | SkySh | Samples => "Sky occlusion and spherical harmonics",
+            Bounce | Surfels | Receivers | MicroRaster => "Bounce light",
+        }
+    }
+
+    /// Its title as the editor lists it: "Ambient occlusion".
+    pub fn title(self) -> String {
+        let t = self.caption().0.to_lowercase();
+        let mut c = t.chars();
+        c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
     }
 
     pub fn from_name(s: &str) -> Option<DebugView> {
