@@ -150,6 +150,9 @@ pub fn apply_material_changes(scene: &mut Scene, i: usize, changes: &[MaterialEn
 /// which then has them; every scene using it sees them.
 pub fn push_materials(scene: &mut Scene, i: usize) -> Result<PathBuf, String> {
     let o = &scene.objects[i];
+    if o.asset.as_deref().and_then(crate::world::part_of).is_some() {
+        return Err(format!("{} is built into the program: its materials stay with the scene", o.name));
+    }
     let path = o.asset.clone().filter(|p| p.exists()).ok_or_else(|| format!("{} has no asset file yet: save the scene first", o.name))?;
     let mats = scene.materials[o.materials.clone()].to_vec();
     crate::fkj::rewrite_materials(&path, &mats)?;
@@ -394,11 +397,8 @@ pub fn write_scene_file(scene: &Scene, path: &Path) -> Result<(), String> {
 /// its asset and placed, and its lights. `dir` is the scene's folder.
 pub fn build(f: &SceneFile, dir: &Path, search: &[PathBuf]) -> Result<Scene, String> {
     let mut scene = match f.world.as_deref() {
-        Some("built-in") => {
-            let mut s = crate::world::build();
-            s.world = World::BuiltIn;
-            s
-        }
+        // Files from before the ground and mountains were objects.
+        Some("built-in") => crate::world::build(),
         Some(w) => {
             let p = resolve(w, dir, search).ok_or_else(|| format!("world asset {w} not found"))?;
             let mut s = load_asset(&p)?;
@@ -413,8 +413,10 @@ pub fn build(f: &SceneFile, dir: &Path, search: &[PathBuf]) -> Result<Scene, Str
         let parent = o.parent.map(|p| index[p]);
         match &o.asset {
             Some(a) => {
-                let p = resolve(a, dir, search).ok_or_else(|| format!("{}: asset {a} not found", o.name))?;
-                let mut m = load_asset(&p)?;
+                let mut m = match crate::world::part_of(Path::new(a)) {
+                    Some(part) => crate::world::part(part).expect("a built-in part"),
+                    None => load_asset(&resolve(a, dir, search).ok_or_else(|| format!("{}: asset {a} not found", o.name))?)?,
+                };
                 m.objects[0].name = o.name.clone();
                 m.objects[0].parent = None;
                 let i = scene.objects.len();
@@ -465,7 +467,7 @@ pub fn save_assets(scene: &mut Scene, scene_path: &Path) -> Result<Vec<PathBuf>,
     let stem = scene_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "scene".into());
     let mut written = Vec::new();
     for i in 0..scene.objects.len() {
-        if scene.objects[i].clusters.is_empty() || scene.objects[i].asset.as_ref().is_some_and(|p| p.exists()) {
+        if scene.objects[i].clusters.is_empty() || scene.objects[i].asset.as_ref().is_some_and(|p| p.exists() || crate::world::part_of(p).is_some()) {
             continue;
         }
         let p = asset_name(&scene.objects[i].name, &dir, &written);
@@ -524,7 +526,11 @@ pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight]) -> Scene
             let o = &scene.objects[i];
             ObjectEntry {
                 name: o.name.clone(),
-                asset: if o.clusters.is_empty() { None } else { o.asset.as_ref().map(|p| relative(p, &dir)) },
+                asset: if o.clusters.is_empty() {
+                    None
+                } else {
+                    o.asset.as_ref().map(|p| if crate::world::part_of(p).is_some() { p.display().to_string() } else { relative(p, &dir) })
+                },
                 pivot: a3(o.pivot),
                 rotation: a3(o.rotation).map(|r| round6(r.to_degrees())),
                 scale: round6(o.scale),
@@ -534,7 +540,6 @@ pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight]) -> Scene
         })
         .collect();
     let world = match &scene.world {
-        World::BuiltIn => Some("built-in".to_string()),
         World::Asset(p) => Some(relative(p, &dir)),
         World::Unsaved => None,
     };
@@ -657,6 +662,33 @@ mod tests {
         assert_eq!((a.materials[1].roughness, a.materials[1].metallic), (0.9, 1.0));
         assert_eq!(a.tri_mat, crate::fjs::load_asset(&d.join("ball_one.fja")).unwrap().tri_mat);
         assert!(material_changes(&t, tb).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The ground and the mountains are objects with built-in assets: a
+    /// deleted one stays deleted when the scene is saved and opened, and
+    /// no file is written for them. Old files' `"world": "built-in"`
+    /// still gives both.
+    #[test]
+    fn the_built_in_world_is_objects() {
+        let d = tmp("builtin");
+        let mut s = crate::world::build();
+        assert_eq!(s.objects.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), vec!["ground", "mountains"]);
+        assert!(s.loose_clusters().is_empty());
+        let m = s.objects.iter().position(|o| o.name == "mountains").unwrap();
+        s.remove_objects(&[m]);
+        let path = d.join("w.fjs");
+        assert!(save_assets(&mut s, &path).unwrap().is_empty());
+        let f = entries(&s, &path, &[]);
+        assert_eq!(f.world, None);
+        assert_eq!(f.objects.len(), 1);
+        assert_eq!(f.objects[0].asset.as_deref(), Some("built-in:ground"));
+        let t = build(&f, &d, &[]).unwrap();
+        assert_eq!(t.objects.len(), 1);
+        assert!(t.objects[0].environment);
+        assert_eq!(t.clusters.len(), s.clusters.len());
+        let old = parse(r#"{ "fjs": 1, "world": "built-in" }"#).unwrap();
+        assert_eq!(build(&old, &d, &[]).unwrap().objects.len(), 2);
         let _ = std::fs::remove_dir_all(&d);
     }
 

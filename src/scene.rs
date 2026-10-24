@@ -287,8 +287,6 @@ pub enum World {
     /// None, or read from a file it is not kept in (an old .fkj scene).
     #[default]
     Unsaved,
-    /// The program's own ground and mountains (`world.rs`).
-    BuiltIn,
     /// An .fja asset.
     Asset(std::path::PathBuf),
 }
@@ -399,13 +397,16 @@ pub struct Object {
     /// them: a scene's changes are the difference.
     pub materials: std::ops::Range<usize>,
     pub asset_materials: Vec<Material>,
+    /// Ground-like (the built-in ground and mountains): open ground for
+    /// bounce light's receivers, no surface samples of its own.
+    pub environment: bool,
 }
 
 impl Object {
     /// A new object of clusters `clusters` whose geometry is stored where it
     /// stands.
     pub fn new(name: String, clusters: std::ops::Range<usize>, pivot: Vec3, rotation: Vec3, scale: f32, parent: Option<usize>) -> Object {
-        Object { name, clusters, pivot, rotation, scale, lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent, asset: None, materials: 0..0, asset_materials: Vec::new() }
+        Object { name, clusters, pivot, rotation, scale, lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent, asset: None, materials: 0..0, asset_materials: Vec::new(), environment: false }
     }
 
     /// The eight corners of its oriented box, in the world.
@@ -801,6 +802,83 @@ impl Scene {
         out
     }
 
+    /// Delete objects `which` and everything under them: their clusters,
+    /// vertices, triangles, samples and texture tiles go. Returns how many
+    /// objects went.
+    pub fn remove_objects(&mut self, which: &[usize]) -> usize {
+        let n = self.objects.len();
+        let mut gone = vec![false; n];
+        for &i in which.iter().filter(|&&i| i < n) {
+            gone[i] = true;
+            for d in self.descendants(i) {
+                gone[d] = true;
+            }
+        }
+        // Clusters kept, in order, and where each old cluster lands.
+        let mut drop = vec![false; self.clusters.len()];
+        for (i, o) in self.objects.iter().enumerate() {
+            if gone[i] {
+                drop[o.clusters.clone()].fill(true);
+            }
+        }
+        let mut kept: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut at = 0;
+        while at < drop.len() {
+            if drop[at] {
+                at += 1;
+                continue;
+            }
+            let start = at;
+            while at < drop.len() && !drop[at] {
+                at += 1;
+            }
+            kept.push(start..at);
+        }
+        let mut new_index = vec![usize::MAX; self.clusters.len()];
+        let mut k = 0;
+        for r in &kept {
+            for c in r.clone() {
+                new_index[c] = k;
+                k += 1;
+            }
+        }
+        let mut out = self.extract(&kept, glam::Affine3A::IDENTITY);
+        let mut object_index = vec![usize::MAX; n];
+        let mut objects = Vec::new();
+        for (i, o) in self.objects.iter().enumerate() {
+            if gone[i] {
+                continue;
+            }
+            object_index[i] = objects.len();
+            let mut o = o.clone();
+            o.clusters = if o.clusters.is_empty() { k..k } else { new_index[o.clusters.start]..new_index[o.clusters.start] + o.clusters.len() };
+            objects.push(o);
+        }
+        for o in &mut objects {
+            o.parent = o.parent.map(|p| object_index[p]).filter(|&p| p != usize::MAX);
+        }
+        let count = n - objects.len();
+        out.objects = objects;
+        // Empty groups point past the clusters.
+        let total = out.clusters.len();
+        for o in &mut out.objects {
+            if o.clusters.is_empty() {
+                o.clusters = total..total;
+            }
+        }
+        out.lights = std::mem::take(&mut self.lights);
+        out.focus = self.focus;
+        out.world = std::mem::take(&mut self.world);
+        *self = out;
+        count
+    }
+
+    /// The first object that is a model: clusters of its own, not the
+    /// ground or the mountains.
+    pub fn first_model(&self) -> Option<usize> {
+        self.objects.iter().position(|o| !o.clusters.is_empty() && !o.environment)
+    }
+
     /// The runs of clusters outside every object, in order.
     pub fn loose_clusters(&self) -> Vec<std::ops::Range<usize>> {
         let mut owned: Vec<std::ops::Range<usize>> = self.objects.iter().map(|o| o.clusters.clone()).filter(|r| !r.is_empty()).collect();
@@ -873,7 +951,7 @@ impl Scene {
     pub fn scatter_missing_samples(&mut self) {
         for i in 0..self.objects.len() {
             let r = self.objects[i].clusters.clone();
-            if !r.is_empty() && self.samples_in(r).is_empty() {
+            if !r.is_empty() && !self.objects[i].environment && self.samples_in(r).is_empty() {
                 let t = std::time::Instant::now();
                 let (n, h) = self.scatter_samples(i);
                 eprintln!("{}: {n} surface samples {:.1} cm apart in {:.2} s", self.objects[i].name, h * 100.0, t.elapsed().as_secs_f64());

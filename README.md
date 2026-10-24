@@ -22,6 +22,12 @@ The built-in set, all real geometry, in metres:
   ground plane;
 - far background: mountains 4 to 12 km away, up to about 2 km high.
 
+The ground (the square and the valley floor) and the mountains are objects
+like any other, `ground` and `mountains` in the outliner: they move, take
+materials and can be deleted. A scene file names them as the assets
+`built-in:ground` and `built-in:mountains`; for bounce light they are
+open ground, and they get no surface samples.
+
 On machines whose plan leaves it out (see Fitting the machine), the T-rex is
 its 28 K-triangle version.
 
@@ -717,6 +723,11 @@ frame into the window, painting the interface and presenting it.
 moves the first object five times and lets go, printing each frame's
 times.
 
+Edit, as Maya's: Copy (Ctrl+C), Paste (Ctrl+V, where it was copied),
+Duplicate (Ctrl+D), Duplicate Instanced (Ctrl+Shift+D; not built yet:
+instancing is next), Delete (Del), on the selected object (with
+everything under it), point light or directional light, then Group.
+
 Shortcuts: Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as, Ctrl+I import,
 Ctrl+G put the selected object in a new group. A scene file dropped on the
 window opens; a model dropped on it opens the importer.
@@ -1094,8 +1105,9 @@ Not measured yet: a Raspberry Pi.
   and frame size follow the machine and are not saved; a scene saved
   with the high-resolution T-rex asks for it on any machine (the Pi
   included) rather than the plan picking the low-resolution one.
-- The editor: no undo; one object selected at a time; objects cannot be
-  deleted or duplicated; a model is added at the origin; the interface is
+- The editor: no undo; one object selected at a time; a copied or
+  duplicated object is a full copy of its geometry in memory until
+  instancing is built; a model is added at the origin; the interface is
   painted again every frame, even when nothing in it changed; a bake
   cannot be stopped once started (closing the importer leaves it to
   finish); the importer reads the formats fkj-import reads, nothing more

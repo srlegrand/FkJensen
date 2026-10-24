@@ -363,8 +363,9 @@ impl Bounce {
         let at_lod = |c: &crate::scene::Cluster| c.lod_drawn(1.0, |_, _| 1.0 / SURFEL_LOD_ERROR);
         let mut object_of = vec![u32::MAX; scene.clusters.len()];
         let mut spheres: Vec<(Vec3, f32)> = Vec::new();
+        // The ground and the mountains are open ground, objects or not.
         for (i, o) in scene.objects.iter().enumerate() {
-            if o.clusters.is_empty() {
+            if o.clusters.is_empty() || o.environment {
                 continue;
             }
             object_of[o.clusters.clone()].fill(i as u32);
@@ -395,7 +396,7 @@ impl Bounce {
             out
         };
         let mut recv: Vec<(Vec3, Vec3, f32, u32)> = Vec::new();
-        for o in &scene.objects {
+        for o in scene.objects.iter().filter(|o| !o.environment) {
             let cs: Vec<usize> = o.clusters.clone().filter(|&c| at_lod(&scene.clusters[c])).collect();
             if !cs.is_empty() {
                 recv.extend(spread(&cs, RECEIVER_SPACING));

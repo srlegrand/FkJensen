@@ -300,10 +300,6 @@ impl Editor {
         if reach_on {
             ui.weak(format!("reaches {} (where it falls under what the exposure shows)", crate::format_metres(raster::light_reach(l, cut))));
         }
-        ui.add_space(6.0);
-        if ui.button("Delete the light").clicked() {
-            self.delete_light();
-        }
     }
 
     fn directional_attributes(&mut self, ui: &mut egui::Ui, k: usize) {
@@ -345,11 +341,6 @@ impl Editor {
             }
         });
         ui.weak("Parallel light and shadows like the sun's, on the scene only: the sky and the exposure do not follow it. Azimuth 0 looks the way the camera starts, towards -Z.");
-        ui.add_space(6.0);
-        if ui.button("Delete the light").clicked() {
-            self.app.settings.dir_lights[k].on = false;
-            self.inspect = Inspect::Selection;
-        }
     }
 
     fn sun_attributes(&mut self, ui: &mut egui::Ui) {

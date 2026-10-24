@@ -12,6 +12,7 @@
 pub mod files;
 pub mod importer;
 pub mod paint;
+mod edit;
 mod materials;
 mod navigate;
 mod panels;
@@ -140,6 +141,8 @@ pub struct Editor {
     show_rect: egui::Rect,
     /// Where its "Light count" entry was last drawn, when open.
     show_item: egui::Rect,
+    /// What Edit > Copy took.
+    clip: Option<edit::Clip>,
 }
 
 impl Editor {
@@ -176,6 +179,7 @@ impl Editor {
             nav_rects: Vec::new(),
             show_rect: egui::Rect::NOTHING,
             show_item: egui::Rect::NOTHING,
+            clip: None,
         }
     }
 
@@ -336,6 +340,26 @@ impl Editor {
             }
             if self.app.ctrl && matches!(code, KeyCode::KeyO | KeyCode::KeyS | KeyCode::KeyI | KeyCode::KeyG | KeyCode::KeyN) {
                 return;
+            }
+            // Edit's keys, as Maya's.
+            match code {
+                KeyCode::Delete | KeyCode::Backspace => {
+                    self.delete_selected();
+                    return;
+                }
+                KeyCode::KeyC if self.app.ctrl => {
+                    self.copy_selected();
+                    return;
+                }
+                KeyCode::KeyV if self.app.ctrl => {
+                    self.paste();
+                    return;
+                }
+                KeyCode::KeyD if self.app.ctrl && !self.app.shift => {
+                    self.duplicate();
+                    return;
+                }
+                _ => {}
             }
         }
         self.app.key(code, pressed);
@@ -577,6 +601,27 @@ impl Editor {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                let some = self.can_edit();
+                if ui.add_enabled(some, egui::Button::new("Copy").shortcut_text("Ctrl+C")).clicked() {
+                    self.copy_selected();
+                    ui.close();
+                }
+                if ui.add_enabled(self.clip.is_some(), egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+                    self.paste();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.add_enabled(some, egui::Button::new("Duplicate").shortcut_text("Ctrl+D")).clicked() {
+                    self.duplicate();
+                    ui.close();
+                }
+                ui.add_enabled(false, egui::Button::new("Duplicate Instanced").shortcut_text("Ctrl+Shift+D")).on_disabled_hover_text("Instances share one copy of the geometry: next to be built");
+                ui.separator();
+                if ui.add_enabled(some, egui::Button::new("Delete").shortcut_text("Del")).clicked() {
+                    self.delete_selected();
+                    ui.close();
+                }
+                ui.separator();
                 if ui.add(egui::Button::new("Group").shortcut_text("Ctrl+G")).clicked() {
                     self.group_selected();
                 }
@@ -586,9 +631,6 @@ impl Editor {
                 ui.separator();
                 if ui.button("Add a light").clicked() {
                     self.add_light();
-                }
-                if ui.add_enabled(matches!(self.app.selection, Selection::Light(_)), egui::Button::new("Delete the light").shortcut_text("Del")).clicked() {
-                    self.delete_light();
                 }
                 if ui.add(egui::Button::new("Reset the lights").shortcut_text("Ctrl+R")).clicked() {
                     self.app.rig = crate::lights::LightRig::new(crate::default_rig(&self.app.scene));
@@ -876,21 +918,21 @@ pub fn shot(app: App, w: usize, h: usize, out: &str, import: Option<PathBuf>, be
     for _ in 0..4 {
         ed.frame(raw(), w, h);
     }
-    if bench_move && !ed.app.scene.objects.is_empty() {
+    if let Some(m) = ed.app.scene.first_model().filter(|_| bench_move) {
         let line = |ed: &Editor, what: &str| {
             let s = ed.app.frame.stats;
             eprintln!("{what}: {} (layout and paint at {w} x {h}); renderer: visibility {:.0}, shade {:.0}, resolve {:.0}, shadows {:.0}, layer {:.0} ms{}", ed.times.line(), s.setup_ms + s.bin_ms + s.raster_ms, s.shade_ms, s.resolve_ms, s.shadow_ms, s.layer_ms, if s.layer_captured { " (captured)" } else { "" });
         };
-        ed.select(Selection::Object(0));
+        ed.select(Selection::Object(m));
         ed.frame(raw(), w, h);
         line(&ed, "still");
         for step in 1..=5 {
-            let o = ed.app.scene.objects[0].clone();
-            ed.app.move_object(0, o.pivot + glam::Vec3::new(0.1, 0.0, 0.0), o.rotation, o.scale);
+            let o = ed.app.scene.objects[m].clone();
+            ed.app.move_object(m, o.pivot + glam::Vec3::new(0.1, 0.0, 0.0), o.rotation, o.scale);
             ed.frame(raw(), w, h);
             line(&ed, &format!("move step {step}"));
         }
-        ed.app.object_settled(0);
+        ed.app.object_settled(m);
         for k in 1..=60 {
             ed.frame(raw(), w, h);
             let baking = ed.app.frame.stats.baking;
@@ -1020,6 +1062,48 @@ mod tests {
         let picked = ed.app.settings.view == crate::raster::View::LightCount;
         assert!(picked, "Light count not picked from the viewport's Show menu");
         assert_eq!(ed.app.selection, Selection::Nothing, "the click did not go through to the viewport");
+    }
+
+    /// Edit: duplicate an object (and its group), copy and paste a light,
+    /// delete an object with what is under it; the scene stays whole.
+    #[test]
+    fn edit_duplicates_copies_and_deletes() {
+        let mut ed = editor();
+        ed.select(Selection::Object(0));
+        ed.group_selected();
+        let Selection::Object(g) = ed.app.selection else { panic!() };
+        let tris = ed.app.scene.triangle_count();
+        // Duplicate the group: a new group with a new ball under it.
+        ed.duplicate();
+        let Selection::Object(g2) = ed.app.selection else { panic!() };
+        assert_ne!(g2, g);
+        assert_eq!(ed.app.scene.objects.len(), 4);
+        let kids: Vec<usize> = (0..4).filter(|&k| ed.app.scene.objects[k].parent == Some(g2)).collect();
+        assert_eq!(kids.len(), 1);
+        assert_eq!(ed.app.scene.triangle_count(), tris + ed.app.scene.objects[0].clusters.clone().map(|c| ed.app.scene.clusters[c].tri_count as usize).sum::<usize>());
+        assert!(ed.app.scene.objects[kids[0]].pivot.distance(ed.app.scene.objects[0].pivot) < 1e-5);
+        // A light: copy, paste.
+        let n = ed.app.rig.lights.len();
+        ed.select(Selection::Light(0));
+        ed.copy_selected();
+        ed.paste();
+        assert_eq!(ed.app.rig.lights.len(), n + 1);
+        assert_eq!(ed.app.rig.lights[n].position, ed.app.rig.lights[0].position);
+        // Delete the first group: it and its ball go; the copy stays and
+        // still draws.
+        ed.select(Selection::Object(g));
+        ed.delete_selected();
+        assert_eq!(ed.app.scene.objects.len(), 2);
+        assert_eq!(ed.app.scene.triangle_count(), tris);
+        let (w, h) = (640, 400);
+        for _ in 0..2 {
+            ed.frame(raw(w, h), w, h);
+        }
+        assert!(ed.app.frame.stats.tris_drawn > 0);
+        // Delete the light pasted.
+        ed.select(Selection::Light(n));
+        ed.delete_selected();
+        assert_eq!(ed.app.rig.lights.len(), n);
     }
 
     /// At 1920 x 1080 the frame keeps its size as the window changes, is

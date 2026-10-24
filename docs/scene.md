@@ -46,7 +46,7 @@ left out keeps the program's own value.
 | field | meaning |
 |---|---|
 | `fjs` | format version, 1 |
-| `world` | the geometry outside every object: `"built-in"` (the program's ground and mountains, `src/world.rs`), an `.fja` path, or left out for none |
+| `world` | the geometry outside every object: an `.fja` path, or left out for none; `"built-in"`, from files written before the ground and mountains were objects, gives both as objects |
 | `objects` | objects and groups, in order; a group before what is in it |
 | `lights` | point lights: `position` (metres), `color` (linear RGB), `lumens` (1 to 2,000,000) |
 | `directional` | up to four directional lights: `on`, `azimuth` and `elevation` (degrees; azimuth clockwise from -Z), `color`, `lux` (up to 150,000) |
@@ -63,7 +63,7 @@ An object:
 | field | meaning |
 |---|---|
 | `name` | shown in the outliner |
-| `asset` | the `.fja` it is; left out for a group |
+| `asset` | the `.fja` it is, or `built-in:ground` or `built-in:mountains` for the program's own; left out for a group |
 | `pivot` | where it stands: the point it turns and scales about, metres |
 | `rotation` | degrees about X, Y and Z, applied in that order (Maya's xyz); 0 when left out |
 | `scale` | uniform; 1 when left out |

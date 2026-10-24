@@ -1186,7 +1186,6 @@ fn built_in() -> Result<Scene, String> {
 /// (high-resolution when `highres`) and the car, and their lights.
 fn built_in_with(highres: bool) -> Result<Scene, String> {
     let mut scene = world::build();
-    scene.world = scene::World::BuiltIn;
     if let Some((lo, hi)) = add_models(&mut scene, highres) {
         scene.focus = Some((lo, hi));
     }
@@ -1945,13 +1944,13 @@ fn main() {
                 );
             }
         }
-        if bench_move && !app.scene.objects.is_empty() {
+        if let Some(m) = app.scene.first_model().filter(|_| bench_move) {
             // Move the first model 10 cm at a time, as a drag would.
             app.settings.bounce_budget_ms = Some(30.0);
-            eprintln!("moving {}", app.scene.objects[0].name);
+            eprintln!("moving {}", app.scene.objects[m].name);
             for step in 1..=5 {
-                let o = app.scene.objects[0].clone();
-                app.move_object(0, o.pivot + Vec3::new(0.1, 0.0, 0.0), o.rotation, o.scale);
+                let o = app.scene.objects[m].clone();
+                app.move_object(m, o.pivot + Vec3::new(0.1, 0.0, 0.0), o.rotation, o.scale);
                 let t = Instant::now();
                 app.render();
                 let s = app.frame.stats;
@@ -1976,7 +1975,7 @@ fn main() {
             if save_png(&app.frame, &drag_out).is_ok() {
                 eprintln!("wrote {drag_out}");
             }
-            app.object_settled(0);
+            app.object_settled(m);
             let t = Instant::now();
             for k in 1..=200 {
                 let tf = Instant::now();

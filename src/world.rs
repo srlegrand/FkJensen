@@ -169,44 +169,79 @@ fn mountains(scene: &mut Scene) {
     scene.push_mesh(&p, &[], &c, &idx);
 }
 
-/// The ground plane, the valley and the mountains. No lights: see
+/// The parts of the built-in world, each an object of its own that can be
+/// moved, changed or deleted like any other: the names `part` makes.
+pub const PARTS: [&str; 2] = ["ground", "mountains"];
+
+/// What a scene file calls a built-in part as its asset.
+pub fn asset_name(part: &str) -> String {
+    format!("built-in:{part}")
+}
+
+/// The built-in part an asset name stands for, if any.
+pub fn part_of(asset: &std::path::Path) -> Option<&str> {
+    asset.to_str()?.strip_prefix("built-in:").filter(|p| PARTS.contains(p))
+}
+
+/// One part of the built-in world as a scene of one object, its asset
+/// `built-in:<name>`, an environment (open ground for bounce light, no
+/// surface samples): the ground (the paved square and the valley floor to
+/// the horizon) or the mountains.
+pub fn part(name: &str) -> Option<Scene> {
+    let mut scene = Scene::new();
+    match name {
+        "ground" => {
+            // The square: 1 m paving slabs, so the clusters stay small and
+            // a light only touches the ones near it.
+            let mut m = Mesh::default();
+            m.ground(-50.0, 50.0, -50.0, 50.0, 0.0, 100, 100, |x, z| {
+                let v = 0.24 + hash(x.floor() as i32, z.floor() as i32) * 0.05;
+                Vec3::new(v, v * 0.97, v * 0.93)
+            });
+            m.into_scene(&mut scene);
+            // Valley floor to the horizon, just below the square, in rings
+            // of growing cell size: 10 m cells out to a few hundred metres,
+            // then 100 m, then 500 m. Small cells near the square keep its
+            // clusters small, so a light there only touches the ground near
+            // it.
+            let mut m = Mesh::default();
+            let grass = |x: f32, z: f32| {
+                let v = hash((x / 37.0) as i32, (z / 37.0) as i32) * 0.03;
+                Vec3::new(0.09 + v, 0.12 + v, 0.06)
+            };
+            let plaza = [-50.0, 50.0, -50.0, 50.0];
+            let r1 = [-400.0, 400.0, -450.0, 400.0];
+            let r2 = [-4000.0, 4000.0, -4000.0, 4000.0];
+            let r3 = [-24000.0, 24000.0, -16000.0, 8000.0];
+            m.ring(r1, plaza, -0.05, 10.0, grass);
+            m.ring(r2, r1, -0.05, 100.0, grass);
+            m.ring(r3, r2, -0.05, 500.0, grass);
+            m.into_scene(&mut scene);
+            // Paving and grass: rough, a dull sheen at grazing angles.
+            scene.materials = vec![crate::scene::Material { name: "ground".into(), roughness: 0.85, ..Default::default() }];
+        }
+        "mountains" => {
+            mountains(&mut scene);
+            scene.materials = vec![crate::scene::Material { name: "rock".into(), roughness: 0.85, ..Default::default() }];
+        }
+        _ => return None,
+    }
+    let n = scene.clusters.len();
+    let i = scene.add_object(name.to_string(), 0..n, Vec3::ZERO, Vec3::ZERO);
+    scene.objects[i].asset = Some(asset_name(name).into());
+    scene.objects[i].environment = true;
+    Some(scene)
+}
+
+/// The ground and the mountains, each an object (`part`). No lights: see
 /// `set_lights`.
 pub fn build() -> Scene {
     let mut scene = Scene::new();
-
-    // The square: 1 m paving slabs, so the clusters stay small and a light
-    // only touches the ones near it.
-    let mut m = Mesh::default();
-    m.ground(-50.0, 50.0, -50.0, 50.0, 0.0, 100, 100, |x, z| {
-        let v = 0.24 + hash(x.floor() as i32, z.floor() as i32) * 0.05;
-        Vec3::new(v, v * 0.97, v * 0.93)
-    });
-    m.into_scene(&mut scene);
-
-    // Valley floor to the horizon, just below the square, in rings of
-    // growing cell size: 10 m cells out to a few hundred metres, then 100 m,
-    // then 500 m. Small cells near the square keep its clusters small, so a
-    // light there only touches the ground near it.
-    let mut m = Mesh::default();
-    let grass = |x: f32, z: f32| {
-        let v = hash((x / 37.0) as i32, (z / 37.0) as i32) * 0.03;
-        Vec3::new(0.09 + v, 0.12 + v, 0.06)
-    };
-    let plaza = [-50.0, 50.0, -50.0, 50.0];
-    let r1 = [-400.0, 400.0, -450.0, 400.0];
-    let r2 = [-4000.0, 4000.0, -4000.0, 4000.0];
-    let r3 = [-24000.0, 24000.0, -16000.0, 8000.0];
-    m.ring(r1, plaza, -0.05, 10.0, grass);
-    m.ring(r2, r1, -0.05, 100.0, grass);
-    m.ring(r3, r2, -0.05, 500.0, grass);
-    m.into_scene(&mut scene);
-
-    mountains(&mut scene);
-
+    for name in PARTS {
+        scene.append(part(name).expect("a built-in part"));
+    }
     // Until the models are added, the subject is the middle of the plane.
     scene.focus = Some((Vec3::new(-6.0, 0.0, -6.0), Vec3::new(6.0, 5.0, 6.0)));
-    // Paving, grass and rock: rough, a dull sheen at grazing angles.
-    scene.materials = vec![crate::scene::Material { name: "ground".into(), roughness: 0.85, ..Default::default() }];
     scene
 }
 

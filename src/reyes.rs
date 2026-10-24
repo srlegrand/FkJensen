@@ -2989,9 +2989,9 @@ mod tests {
         let ball: Vec<Vec3> = p.iter().map(|v| *v * 0.3 + Vec3::new(0.0, 0.6, 0.0)).collect();
         scene.push_mesh(&ball, &[], &[Vec3::new(0.8, 0.3, 0.2)], &idx);
         let n = scene.clusters.len();
-        scene.add_object("ball".into(), first..n, Vec3::new(0.0, 0.3, 0.0), Vec3::ZERO);
+        let ob = scene.add_object("ball".into(), first..n, Vec3::new(0.0, 0.3, 0.0), Vec3::ZERO);
         // With samples, so its occlusion of the ground's sky moves too.
-        scene.scatter_samples(0);
+        scene.scatter_samples(ob);
         crate::transfer::compute(&mut scene.samples);
         let (w, h) = (200, 112);
         let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.6, 0.0), 4.0, 0.15);
@@ -3000,10 +3000,10 @@ mod tests {
         let mut f = Frame::new(w, h);
         r.render(&scene, &cam, &lights, &settings, &mut f);
         let before = f.color.clone();
-        let from = scene.object_bounds(0);
-        scene.set_object(0, Vec3::new(0.6, 0.3, 0.2), Vec3::new(0.4, 0.5, -0.3), 1.4);
-        let to = scene.object_bounds(0);
-        r.moved(scene.objects[0].clusters.clone(), from, to, true);
+        let from = scene.object_bounds(ob);
+        scene.set_object(ob, Vec3::new(0.6, 0.3, 0.2), Vec3::new(0.4, 0.5, -0.3), 1.4);
+        let to = scene.object_bounds(ob);
+        r.moved(scene.objects[ob].clusters.clone(), from, to, true);
         r.render(&scene, &cam, &lights, &settings, &mut f);
         assert_ne!(f.color, before, "the picture changed");
         let mut fresh = Frame::new(w, h);
@@ -3027,7 +3027,7 @@ mod tests {
         let ball: Vec<Vec3> = p.iter().map(|v| *v * 0.3 + Vec3::new(0.0, 0.6, 0.0)).collect();
         scene.push_mesh(&ball, &[], &[Vec3::new(0.8, 0.3, 0.2)], &idx);
         let n = scene.clusters.len();
-        scene.add_object("ball".into(), first..n, Vec3::new(0.0, 0.3, 0.0), Vec3::ZERO);
+        let ob = scene.add_object("ball".into(), first..n, Vec3::new(0.0, 0.3, 0.0), Vec3::ZERO);
         let (w, h) = (200, 112);
         let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.6, 0.0), 3.0, 0.15);
         let settings = RenderSettings { adaptive: false, ..RenderSettings::new(Sky::new(30.0, true)) };
@@ -3039,15 +3039,15 @@ mod tests {
         let mut r3 = Renderer::new();
         let mut f3 = Frame::new(w, h);
         r3.render(&scene, &cam, &lights, &settings, &mut f3);
-        let start = scene.objects[0].clone();
+        let start = scene.objects[ob].clone();
         let mut last = Vec::new();
         for step in 1..=4 {
-            let from = scene.object_bounds(0);
+            let from = scene.object_bounds(ob);
             // The last step turns past what the picture can follow.
             let yaw = if step < 4 { 0.03 * step as f32 } else { 0.6 };
             let (pivot, turn) = (start.pivot + Vec3::new(0.04 * step as f32, 0.0, 0.0), Vec3::new(0.0, yaw, 0.0));
-            scene.set_object(0, pivot, turn, 1.0);
-            let to = scene.object_bounds(0);
+            scene.set_object(ob, pivot, turn, 1.0);
+            let to = scene.object_bounds(ob);
             let ahead = glam::Affine3A::from_translation(pivot) * glam::Affine3A::from_rotation_translation(crate::scene::euler_quat(turn), Vec3::ZERO) * glam::Affine3A::from_translation(-start.pivot);
             r.dragged(vec![first..n], from, to, ahead.inverse());
             r.render(&scene, &cam, &lights, &settings, &mut f);
@@ -3088,17 +3088,17 @@ mod tests {
         let ball: Vec<Vec3> = p.iter().map(|v| *v * 0.3 + Vec3::new(0.0, 0.6, 0.0)).collect();
         scene.push_mesh(&ball, &[], &[Vec3::new(0.8, 0.3, 0.2)], &idx);
         let n = scene.clusters.len();
-        scene.add_object("ball".into(), first..n, Vec3::new(0.0, 0.3, 0.0), Vec3::ZERO);
+        let ob = scene.add_object("ball".into(), first..n, Vec3::new(0.0, 0.3, 0.0), Vec3::ZERO);
         let (w, h) = (200, 112);
         let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.6, 0.0), 3.0, 0.15);
         let settings = RenderSettings { adaptive: false, ..RenderSettings::new(Sky::new(30.0, true)) };
         let mut r = Renderer::new();
         let mut f = Frame::new(w, h);
         r.render(&scene, &cam, &lights, &settings, &mut f);
-        let start = scene.objects[0].pivot;
-        let from = scene.object_bounds(0);
-        scene.set_object(0, start + Vec3::new(0.3, 0.0, 0.0), Vec3::ZERO, 1.0);
-        let to = scene.object_bounds(0);
+        let start = scene.objects[ob].pivot;
+        let from = scene.object_bounds(ob);
+        scene.set_object(ob, start + Vec3::new(0.3, 0.0, 0.0), Vec3::ZERO, 1.0);
+        let to = scene.object_bounds(ob);
         r.dragged(vec![first..n], from, to, glam::Affine3A::from_translation(-Vec3::new(0.3, 0.0, 0.0)));
         r.render(&scene, &cam, &lights, &settings, &mut f);
         let dragging = f.color.clone();
