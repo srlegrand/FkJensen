@@ -329,6 +329,12 @@ impl Bounce {
             if !c.lod_drawn(1.0, |_, _| 1.0 / surfel_error[ci]) {
                 continue;
             }
+            // A cut-out triangle is as much surface as its solid share.
+            let cut = scene.textures.alpha_block(ci, c.tri_count as usize, 2);
+            let tri = |cl: &crate::scene::Cluster, t: usize| {
+                let (p, a, alb) = tri(cl, t);
+                (p, a * cut.as_ref().map_or(1.0, |b| b.coverage(t - cl.first_tri as usize)), alb)
+            };
             if c.radius <= SMALL_CLUSTER {
                 // Bin the cluster's triangles by the axis they face most.
                 let mut bins = [(Vec3::ZERO, Vec3::ZERO, 0f32, Vec3::ZERO); 6];

@@ -3231,7 +3231,7 @@ mod tests {
         // Pure red tiles at levels 1 to 5.
         let len = level_offset(c.tri_count as usize, 6) as usize;
         let pool: Vec<u8> = (0..len / 3).flat_map(|_| [255u8, 0, 0]).collect();
-        scene.textures.entries = vec![TexEntry { level: 5, source: 0, offset: 0 }];
+        scene.textures.entries = vec![TexEntry { level: 5, source: 0, offset: 0, alpha: None }];
         scene.textures.sources = vec![Arc::new(Source::Memory(Arc::new(pool)))];
         let (w, h) = (160, 120);
         let cam = cam_at(0.0, w, h, Vec3::ZERO, 3.0, 0.0);
@@ -3243,6 +3243,53 @@ mod tests {
         // Red, with the sky's highlight (4% of it facing) on top.
         assert!(r > 40 && g * 4 < r && b * 4 < r, "red from the tiles, got {r} {g} {b}");
         assert!(scene.textures.stats().reads >= 1);
+    }
+
+    /// A card cut out by alpha tiles: where its mask is clear it is not
+    /// drawn and casts no shadow; it is seen from both sides.
+    #[test]
+    fn alpha_tiles_cut_out_a_card_from_both_sides() {
+        use crate::texture::{level_offset, tile_points, Source, TexEntry};
+        use std::sync::Arc;
+        let mut scene = Scene::new();
+        let quad = [Vec3::new(-1.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 2.0, 0.0), Vec3::new(-1.0, 2.0, 0.0)];
+        scene.push_mesh(&quad, &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
+        let c = scene.clusters[0];
+        let n = c.tri_count as usize;
+        let len = level_offset(n, 4) as usize;
+        let pool: Vec<u8> = vec![128; len];
+        // The first triangle clear, the second solid, at levels 1 to 3.
+        let alpha: Vec<u8> = (1..=3u8).flat_map(|l| (0..n).flat_map(move |t| std::iter::repeat_n(if t == 0 { 0u8 } else { 255 }, tile_points(l)))).collect();
+        scene.textures.entries = vec![TexEntry { level: 3, source: 0, offset: 0, alpha: Some(0) }];
+        scene.textures.sources = vec![Arc::new(Source::Memory(Arc::new(pool)))];
+        scene.textures.alpha_sources = vec![Some(Arc::new(Source::Memory(Arc::new(alpha))))];
+        let (w, h) = (160, 120);
+        let settings = RenderSettings { shadows: false, bounce: false, ..RenderSettings::new(Sky::new(100.0, true)) };
+        let mut counts = Vec::new();
+        for yaw in [0.0, std::f32::consts::PI] {
+            let cam = cam_at(yaw, w, h, Vec3::new(0.0, 1.0, 0.0), 3.0, 0.0);
+            let mut f = Frame::new(w, h);
+            render(&scene, &cam, &[], &settings, &mut f);
+            let tris: Vec<u32> = f.tri_id.iter().filter(|&&id| id != NO_TRI).map(|&id| f.setups[id as usize].tri).collect();
+            assert!(tris.iter().all(|&t| t == c.first_tri + 1), "only the solid triangle is seen");
+            counts.push(tris.len());
+        }
+        assert!(counts.iter().all(|&k| k > 500), "seen from both sides: {counts:?}");
+        // Over a floor, under a light: the clear half casts no shadow.
+        let floor = [Vec3::new(-3.0, -0.01, -3.0), Vec3::new(3.0, -0.01, -3.0), Vec3::new(3.0, -0.01, 3.0), Vec3::new(-3.0, -0.01, 3.0)];
+        let mut lit = Scene::new();
+        lit.push_mesh(&floor.map(|p| p + Vec3::new(0.0, 0.0, 0.0)), &[], &[Vec3::splat(0.5)], &[0, 2, 1, 0, 3, 2]);
+        let card: Vec<Vec3> = quad.iter().map(|p| Vec3::new(p.x, 1.0, p.y - 1.0)).collect();
+        lit.push_mesh(&card, &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
+        lit.textures.entries = vec![TexEntry::default(), scene.textures.entries[0]];
+        lit.textures.sources = scene.textures.sources.clone();
+        lit.textures.alpha_sources = scene.textures.alpha_sources.clone();
+        let m = crate::shadow::CubeShadow::build(&lit, Vec3::new(0.0, 3.0, 0.0), 10.0, 256);
+        // The card's triangles: (-1,-1) (1,-1) (1,1) clear, (-1,-1) (1,1) (-1,1) solid.
+        let under_clear = Vec3::new(0.5, 0.0, -0.5);
+        let under_solid = Vec3::new(-0.5, 0.0, 0.5);
+        assert!(m.lit(under_clear, Vec3::Y) > 0.5, "the clear half casts nothing");
+        assert!(m.lit(under_solid, Vec3::Y) < 0.5, "the solid half casts its shadow");
     }
 
     /// A floor and a tall wall as one object with its sky transfer: the

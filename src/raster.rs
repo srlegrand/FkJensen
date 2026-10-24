@@ -125,6 +125,9 @@ pub struct TriSetup {
     pub tri: u32,
     /// The cluster the triangle belongs to.
     pub cluster: u32,
+    /// Its cluster's alpha tiles, an index into the frame's list of them
+    /// (`NO_ALPHA`: opaque).
+    pub alpha: u32,
     pub min_x: u16,
     pub min_y: u16,
     pub max_x: u16,
@@ -552,6 +555,7 @@ fn setup_tri(tri: u32, v: &[ClipVert; 3], width: usize, height: usize, cull: boo
         bary: [v[0].bary, v[1].bary, v[2].bary],
         tri,
         cluster: 0,
+        alpha: NO_ALPHA,
         min_x: min_x as u16,
         min_y: min_y as u16,
         max_x: max_x as u16,
@@ -699,7 +703,8 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile
                 Part::Only(r, detail) if r.iter().any(|r| r.contains(&(i as usize))) => lod_px * detail.max(1.0),
                 Part::Only(..) => return false,
             };
-            c.lod_drawn(px, &lod_scale) && !cluster_hidden(c, &planes, eye, cull)
+            // A cut-out cluster (leaves on cards) is seen from both sides.
+            c.lod_drawn(px, &lod_scale) && !cluster_hidden(c, &planes, eye, cull && !scene.textures.has_alpha(i as usize))
         })
         .collect();
     let prev = prev.filter(|p| p.len() == scene.clusters.len());
@@ -714,7 +719,8 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile
     let mut times = [0f32; 3];
 
     let first_n = first.len();
-    draw_clusters(scene, &first, vp, near, cull, wireframe, tile, frame, &mut setups, &mut level, &mut times);
+    let mut alpha: Vec<AlphaTiles> = Vec::new();
+    draw_clusters(scene, &first, vp, near, cull, wireframe, tile, frame, &mut setups, &mut alpha, &mut level, &mut times);
     let mut occluded = 0;
     if !second.is_empty() {
         let th = std::time::Instant::now();
@@ -723,7 +729,7 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile
         let visible: Vec<u32> = second.par_iter().copied().filter(|&i| !sphere_hidden(&scene.clusters[i as usize], vp, near, width, height, &hiz, bw)).collect();
         occluded = second.len() - visible.len();
         times[0] += th.elapsed().as_secs_f32() * 1000.0;
-        draw_clusters(scene, &visible, vp, near, cull, wireframe, tile, frame, &mut setups, &mut level, &mut times);
+        draw_clusters(scene, &visible, vp, near, cull, wireframe, tile, frame, &mut setups, &mut alpha, &mut level, &mut times);
     }
 
     frame.stats.clusters_in = scene.clusters.len();
@@ -806,20 +812,24 @@ fn sphere_hidden(c: &Cluster, vp: Mat4, near: f32, width: usize, height: usize, 
 /// and their dicing levels to `level`. `times` gains setup, bin and raster
 /// milliseconds.
 #[allow(clippy::too_many_arguments)]
-fn draw_clusters(scene: &Scene, list: &[u32], vp: Mat4, near: f32, cull: bool, wireframe: bool, tile: usize, frame: &mut Frame, setups: &mut Vec<TriSetup>, level: &mut [u8], times: &mut [f32; 3]) {
+fn draw_clusters(scene: &Scene, list: &[u32], vp: Mat4, near: f32, cull: bool, wireframe: bool, tile: usize, frame: &mut Frame, setups: &mut Vec<TriSetup>, alpha: &mut Vec<AlphaTiles>, level: &mut [u8], times: &mut [f32; 3]) {
     let (width, height) = (frame.width, frame.height);
     let t0 = std::time::Instant::now();
     // Project each cluster's vertices into a local array and set up its
     // triangles.
-    let parts: Vec<(Vec<TriSetup>, Vec<(u32, u8)>)> = list
+    let parts: Vec<(Vec<TriSetup>, Vec<(u32, u8)>, Vec<AlphaTiles>)> = list
         .par_chunks(64)
         .map(|chunk| {
             let mut out: Vec<TriSetup> = Vec::new();
             let mut levels: Vec<(u32, u8)> = Vec::new();
+            let mut tiles: Vec<AlphaTiles> = Vec::new();
             let mut clipped: Vec<[ClipVert; 3]> = Vec::new();
             let mut clip = [Vec4::ZERO; crate::scene::CLUSTER_VERTS];
             for &cluster in chunk {
                 let c = &scene.clusters[cluster as usize];
+                let cut = scene.textures.has_alpha(cluster as usize);
+                let cull = cull && !cut;
+                let first_setup = out.len();
                 for (k, p) in scene.cluster_pos(c).enumerate() {
                     clip[k] = vp * p.extend(1.0);
                 }
@@ -865,18 +875,37 @@ fn draw_clusters(scene: &Scene, list: &[u32], vp: Mat4, near: f32, cull: bool, w
                     }
                 }
                 levels.push((cluster, dice_level(edge_px)));
+                // Cut out: its alpha tiles, a point about a pixel apart.
+                if cut && out.len() > first_setup {
+                    let l = (edge_px.clamp(1.0, 1e6).log2().ceil() as u8).max(1);
+                    if let Some(b) = scene.textures.alpha_block(cluster as usize, c.tri_count as usize, l) {
+                        let k = tiles.len() as u32;
+                        tiles.push(AlphaTiles { block: b, first_tri: c.first_tri });
+                        for s in &mut out[first_setup..] {
+                            s.alpha = k;
+                        }
+                    }
+                }
             }
-            (out, levels)
+            (out, levels, tiles)
         })
         .collect();
     let base = setups.len();
     setups.reserve(parts.iter().map(|p| p.0.len()).sum());
-    for (s, l) in parts {
+    for (mut s, l, t) in parts {
+        let k = alpha.len() as u32;
+        if k > 0 {
+            for x in s.iter_mut().filter(|x| x.alpha != NO_ALPHA) {
+                x.alpha += k;
+            }
+        }
+        alpha.extend(t);
         setups.extend(s);
         for (c, lv) in l {
             level[c as usize] = lv;
         }
     }
+    let alpha: &[AlphaTiles] = alpha;
     let new = &setups[base..];
     let t1 = std::time::Instant::now();
 
@@ -935,7 +964,7 @@ fn draw_clusters(scene: &Scene, list: &[u32], vp: Mat4, near: f32, cull: bool, w
                 id.extend_from_slice(&fid[y * width + x0..y * width + x1]);
             }
             for &sid in &tile_lists[t] {
-                raster_tri(&all[sid as usize], sid, x0, y0, x1, y1, tw, &mut depth, &mut id, wireframe);
+                raster_tri(&all[sid as usize], sid, x0, y0, x1, y1, tw, &mut depth, &mut id, wireframe, alpha);
             }
             Some((depth, id))
         })
@@ -976,7 +1005,9 @@ fn raster_tri(
     depth: &mut [f32],
     id: &mut [u32],
     wireframe: bool,
+    alpha: &[AlphaTiles],
 ) {
+    let cut = (s.alpha != NO_ALPHA).then(|| &alpha[s.alpha as usize]);
     let bx0 = (s.min_x as usize).max(x0);
     let bx1 = (s.max_x as usize + 1).min(x1);
     let by0 = (s.min_y as usize).max(y0);
@@ -1021,7 +1052,7 @@ fn raster_tri(
             if e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0 {
                 let inside = !wireframe || e0 < edge_w[0] || e1 < edge_w[1] || e2 < edge_w[2];
                 let i = row + (x - x0);
-                if inside && z > depth[i] {
+                if inside && z > depth[i] && cut.is_none_or(|a| a.solid_at(s, e0, e1, e2)) {
                     depth[i] = z;
                     id[i] = sid;
                 }
@@ -1036,6 +1067,86 @@ fn raster_tri(
         e2_row += b2;
         z_row += dz_dy;
     }
+}
+
+/// No alpha tiles: an opaque triangle.
+pub const NO_ALPHA: u32 = u32::MAX;
+
+/// A cut-out cluster's alpha tiles for a frame, and its first triangle.
+pub struct AlphaTiles {
+    pub block: std::sync::Arc<crate::texture::Block>,
+    pub first_tri: u32,
+}
+
+impl AlphaTiles {
+    /// Whether triangle `s` is solid where its edge functions are (e0,
+    /// e1, e2): the perspective-correct weights, through its setup's
+    /// barycentrics (a triangle cut by the near plane) to the stored
+    /// triangle's, then its nearest alpha point.
+    #[inline]
+    pub fn solid_at(&self, s: &TriSetup, e0: f32, e1: f32, e2: f32) -> bool {
+        let (l0, l1, l2) = (e0 * s.inv_w[0], e1 * s.inv_w[1], e2 * s.inv_w[2]);
+        let sum = l0 + l1 + l2;
+        if sum.abs() < 1e-30 {
+            return true;
+        }
+        let inv = 1.0 / sum;
+        let (l0, l1, l2) = (l0 * inv, l1 * inv, l2 * inv);
+        let b1 = l0 * s.bary[0][1] + l1 * s.bary[1][1] + l2 * s.bary[2][1];
+        let b2 = l0 * s.bary[0][2] + l1 * s.bary[1][2] + l2 * s.bary[2][2];
+        self.block.solid((s.tri - self.first_tri) as usize, b1, b2)
+    }
+}
+
+/// Level of alpha tiles shadow maps use: their texels are coarse, and a
+/// leaf's shadow needs no finer outline.
+pub const SHADOW_ALPHA_LEVEL: u8 = 4;
+
+/// Rasterise a cut-out triangle into a map that keeps the largest value:
+/// corners `p` (x, y in texels of `buf`, which is `width` wide, and the
+/// value, affine on screen), `inv_w` their 1/w for perspective-correct
+/// weights (1 for an orthographic map), `bary` their weights in the stored
+/// triangle `tri`, only texels in columns `xs` and rows `ys` (inclusive)
+/// where `tiles` say it is solid. Whether it touched any texel.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_max_cut(buf: &mut [f32], width: usize, xs: (usize, usize), ys: (usize, usize), p: [(f32, f32, f32); 3], inv_w: [f32; 3], bary: [[f32; 3]; 3], tiles: &AlphaTiles, tri: u32) -> bool {
+    let [(ax, ay, az), (bx, by, bz), (cx, cy, cz)] = p;
+    let area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+    if area == 0.0 || !area.is_finite() {
+        return false;
+    }
+    let inv_area = 1.0 / area;
+    let t = (tri - tiles.first_tri) as usize;
+    let mut any = false;
+    for y in ys.0..=ys.1 {
+        let py = y as f32 + 0.5;
+        for x in xs.0..=xs.1 {
+            let px = x as f32 + 0.5;
+            // Weights of a, b and c, all positive inside whichever way
+            // the triangle turns.
+            let w0 = ((bx - px) * (cy - py) - (cx - px) * (by - py)) * inv_area;
+            let w1 = ((cx - px) * (ay - py) - (ax - px) * (cy - py)) * inv_area;
+            let w2 = 1.0 - w0 - w1;
+            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                continue;
+            }
+            let z = w0 * az + w1 * bz + w2 * cz;
+            let i = y * width + x;
+            if z <= buf[i] {
+                continue;
+            }
+            let (l0, l1, l2) = (w0 * inv_w[0], w1 * inv_w[1], w2 * inv_w[2]);
+            let sum = l0 + l1 + l2;
+            let (l0, l1, l2) = if sum.abs() > 1e-30 { (l0 / sum, l1 / sum, l2 / sum) } else { (w0, w1, w2) };
+            let b1 = l0 * bary[0][1] + l1 * bary[1][1] + l2 * bary[2][1];
+            let b2 = l0 * bary[0][2] + l1 * bary[1][2] + l2 * bary[2][2];
+            if tiles.block.solid(t, b1, b2) {
+                buf[i] = z;
+                any = true;
+            }
+        }
+    }
+    any
 }
 
 /// Perspective-correct barycentric weights of a pixel centre.

@@ -751,6 +751,7 @@ impl Scene {
         let still = turn.abs_diff_eq(glam::Quat::IDENTITY, 1e-7);
         let mut out = Scene::default();
         out.textures.sources = self.textures.sources.clone();
+        out.textures.alpha_sources = self.textures.alpha_sources.clone();
         out.materials = self.materials.clone();
         let mut index = std::collections::HashMap::new();
         // Instances share their vertices and triangles: each stretch is
@@ -1020,6 +1021,12 @@ impl Scene {
     /// Spread samples over the finest level of clusters `range`, replacing
     /// any they had.
     pub fn scatter_over(&mut self, range: std::ops::Range<usize>) -> (usize, f32) {
+        self.scatter_over_masked(range, |_, _, _| true)
+    }
+
+    /// `scatter_over`, only where `solid(scene triangle, b1, b2)` says the
+    /// surface is (cut-out leaves).
+    pub fn scatter_over_masked(&mut self, range: std::ops::Range<usize>, solid: impl Fn(u32, f32, f32) -> bool + Sync) -> (usize, f32) {
         let old = self.samples_in(range.clone());
         self.samples.drain(old.clone());
         if range.is_empty() {
@@ -1039,7 +1046,7 @@ impl Scene {
             (0..tris.len()).into_par_iter().map(|k| crate::samples::tri_area(get(k).1) as f64).sum::<f64>() as f32
         };
         let h = crate::samples::spacing_for(area);
-        let new = crate::samples::scatter(tris.len(), get, area, h);
+        let new = crate::samples::scatter_masked(tris.len(), get, area, h, |k, b1, b2| solid(tris[k].1, b1, b2));
         let n = new.len();
         self.samples.splice(old.start..old.start, new);
         (n, h)

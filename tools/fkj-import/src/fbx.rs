@@ -327,9 +327,11 @@ pub fn load(path: &Path, tex_dirs: &[std::path::PathBuf]) -> Result<Model, Strin
                 let g = *material_index.entry(mid).or_insert_with(|| {
                     let mn = by_id[&mid];
                     let color = mn.p70_vec3("DiffuseColor").or_else(|| mn.p70_vec3("Diffuse")).unwrap_or(Vec3::splat(0.8));
-                    // The texture linked to the diffuse colour.
+                    // The texture linked to the diffuse colour, and the one
+                    // linked to transparency or opacity (a cut-out mask).
                     let tex_node = prop_links.iter().find(|(_, b, p)| *b == mid && (p.contains("Diffuse") || p.contains("BaseColor") || p.contains("Base Color"))).and_then(|(a, _, _)| by_id.get(a));
-                    let tex = tex_node.and_then(|t| {
+                    let alpha_node = prop_links.iter().find(|(_, b, p)| *b == mid && (p.contains("Transparen") || p.contains("Opacity"))).and_then(|(a, _, _)| by_id.get(a));
+                    let mut load_tex = |t: &&Node| -> Option<usize> {
                         let file = t.child("RelativeFilename").or_else(|| t.child("FileName")).and_then(|n| n.props.first()).map(|p| p.str().to_string())?;
                         let base_name = file.rsplit(['\\', '/']).next().unwrap_or(&file).to_string();
                         texture_cache
@@ -356,17 +358,19 @@ pub fn load(path: &Path, tex_dirs: &[std::path::PathBuf]) -> Result<Model, Strin
                                 }
                             })
                             .clone()
-                    });
+                    };
+                    let tex = tex_node.and_then(&mut load_tex);
+                    let alpha = alpha_node.and_then(&mut load_tex);
                     let name = mn.props.get(1).map(|p| p.str().split('\0').next().unwrap_or("").to_string()).unwrap_or_default();
                     // With a texture, the texture is the colour: Blender
                     // writes a placeholder diffuse colour alongside it.
-                    model.materials.push(Material { name, color: if tex.is_some() { Vec3::ONE } else { color }, texture: tex, roughness: 0.5, metallic: 0.0 });
+                    model.materials.push(Material { name, color: if tex.is_some() { Vec3::ONE } else { color }, texture: tex, roughness: 0.5, metallic: 0.0, alpha });
                     (model.materials.len() - 1) as u32
                 });
                 local_to_global.push(g);
             }
             if local_to_global.is_empty() {
-                model.materials.push(Material { name: "default".into(), color: Vec3::splat(0.7), texture: None, roughness: 0.5, metallic: 0.0 });
+                model.materials.push(Material { name: "default".into(), color: Vec3::splat(0.7), texture: None, roughness: 0.5, metallic: 0.0, alpha: None });
                 local_to_global.push((model.materials.len() - 1) as u32);
             }
 
@@ -403,6 +407,22 @@ pub fn load(path: &Path, tex_dirs: &[std::path::PathBuf]) -> Result<Model, Strin
     }
     if model.tris.is_empty() {
         return Err("no meshes found in the FBX".into());
+    }
+    // A material with no mask that shares its colour texture with one
+    // that has a mask (a second leaf material over the same leaf atlas)
+    // takes that mask: the atlas's cut-out is the leaves' shape.
+    for k in 0..model.materials.len() {
+        if model.materials[k].alpha.is_some() {
+            continue;
+        }
+        let Some(t) = model.materials[k].texture else { continue };
+        if let Some(src) = model.materials.iter().find(|m| m.texture == Some(t) && m.alpha.is_some()) {
+            let (a, from) = (src.alpha, src.name.clone());
+            let msg = format!("{}: no mask of its own; takes {from}'s, which shares its colour texture", model.materials[k].name);
+            eprintln!("  {msg}");
+            model.warnings.push(msg);
+            model.materials[k].alpha = a;
+        }
     }
     Ok(model)
 }

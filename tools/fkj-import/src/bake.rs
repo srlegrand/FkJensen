@@ -97,6 +97,22 @@ fn colour_at(m: &Model, t: BakeTri, b1: f32, b2: f32, levels_per_edge: f32) -> V
     mat.color * tex.sample(uv, spacing.max(1.0).log2())
 }
 
+/// Triangle `t`'s cut-out mask at barycentric (b1, b2), as a byte (0 to
+/// 255, solid from 128), filtered like `colour_at`; None for a triangle
+/// with no mask.
+fn alpha_at(m: &Model, t: BakeTri, b1: f32, b2: f32, levels_per_edge: f32) -> Option<u8> {
+    let mat = &m.materials[m.tri_material[t.material_of as usize] as usize];
+    let tex = &m.textures[mat.alpha?];
+    let [ua, ub, uc] = t.corners.map(|i| m.uvs[i as usize]);
+    let uv = ua * (1.0 - b1 - b2) + ub * b1 + uc * b2;
+    let (w, h) = tex.size();
+    let [a, b, c] = [ua, ub, uc].map(|u| u * Vec2::new(w as f32, h as f32));
+    let area = (((b - a).perp_dot(c - a)).abs() * 0.5).max(1.0);
+    let spacing = (2.0 * area).sqrt() / levels_per_edge;
+    // The mask is read as the file has it (the loader decodes sRGB).
+    Some(linear_to_srgb8(tex.sample(uv, spacing.max(1.0).log2()).x))
+}
+
 pub struct Baked {
     pub scene: Scene,
     pub levels: Vec<usize>,
@@ -174,7 +190,8 @@ pub fn bake_logged(m: &Model, o: &Options, levels: bool, log: &dyn Fn(String)) -
     // Surface samples and what each sees of the sky past the model itself
     // (src/samples.rs, src/transfer.rs in FkJensen).
     let ts = std::time::Instant::now();
-    let (n, h) = scene.scatter_over(0..scene.clusters.len());
+    // On cut-out triangles, only where the mask is solid.
+    let (n, h) = scene.scatter_over_masked(0..scene.clusters.len(), |t, b1, b2| alpha_at(m, tris[t as usize], b1, b2, 32.0).is_none_or(|a| a >= crate::texture::ALPHA_CUT));
     crate::transfer::compute(&mut scene.samples);
     log(format!("sky transfer: {n} surface samples, at least {:.1} cm apart, in {:.1} s", h * 100.0, ts.elapsed().as_secs_f64()));
     let mut error = vec![0f32; tris.len()];
@@ -193,7 +210,7 @@ pub fn bake_logged(m: &Model, o: &Options, levels: bool, log: &dyn Fn(String)) -
         if level == 0 {
             entries.push(TexEntry::default());
         } else {
-            entries.push(TexEntry { level, source: 0, offset: total as u64 });
+            entries.push(TexEntry { level, source: 0, offset: total as u64, alpha: None });
             total += texture::level_offset(c.tri_count as usize, level + 1) as usize;
         }
     }
@@ -224,9 +241,57 @@ pub fn bake_logged(m: &Model, o: &Options, levels: bool, log: &dyn Fn(String)) -
         }
         debug_assert_eq!(k, out.len());
     });
-    let pool_bytes = pool.len();
+    // Cut-out masks: for each textured cluster with a masked triangle, the
+    // same levels and points as its colour tiles, a byte each (255 where
+    // a triangle has no mask).
+    let masked: Vec<bool> = scene.clusters.iter().zip(&cluster_levels).map(|(c, &l)| l > 0 && (c.first_tri..c.first_tri + c.tri_count).any(|t| m.materials.get(m.tri_material[tris[t as usize].material_of as usize] as usize).is_some_and(|x| x.alpha.is_some()))).collect();
+    let mut alpha_total = 0usize;
+    for ((c, e), (&l, &on)) in scene.clusters.iter().zip(entries.iter_mut()).zip(cluster_levels.iter().zip(&masked)) {
+        if on {
+            e.alpha = Some(alpha_total as u64);
+            alpha_total += (texture::level_offset(c.tri_count as usize, l + 1) / 3) as usize;
+        }
+    }
+    let alpha_pool = if alpha_total > 0 {
+        let mut apool = vec![255u8; alpha_total];
+        let mut aslices: Vec<Option<&mut [u8]>> = Vec::with_capacity(scene.clusters.len());
+        let mut rest: &mut [u8] = &mut apool;
+        for ((c, &l), &on) in scene.clusters.iter().zip(&cluster_levels).zip(&masked) {
+            if on {
+                let (head, tail) = rest.split_at_mut((texture::level_offset(c.tri_count as usize, l + 1) / 3) as usize);
+                aslices.push(Some(head));
+                rest = tail;
+            } else {
+                aslices.push(None);
+            }
+        }
+        aslices.into_par_iter().zip(scene.clusters.par_iter()).zip(cluster_levels.par_iter()).for_each(|((out, c), &level)| {
+            let Some(out) = out else { return };
+            let mut k = 0;
+            for l in 1..=level {
+                let n = 1usize << l;
+                let inv = 1.0 / n as f32;
+                for t in c.first_tri as usize..(c.first_tri + c.tri_count) as usize {
+                    for i in 0..=n {
+                        for j in 0..=(n - i) {
+                            out[k] = alpha_at(m, tris[t], i as f32 * inv, j as f32 * inv, n as f32).unwrap_or(255);
+                            k += 1;
+                        }
+                    }
+                }
+            }
+            debug_assert_eq!(k, out.len());
+        });
+        let solid = apool.iter().filter(|&&a| a >= crate::texture::ALPHA_CUT).count();
+        log(format!("cut-out masks: {} clusters, {:.0}% of their points solid", masked.iter().filter(|&&x| x).count(), 100.0 * solid as f64 / apool.len().max(1) as f64));
+        Some(apool)
+    } else {
+        None
+    };
+    let pool_bytes = pool.len() + alpha_pool.as_ref().map_or(0, |p| p.len());
     scene.textures.entries = entries;
     scene.textures.sources = vec![Arc::new(Source::Memory(Arc::new(pool)))];
+    scene.textures.alpha_sources = vec![alpha_pool.map(|p| Arc::new(Source::Memory(Arc::new(p))))];
     Baked { scene, levels, pool_bytes, lod: lod_stats }
 }
 
@@ -264,8 +329,8 @@ mod tests {
         m.tri_material = idx.iter().map(|t| (p[t[0] as usize].x >= 0.5) as u32).collect();
         m.positions = p;
         m.tris = idx;
-        m.materials.push(model::Material { name: "left".into(), color: Vec3::ONE, texture: None, roughness: 0.2, metallic: 0.0 });
-        m.materials.push(model::Material { name: "right".into(), color: Vec3::ONE, texture: None, roughness: 0.7, metallic: 1.0 });
+        m.materials.push(model::Material { name: "left".into(), color: Vec3::ONE, texture: None, roughness: 0.2, metallic: 0.0, alpha: None });
+        m.materials.push(model::Material { name: "right".into(), color: Vec3::ONE, texture: None, roughness: 0.7, metallic: 1.0, alpha: None });
         let baked = bake(&m, &Options { texel: 0.01, max_level: 1 }, true);
         let s = &baked.scene;
         assert_eq!(s.materials.iter().map(|x| (x.name.as_str(), x.roughness, x.metallic)).collect::<Vec<_>>(), vec![("left", 0.2, 0.0), ("right", 0.7, 1.0)]);
@@ -286,6 +351,55 @@ mod tests {
     /// A 1 x 1 m quad textured with a 2 x 2 checker: the baked tiles hold
     /// the checker's colours at the right points, and reading the file back
     /// through FkJensen's streaming reader gives the same tiles.
+    /// A quad whose mask is solid on its left half: alpha tiles solid
+    /// there and clear on the right, through a file; surface samples only
+    /// on the left.
+    #[test]
+    fn a_masked_quad_bakes_alpha_tiles_and_samples_its_solid_half() {
+        let mut m = Model::default();
+        m.positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 0.0, -1.0), Vec3::new(0.0, 0.0, -1.0)];
+        m.normals = vec![Vec3::Y; 4];
+        m.uvs = vec![Vec2::new(0.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 0.0)];
+        m.tris = vec![[0, 1, 2], [0, 2, 3]];
+        m.tri_material = vec![0, 0];
+        let grey = vec![128u8; 64 * 64 * 3];
+        let mut mask = Vec::new();
+        for _y in 0..64 {
+            for x in 0..64 {
+                let v = if x < 32 { 255 } else { 0 };
+                mask.extend_from_slice(&[v, v, v]);
+            }
+        }
+        m.textures.push(model::Texture::from_rgb8("c".into(), 64, 64, &grey));
+        m.textures.push(model::Texture::from_rgb8("a".into(), 64, 64, &mask));
+        m.materials.push(model::Material { name: "leaf".into(), color: Vec3::ONE, texture: Some(0), roughness: 0.5, metallic: 0.0, alpha: Some(1) });
+        let baked = bake(&m, &Options { texel: 0.001, max_level: 5 }, false);
+        let dir = std::env::temp_dir().join(format!("fkj-import-mask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("q.fkj");
+        std::fs::write(&path, fkj::write(&baked.scene, &[])).unwrap();
+        let (s2, _) = fkj::read_file(&path).unwrap();
+        assert!(s2.textures.has_alpha(0));
+        let c = &s2.clusters[0];
+        let b = s2.textures.alpha_block(0, c.tri_count as usize, 5).unwrap();
+        let (pos, idx) = (s2.positions(), s2.indices());
+        for t in 0..c.tri_count as usize {
+            let i = (c.first_tri as usize + t) * 3;
+            let corners = [pos[idx[i] as usize], pos[idx[i + 1] as usize], pos[idx[i + 2] as usize]];
+            for (b1, b2) in [(0.1f32, 0.1f32), (0.6, 0.2), (0.2, 0.6), (0.3, 0.3), (0.05, 0.8)] {
+                let p = corners[0] * (1.0 - b1 - b2) + corners[1] * b1 + corners[2] * b2;
+                if (p.x - 0.5).abs() > 0.06 {
+                    assert_eq!(b.solid(t, b1, b2), p.x < 0.5, "at {p}");
+                }
+            }
+        }
+        assert!(!s2.samples.is_empty());
+        assert!(s2.samples.iter().all(|s| s.position.x < 0.55), "samples only on the solid half");
+        let area: f32 = s2.samples.iter().map(|s| s.area).sum();
+        assert!((area - 0.5).abs() < 0.05, "the samples share the solid half: {area} m2");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_checker_quad_bakes_and_round_trips() {
         let mut m = Model::default();
@@ -302,7 +416,7 @@ mod tests {
             }
         }
         m.textures.push(model::Texture::from_rgb8("t".into(), 64, 64, &rgb));
-        m.materials.push(model::Material { name: "m".into(), color: Vec3::ONE, texture: Some(0), roughness: 0.5, metallic: 0.0 });
+        m.materials.push(model::Material { name: "m".into(), color: Vec3::ONE, texture: Some(0), roughness: 0.5, metallic: 0.0, alpha: None });
         let baked = bake(&m, &Options { texel: 0.001, max_level: 5 }, false);
         assert_eq!(baked.scene.clusters.len(), 1);
         let e = baked.scene.textures.entry(0);
@@ -351,7 +465,7 @@ mod tests {
         m.tris = vec![[0, 1, 2]];
         m.tri_material = vec![0];
         m.textures.push(model::Texture::from_rgb8("t".into(), 16, 16, &vec![128; 16 * 16 * 3]));
-        m.materials.push(model::Material { name: "m".into(), color: Vec3::ONE, texture: Some(0), roughness: 0.5, metallic: 0.0 });
+        m.materials.push(model::Material { name: "m".into(), color: Vec3::ONE, texture: Some(0), roughness: 0.5, metallic: 0.0, alpha: None });
         // 128 texels: level 4 by texels; a 1 cm triangle at 2 mm: level 2.
         let t = BakeTri::of(&m, 0);
         assert_eq!(wanted_level(&m, t, &Options { texel: 0.002, max_level: 5 }, 0.0), 2);

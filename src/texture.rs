@@ -54,6 +54,10 @@ pub struct TexEntry {
     pub source: u16,
     /// Offset of its level-1 block in the source's pool.
     pub offset: u64,
+    /// Offset of its cutout tiles in the source's alpha pool: the same
+    /// levels and points, one byte each (0 to 255, opaque from 128). None
+    /// for an opaque cluster. A cluster with them is drawn from both sides.
+    pub alpha: Option<u64>,
 }
 
 /// Where tile data comes from.
@@ -103,13 +107,37 @@ fn read_exact_at(f: &File, buf: &mut [u8], mut at: u64) -> std::io::Result<()> {
 }
 
 /// A block of one cluster's tiles at one level: sRGB8 RGB, triangle by
-/// triangle, `tile_points(level)` points each.
+/// triangle, `tile_points(level)` points each (one byte each for alpha).
 pub struct Block {
     pub level: u8,
     pub data: Vec<u8>,
 }
 
+/// From an alpha byte up, a point is solid.
+pub const ALPHA_CUT: u8 = 128;
+
 impl Block {
+    /// Whether triangle `t` (index within the cluster) is solid at
+    /// barycentric weights (b1, b2): its nearest alpha point.
+    #[inline]
+    pub fn solid(&self, t: usize, b1: f32, b2: f32) -> bool {
+        let n = 1usize << self.level;
+        let nf = n as f32;
+        let i = ((b1 * nf + 0.5) as isize).clamp(0, n as isize) as usize;
+        let j = ((b2 * nf + 0.5) as isize).clamp(0, (n - i) as isize) as usize;
+        self.data.get(t * tile_points(self.level) + tile_index(n, i, j)).is_none_or(|&a| a >= ALPHA_CUT)
+    }
+
+    /// Share of triangle `t`'s alpha points that are solid.
+    pub fn coverage(&self, t: usize) -> f32 {
+        let k = tile_points(self.level);
+        let pts = self.data.get(t * k..t * k + k).unwrap_or(&[]);
+        if pts.is_empty() {
+            return 1.0;
+        }
+        pts.iter().filter(|&&a| a >= ALPHA_CUT).count() as f32 / pts.len() as f32
+    }
+
     /// Linear colour at grid point (i, j) of triangle `t` (index within the
     /// cluster).
     #[inline]
@@ -149,9 +177,10 @@ fn srgb_lut() -> &'static [f32; 256] {
     })
 }
 
-/// A block's key: where its data is (source, offset) and its level, so
-/// that instances, whose clusters point at the same tiles, share blocks.
-type Key = (u16, u64, u8);
+/// A block's key: where its data is (source, offset), its level, and
+/// whether it is alpha, so that instances, whose clusters point at the
+/// same tiles, share blocks.
+type Key = (u16, u64, u8, bool);
 
 struct Cache {
     blocks: HashMap<Key, (Arc<Block>, u64)>,
@@ -171,6 +200,8 @@ pub struct TexStats {
 pub struct Textures {
     pub entries: Vec<TexEntry>,
     pub sources: Vec<Arc<Source>>,
+    /// Each source's alpha pool, if it has one (same order as `sources`).
+    pub alpha_sources: Vec<Option<Arc<Source>>>,
     cache: Mutex<Cache>,
     /// Most bytes the cache holds before it drops the least recently used.
     pub budget: Mutex<usize>,
@@ -182,6 +213,7 @@ impl Default for Textures {
         Textures {
             entries: Vec::new(),
             sources: Vec::new(),
+            alpha_sources: Vec::new(),
             cache: Mutex::new(Cache { blocks: HashMap::new(), bytes: 0, clock: 0 }),
             budget: Mutex::new(64 << 20),
             stats: Mutex::new(TexStats::default()),
@@ -206,7 +238,7 @@ impl Textures {
         if e.level == 0 || level == 0 {
             return false;
         }
-        let key = (e.source, e.offset, level.min(e.level));
+        let key = (e.source, e.offset, level.min(e.level), false);
         self.cache.lock().unwrap().blocks.contains_key(&key)
     }
 
@@ -225,7 +257,9 @@ impl Textures {
     pub fn append(&mut self, other: &Textures, cluster_base: usize, other_clusters: usize) {
         self.entries.resize(cluster_base, TexEntry::default());
         let base = self.sources.len() as u16;
+        self.alpha_sources.resize(self.sources.len(), None);
         self.sources.extend(other.sources.iter().cloned());
+        self.alpha_sources.extend((0..other.sources.len()).map(|k| other.alpha_sources.get(k).cloned().flatten()));
         for c in 0..other_clusters {
             let mut e = other.entry(c);
             if e.level > 0 {
@@ -243,8 +277,31 @@ impl Textures {
         if e.level == 0 || level == 0 {
             return None;
         }
-        let level = level.min(e.level);
-        let key = (e.source, e.offset, level);
+        let src = self.sources.get(e.source as usize)?;
+        self.fetch(src, (e.source, e.offset, level.min(e.level), false), tri_count, 3)
+    }
+
+    /// Whether cluster `c` is cut out by alpha tiles.
+    #[inline]
+    pub fn has_alpha(&self, c: usize) -> bool {
+        self.entries.get(c).is_some_and(|e| e.alpha.is_some() && e.level > 0)
+    }
+
+    /// The block of cluster `c`'s alpha tiles at `level` (at most the
+    /// stored level). None for an opaque cluster.
+    pub fn alpha_block(&self, c: usize, tri_count: usize, level: u8) -> Option<Arc<Block>> {
+        let e = self.entry(c);
+        let a = e.alpha?;
+        if e.level == 0 {
+            return None;
+        }
+        let src = self.alpha_sources.get(e.source as usize)?.as_ref()?;
+        self.fetch(src, (e.source, a, level.clamp(1, e.level), true), tri_count, 1)
+    }
+
+    /// A block from the cache, or read from `src`: `bytes` per point.
+    fn fetch(&self, src: &Source, key: Key, tri_count: usize, bytes: usize) -> Option<Arc<Block>> {
+        let (_, offset, level, _) = key;
         {
             let mut cache = self.cache.lock().unwrap();
             cache.clock += 1;
@@ -254,9 +311,8 @@ impl Textures {
                 return Some(b.clone());
             }
         }
-        let src = self.sources.get(e.source as usize)?;
-        let len = tri_count * tile_points(level) * 3;
-        let data = src.read(e.offset + level_offset(tri_count, level), len).ok()?;
+        let len = tri_count * tile_points(level) * bytes;
+        let data = src.read(offset + level_offset(tri_count, level) / 3 * bytes as u64, len).ok()?;
         let block = Arc::new(Block { level, data });
         {
             let mut st = self.stats.lock().unwrap();
@@ -299,7 +355,7 @@ mod tests {
                 }
             }
         }
-        let tex = Textures { entries: vec![TexEntry { level: 2, source: 0, offset: 0 }], sources: vec![Arc::new(Source::Memory(Arc::new(pool.clone())))], ..Default::default() };
+        let tex = Textures { entries: vec![TexEntry { level: 2, source: 0, offset: 0, alpha: None }], sources: vec![Arc::new(Source::Memory(Arc::new(pool.clone())))], ..Default::default() };
         (tex, pool)
     }
 

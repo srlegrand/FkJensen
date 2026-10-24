@@ -52,6 +52,7 @@ A reader skips any section whose tag it does not know, using the length.
 | `OBJS` | objects and groups, for the editor | yes |
 | `SAMP` | surface samples and their sky transfer | yes |
 | `MATS` | materials, and which triangle has which | yes |
+| `ALPH` | cut-out masks: per-triangle alpha tiles | yes, streamed from the file |
 | `PNTS` | points, particles | reserved |
 | `CURV` | curves, fur and hair | reserved |
 | `VOLM` | volumes | reserved |
@@ -150,6 +151,29 @@ seen at, are read.
 
 An `INST` copy of a cluster uses the same tiles; a mirrored copy keeps
 vertex colours only, since mirroring turns its tiles over.
+
+## ALPH
+
+Cut-out masks (leaves on cards), laid out as `TEXR`'s tiles: the same
+clusters, levels and points, one byte a point, 0 to 255, solid from 128.
+Only clusters with a masked triangle have them; in such a cluster, a
+triangle without a mask is 255 throughout.
+
+    u32       cluster count (the MESH section's)
+    u32       0
+    u64       bytes from the start of this payload to the pool
+    per cluster, 8 bytes
+      u64       offset of its alpha tiles in the pool, u64::MAX for none
+    pool
+
+A cluster with alpha tiles is drawn from both sides, whatever back-face
+culling says. The visibility pass, the point lights' shadow maps and the
+sun's cascades test each pixel or texel against the nearest alpha point
+of its triangle (perspective-correct weights), at a level of about a
+point a pixel on screen and level 4 in shadow maps. Bounce light counts a
+masked triangle's surfel at its solid share. The importer spreads surface
+samples, and so sky transfer, only where the mask is solid. Like the
+colour tiles, the pool stays in the file and blocks are read as needed.
 
 ## LODS
 

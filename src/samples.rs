@@ -65,8 +65,19 @@ pub fn tri_area(p: [Vec3; 3]) -> f32 {
 /// triangle i's cluster, corners and corner normals. `area` is their
 /// total area.
 pub fn scatter(count: usize, tri: impl Fn(usize) -> (u32, [Vec3; 3], [Vec3; 3]) + Sync, area: f32, h: f32) -> Vec<Sample> {
+    scatter_masked(count, tri, area, h, |_, _, _| true)
+}
+
+/// `scatter`, only where `solid(triangle, b1, b2)` (barycentric weights
+/// of its second and third corners) says the surface is: a cut-out leaf
+/// card gets samples on its leaves. `area` is the triangles' whole area;
+/// the samples share the solid part of it.
+pub fn scatter_masked(count: usize, tri: impl Fn(usize) -> (u32, [Vec3; 3], [Vec3; 3]) + Sync, area: f32, h: f32, solid: impl Fn(usize, f32, f32) -> bool + Sync) -> Vec<Sample> {
     use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let density = CANDIDATES / (h * h);
+    let (thrown, missed) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let (thrown_r, missed_r, solid_r) = (&thrown, &missed, &solid);
     // Candidates, each with a random key that sets the order they are
     // taken in.
     let mut cand: Vec<(f32, Vec3, Vec3, u32)> = (0..count)
@@ -83,10 +94,21 @@ pub fn scatter(count: usize, tri: impl Fn(usize) -> (u32, [Vec3; 3], [Vec3; 3]) 
                 let (a, b, c) = (1.0 - r1, r1 * (1.0 - r2), r1 * r2);
                 let pos = p[0] * a + p[1] * b + p[2] * c;
                 let nrm = (n[0] * a + n[1] * b + n[2] * c).normalize_or(face);
-                (rand(i as u64 ^ 0x5555, j), pos, nrm, cluster)
+                (rand(i as u64 ^ 0x5555, j), pos, nrm, cluster, b, c)
             })
+            .filter(move |&(_, _, _, _, b, c)| {
+                thrown_r.fetch_add(1, Ordering::Relaxed);
+                let ok = solid_r(i, b, c);
+                if !ok {
+                    missed_r.fetch_add(1, Ordering::Relaxed);
+                }
+                ok
+            })
+            .map(|(k, p, n, c, _, _)| (k, p, n, c))
         })
         .collect();
+    let thrown = thrown.into_inner().max(1);
+    let area = area * (1.0 - missed.into_inner() as f32 / thrown as f32);
     cand.par_sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     // Dart throwing on a grid of cells `h` wide.
     let cell = |p: Vec3| ((p.x / h).floor() as i32, (p.y / h).floor() as i32, (p.z / h).floor() as i32);

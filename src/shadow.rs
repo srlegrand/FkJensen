@@ -261,6 +261,7 @@ fn draw_face_into(buf: &mut [f32], scene: &Scene, clusters: &[usize], pos: Vec3,
     let planes = [(a - r) * s2, (a + r) * s2, (a - u) * s2, (a + u) * s2];
     let mut clip = [Vec4::ZERO; crate::scene::CLUSTER_VERTS];
     let mut poly: Vec<Vec4> = Vec::with_capacity(4);
+    let mut weights: Vec<[f32; 3]> = Vec::with_capacity(4);
     for &ci in clusters {
         let c = &scene.clusters[ci];
         let qc = c.centre - pos;
@@ -271,6 +272,8 @@ fn draw_face_into(buf: &mut [f32], scene: &Scene, clusters: &[usize], pos: Vec3,
             let q = p - pos;
             clip[k] = Vec4::new(q.dot(r), q.dot(u), 0.0, q.dot(a));
         }
+        // Leaves on cards cast the shape of their leaves.
+        let cut = scene.textures.alpha_block(ci, c.tri_count as usize, crate::raster::SHADOW_ALPHA_LEVEL).map(|block| crate::raster::AlphaTiles { block, first_tri: c.first_tri });
         for tri in c.first_tri..c.first_tri + c.tri_count {
             let v = scene.tris[tri as usize].map(|l| clip[l as usize]);
             if (v[0].w < NEAR && v[1].w < NEAR && v[2].w < NEAR)
@@ -282,24 +285,48 @@ fn draw_face_into(buf: &mut [f32], scene: &Scene, clusters: &[usize], pos: Vec3,
                 continue;
             }
             tris += 1;
-            // Clip against the near plane.
+            // Clip against the near plane, keeping each corner's weights
+            // in the stored triangle.
             poly.clear();
+            weights.clear();
+            const W: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
             for i in 0..3 {
                 let (p, q) = (v[i], v[(i + 1) % 3]);
                 if p.w >= NEAR {
                     poly.push(p);
+                    weights.push(W[i]);
                 }
                 if (p.w >= NEAR) != (q.w >= NEAR) {
                     let t = (NEAR - p.w) / (q.w - p.w);
                     poly.push(p.lerp(q, t));
+                    let (wa, wb) = (W[i], W[(i + 1) % 3]);
+                    weights.push(std::array::from_fn(|k| wa[k] + (wb[k] - wa[k]) * t));
                 }
             }
             for k in 1..poly.len().saturating_sub(1) {
-                fill(buf, res, poly[0], poly[k], poly[k + 1], rect);
+                match &cut {
+                    Some(tiles) => fill_cut(buf, res, [poly[0], poly[k], poly[k + 1]], [weights[0], weights[k], weights[k + 1]], rect, tiles, tri),
+                    None => fill(buf, res, poly[0], poly[k], poly[k + 1], rect),
+                }
             }
         }
     }
     tris
+}
+
+/// `fill` for a cut-out triangle: only where its alpha tiles are solid.
+fn fill_cut(buf: &mut [f32], res: usize, v: [Vec4; 3], bary: [[f32; 3]; 3], clip: [usize; 4], tiles: &crate::raster::AlphaTiles, tri: u32) {
+    let rs = res as f32;
+    let to = |p: Vec4| (((p.x / p.w) * 0.5 + 0.5) * rs, ((p.y / p.w) * 0.5 + 0.5) * rs, 1.0 / p.w);
+    let p = v.map(to);
+    let x0 = (p.iter().map(|q| q.0).fold(f32::INFINITY, f32::min).floor().max(0.0) as usize).max(clip[0]);
+    let y0 = (p.iter().map(|q| q.1).fold(f32::INFINITY, f32::min).floor().max(0.0) as usize).max(clip[1]);
+    let x1 = ((p.iter().map(|q| q.0).fold(f32::NEG_INFINITY, f32::max).ceil().min(rs - 1.0)).max(0.0) as usize).min(clip[2]);
+    let y1 = ((p.iter().map(|q| q.1).fold(f32::NEG_INFINITY, f32::max).ceil().min(rs - 1.0)).max(0.0) as usize).min(clip[3]);
+    if x0 > x1 || y0 > y1 {
+        return;
+    }
+    crate::raster::fill_max_cut(buf, res, (x0, x1), (y0, y1), p, p.map(|q| q.2), bary, tiles, tri);
 }
 
 /// Rasterise one triangle into a face, keeping the largest 1/w.

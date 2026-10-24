@@ -44,6 +44,7 @@ pub const TAG_LODS: [u8; 4] = *b"LODS";
 pub const TAG_OBJS: [u8; 4] = *b"OBJS";
 pub const TAG_SAMP: [u8; 4] = *b"SAMP";
 pub const TAG_MATS: [u8; 4] = *b"MATS";
+pub const TAG_ALPH: [u8; 4] = *b"ALPH";
 
 /// Extra copies of clusters `first_cluster..first_cluster + cluster_count`
 /// of the `MESH` section, each at `transform` applied to the stored
@@ -109,7 +110,8 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
     let objs = !scene.objects.is_empty();
     let samp = !scene.samples.is_empty();
     let mats = !scene.materials.is_empty();
-    head.u32(2 + !instances.is_empty() as u32 + textured as u32 + lods as u32 + objs as u32 + samp as u32 + mats as u32);
+    let alph = textured && (0..scene.clusters.len()).any(|c| scene.textures.has_alpha(c));
+    head.u32(2 + !instances.is_empty() as u32 + textured as u32 + lods as u32 + objs as u32 + samp as u32 + mats as u32 + alph as u32);
     head.u32(0);
     out.write_all(&head.0)?;
 
@@ -258,6 +260,43 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
         out.write_all(&t.0)?;
         for (src, off, l) in parts.into_iter().flatten() {
             out.write_all(&scene.textures.sources[src].read(off, l)?)?;
+        }
+        out.write_all(&[0u8; 8][..((8 - len % 8) % 8) as usize])?;
+    }
+
+    // ALPH: u32 cluster count, u32 0, u64 bytes from the payload's start to
+    // the pool; per cluster u64 offset of its alpha tiles in the pool
+    // (u64::MAX: opaque); then the pool. A cluster's alpha tiles are laid
+    // out as its TEXR tiles are, one byte a point (opaque from 128).
+    if alph {
+        let n = scene.clusters.len();
+        let table_end = (16 + n * 8) as u64;
+        let mut t = W(Vec::new());
+        t.u32(n as u32);
+        t.u32(0);
+        t.u64(table_end);
+        let mut parts: Vec<Option<(usize, u64, usize)>> = Vec::with_capacity(n);
+        let mut pool_len = 0u64;
+        for (ci, c) in scene.clusters.iter().enumerate() {
+            let e = scene.textures.entry(ci);
+            let part = e.alpha.filter(|_| e.level > 0 && scene.textures.alpha_sources.get(e.source as usize).is_some_and(|s| s.is_some())).map(|a| (e.source as usize, a, (level_offset(c.tri_count as usize, e.level + 1) / 3) as usize));
+            match part {
+                Some((_, _, len)) => {
+                    t.u64(pool_len);
+                    pool_len += len as u64;
+                }
+                None => t.u64(u64::MAX),
+            }
+            parts.push(part);
+        }
+        let len = t.0.len() as u64 + pool_len;
+        out.write_all(&TAG_ALPH)?;
+        out.write_all(&1u32.to_le_bytes())?;
+        out.write_all(&len.to_le_bytes())?;
+        out.write_all(&t.0)?;
+        for (src, off, l) in parts.into_iter().flatten() {
+            let s = scene.textures.alpha_sources[src].as_ref().expect("checked above");
+            out.write_all(&s.read(off, l)?)?;
         }
         out.write_all(&[0u8; 8][..((8 - len % 8) % 8) as usize])?;
     }
@@ -415,6 +454,7 @@ pub fn read(bytes: &[u8]) -> Result<(Scene, ReadReport), String> {
     let sections = header(r.take(16)?)?;
     let mut list: Vec<([u8; 4], u32, Vec<u8>)> = Vec::new();
     let mut tex: Option<(Vec<u8>, Source)> = None;
+    let mut alpha: Option<(Vec<u8>, Source)> = None;
     for _ in 0..sections {
         let tag: [u8; 4] = r.take(4)?.try_into().unwrap();
         let section_version = r.u32()?;
@@ -424,11 +464,14 @@ pub fn read(bytes: &[u8]) -> Result<(Scene, ReadReport), String> {
         if tag == TAG_TEXR {
             let table_end = texr_table_end(payload)?;
             tex = Some((payload[..table_end].to_vec(), Source::Memory(Arc::new(payload[table_end..].to_vec()))));
+        } else if tag == TAG_ALPH && section_version == 1 {
+            let table_end = alph_table_end(payload)?;
+            alpha = Some((payload[..table_end].to_vec(), Source::Memory(Arc::new(payload[table_end..].to_vec()))));
         } else {
             list.push((tag, section_version, payload.to_vec()));
         }
     }
-    assemble(list, tex)
+    assemble(list, tex, alpha)
 }
 
 /// Read a `.fkj` file. Everything but the texture tiles is read; the tiles
@@ -442,6 +485,7 @@ pub fn read_file(path: &std::path::Path) -> Result<(Scene, ReadReport), String> 
     let sections = header(&buf)?;
     let mut list = Vec::new();
     let mut tex_table: Option<(Vec<u8>, u64)> = None;
+    let mut alpha_table: Option<(Vec<u8>, u64)> = None;
     let mut at = 16u64;
     for _ in 0..sections {
         f.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
@@ -458,6 +502,14 @@ pub fn read_file(path: &std::path::Path) -> Result<(Scene, ReadReport), String> 
             table[..16].copy_from_slice(&head);
             f.read_exact(&mut table[16..]).map_err(|_| "file is truncated".to_string())?;
             tex_table = Some((table, start + table_end as u64));
+        } else if tag == TAG_ALPH && version == 1 {
+            let mut head = [0u8; 16];
+            f.read_exact(&mut head).map_err(|_| "file is truncated".to_string())?;
+            let table_end = alph_table_end(&head)?;
+            let mut table = vec![0u8; table_end];
+            table[..16].copy_from_slice(&head);
+            f.read_exact(&mut table[16..]).map_err(|_| "file is truncated".to_string())?;
+            alpha_table = Some((table, start + table_end as u64));
         } else {
             let mut payload = vec![0u8; len as usize];
             f.read_exact(&mut payload).map_err(|_| "file is truncated".to_string())?;
@@ -472,7 +524,26 @@ pub fn read_file(path: &std::path::Path) -> Result<(Scene, ReadReport), String> 
         }
         None => None,
     };
-    assemble(list, tex)
+    let alpha = match alpha_table {
+        Some((table, pool)) => {
+            let file = std::fs::File::open(path).map_err(|e| format!("cannot read {name}: {e}"))?;
+            Some((table, Source::File { file, pool }))
+        }
+        None => None,
+    };
+    assemble(list, tex, alpha)
+}
+
+fn alph_table_end(payload: &[u8]) -> Result<usize, String> {
+    if payload.len() < 16 {
+        return Err("ALPH section is truncated".into());
+    }
+    let n = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let end = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+    if end != 16 + n * 8 {
+        return Err("ALPH table size does not match its cluster count".into());
+    }
+    Ok(end)
 }
 
 fn header(b: &[u8]) -> Result<u32, String> {
@@ -498,7 +569,7 @@ fn texr_table_end(payload: &[u8]) -> Result<usize, String> {
     Ok(end)
 }
 
-fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) -> Result<(Scene, ReadReport), String> {
+fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>, alpha: Option<(Vec<u8>, Source)>) -> Result<(Scene, ReadReport), String> {
     let mut scene = Scene::new();
     let mut report = ReadReport::default();
     let mut inst_payloads: Vec<&[u8]> = Vec::new();
@@ -537,10 +608,22 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) 
             if level > crate::texture::MAX_LEVEL {
                 return Err("TEXR level beyond the finest dicing level".into());
             }
-            entries.push(TexEntry { level, source: 0, offset });
+            entries.push(TexEntry { level, source: 0, offset, alpha: None });
         }
         scene.textures.entries = entries;
         scene.textures.sources = vec![Arc::new(source)];
+        if let Some((table, source)) = alpha {
+            let n = u32::from_le_bytes(table[0..4].try_into().unwrap()) as usize;
+            if n != stored_clusters {
+                return Err(format!("ALPH has {n} clusters, MESH has {stored_clusters}"));
+            }
+            let mut r = R { b: &table, at: 16 };
+            for e in scene.textures.entries.iter_mut() {
+                let a = r.u64()?;
+                e.alpha = (a != u64::MAX).then_some(a);
+            }
+            scene.textures.alpha_sources = vec![Some(Arc::new(source))];
+        }
     }
     if let Some(b) = samp {
         read_samples(b, &mut scene, stored_clusters)?;
@@ -1172,7 +1255,7 @@ mod tests {
         let mut pool = Vec::new();
         let mut entries = Vec::new();
         for (ci, c) in a.clusters.iter().enumerate() {
-            entries.push(TexEntry { level: 2, source: 0, offset: pool.len() as u64 });
+            entries.push(TexEntry { level: 2, source: 0, offset: pool.len() as u64, alpha: None });
             let len = level_offset(c.tri_count as usize, 3) as usize;
             pool.extend(std::iter::repeat_n(ci as u8, len));
         }
@@ -1188,5 +1271,39 @@ mod tests {
             assert_eq!(blk.data.len(), b.clusters[ci].tri_count as usize * tile_points(2) * 3);
             assert!(blk.data.iter().all(|v| *v == src as u8), "cluster {ci} reads its own tiles");
         }
+    }
+
+    /// Alpha tiles go out in ALPH and come back, from memory and from a
+    /// file, for the clusters that have them only.
+    #[test]
+    fn alpha_tiles_round_trip() {
+        use crate::texture::{level_offset, tile_points};
+        let mut a = sample();
+        let (mut pool, mut alpha, mut entries) = (Vec::new(), Vec::new(), Vec::new());
+        for (ci, c) in a.clusters.iter().enumerate() {
+            let len = level_offset(c.tri_count as usize, 3) as usize;
+            let cut = ci % 2 == 0;
+            entries.push(TexEntry { level: 2, source: 0, offset: pool.len() as u64, alpha: cut.then_some(alpha.len() as u64) });
+            pool.extend(std::iter::repeat_n(7u8, len));
+            if cut {
+                alpha.extend(std::iter::repeat_n(ci as u8 * 10, len / 3));
+            }
+        }
+        a.textures.entries = entries;
+        a.textures.sources = vec![Arc::new(Source::Memory(Arc::new(pool)))];
+        a.textures.alpha_sources = vec![Some(Arc::new(Source::Memory(Arc::new(alpha))))];
+        let bytes = write(&a, &[]);
+        let path = std::env::temp_dir().join(format!("fkj-alpha-{}.fkj", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        for (b, _) in [read(&bytes).unwrap(), read_file(&path).unwrap()] {
+            for ci in 0..b.clusters.len() {
+                assert_eq!(b.textures.has_alpha(ci), ci % 2 == 0);
+                if let Some(blk) = b.textures.alpha_block(ci, b.clusters[ci].tri_count as usize, 2) {
+                    assert_eq!(blk.data.len(), b.clusters[ci].tri_count as usize * tile_points(2));
+                    assert!(blk.data.iter().all(|v| *v == ci as u8 * 10), "cluster {ci} reads its own alpha");
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

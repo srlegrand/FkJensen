@@ -354,6 +354,15 @@ finest level stops where its points would be finer than the source's
 texels or closer than `--texel` (2 mm). A triangle covering two texels or
 fewer gets no tiles: its three vertex colours hold them.
 
+Cut-out masks (leaves on cards). An FBX material's texture linked to
+transparency or opacity is baked as alpha tiles alongside the colour
+tiles (`ALPH`, `docs/format.md`); a material without one that shares its
+colour texture with a masked material takes that mask, and the importer
+says so. Where a mask is under half the surface is not drawn and casts no
+shadow, and a masked card is drawn from both sides. Surface samples, and
+so sky transfer, lie on the solid part only. glTF's alpha (a base colour
+texture's fourth channel) is not read yet.
+
 At load the tiles stay in the file. When a cluster is shaded at level L,
 its tiles at that level are read with one positioned read and kept in a
 cache capped by the machine's plan (an eighth of available memory). Only

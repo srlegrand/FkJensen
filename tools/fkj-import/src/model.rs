@@ -14,6 +14,9 @@ pub struct Material {
     /// GGX roughness and metalness (glTF's factors; 0.5 and 0 otherwise).
     pub roughness: f32,
     pub metallic: f32,
+    /// A cut-out mask (leaves on cards): a texture whose red channel says
+    /// where the surface is, solid from half up.
+    pub alpha: Option<usize>,
 }
 
 /// A base colour texture, linear RGB, with its mip chain.

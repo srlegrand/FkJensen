@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 24/10/2026: cut-out masks as alpha tiles beside the colour tiles (`ALPH`): no UVs at render time still; the visibility pass and both kinds of shadow map test each pixel against the triangle's nearest alpha point; masked cards are two-sided; samples only on solid parts. Cutting the leaves into geometry was the other way, and it would have multiplied a tree's triangles by tens.
 - 24/10/2026: instances as in Maya (Duplicate Instanced, Ctrl+Shift+D; `instance_of` in scene files): an instance is its own clusters' headers over shared vertices, triangles, levels of detail, materials and texture tiles; the texture cache is keyed by where tiles are stored, so instances read them once; objects are culled by their boxes before their clusters. 25 instances of a 22,600-triangle tree read 1,163 texture blocks where 25 copies read 6,917; frame time is the same, since shading and visibility were already per cluster.
 - 24/10/2026: cameras as in Maya: Create > Cameras (Camera, Camera from View), the viewport's View and Panels menus, Look Through, the outliner's Cameras; navigating while looking through a camera moves it, persp keeps its place. Scene files keep the cameras and the view. The menu bar's View became Display.
 - 24/10/2026: point lights parent to objects and groups as in Maya (Edit > Parent, P, then pick; Unparent, Shift+P; outliner drag), keeping their world position or taking it as an offset; they follow their object, and go with it when it is deleted.

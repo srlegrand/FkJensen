@@ -322,18 +322,37 @@ fn draw_bands(height: &mut [f32], res: usize, rows: (usize, usize), cols: (f32, 
                     continue;
                 }
                 let c = &scene.clusters[i];
+                // Leaves on cards cast the shape of their leaves.
+                let cut = scene.textures.alpha_block(i, c.tri_count as usize, crate::raster::SHADOW_ALPHA_LEVEL).map(|block| crate::raster::AlphaTiles { block, first_tri: c.first_tri });
                 for t in c.first_tri..c.first_tri + c.tri_count {
                     // Rows of this band count from 0 in its own slice.
                     let v = scene.tri_pos(c, t).map(|p| {
                         let q = project(p);
                         Vec4::new(q.x, q.y - fy0, q.z, 0.0)
                     });
-                    n += fill_max_rows(buf, res, n_rows, cols, v[0], v[1], v[2]) as u64;
+                    n += match &cut {
+                        Some(tiles) => fill_cut_rows(buf, res, n_rows, cols, v, tiles, t),
+                        None => fill_max_rows(buf, res, n_rows, cols, v[0], v[1], v[2]),
+                    } as u64;
                 }
             }
             n
         })
         .sum()
+}
+
+/// `fill_max_rows` for a cut-out triangle: only where its alpha tiles are
+/// solid. The map is orthographic: weights are affine on it.
+fn fill_cut_rows(buf: &mut [f32], res: usize, rows: usize, cols: (f32, f32), v: [Vec4; 3], tiles: &crate::raster::AlphaTiles, tri: u32) -> bool {
+    let x0 = v.iter().map(|q| q.x).fold(f32::INFINITY, f32::min).floor().max(0.0).max(cols.0);
+    let y0 = v.iter().map(|q| q.y).fold(f32::INFINITY, f32::min).floor().max(0.0);
+    let x1 = v.iter().map(|q| q.x).fold(f32::NEG_INFINITY, f32::max).ceil().min(res as f32 - 1.0).min(cols.1);
+    let y1 = v.iter().map(|q| q.y).fold(f32::NEG_INFINITY, f32::max).ceil().min(rows as f32 - 1.0);
+    if x0 > x1 || y0 > y1 {
+        return false;
+    }
+    const W: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    crate::raster::fill_max_cut(buf, res, (x0 as usize, x1 as usize), (y0 as usize, y1 as usize), v.map(|q| (q.x, q.y, q.z)), [1.0; 3], W, tiles, tri)
 }
 
 /// `fill_max` into a band of `rows` rows, `res` texels wide, coordinates
