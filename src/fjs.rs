@@ -717,7 +717,7 @@ mod tests {
         // The camera's subject is the objects, not kilometres of ground: a
         // subject that size put the near plane tens of metres out and hid
         // everything closer.
-        assert_eq!(t.focus, Some(crate::world::middle()));
+        assert_eq!(t.focus, Some(crate::scene::set_middle()));
         let with = parse(r#"{ "fjs": 1, "world": "built-in", "objects": [ { "name": "c", "asset": "built-in:cube", "pivot": [7.5, 0.0, 5.0] } ] }"#).unwrap();
         let (lo, hi) = build(&with, &d, &[]).unwrap().focus.unwrap();
         assert!(lo.distance(glam::Vec3::new(7.0, 0.0, 4.5)) < 1e-3 && hi.distance(glam::Vec3::new(8.0, 1.0, 5.5)) < 1e-3, "{lo} {hi}");

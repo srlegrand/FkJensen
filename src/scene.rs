@@ -293,6 +293,12 @@ pub enum World {
     Asset(std::path::PathBuf),
 }
 
+/// The middle of the built-in set, where the camera looks when there is
+/// nothing but the ground and the mountains.
+pub fn set_middle() -> (Vec3, Vec3) {
+    (Vec3::new(-6.0, 0.0, -6.0), Vec3::new(6.0, 5.0, 6.0))
+}
+
 /// A model in the scene: its clusters (and so its vertices, which they
 /// hold in one run), and how it has been placed. Geometry is kept in world
 /// space; moving an object rewrites its vertices. A group is an object with
@@ -615,7 +621,7 @@ impl Scene {
     /// nothing else. None for a scene with neither.
     pub fn subject(&self) -> Option<(Vec3, Vec3)> {
         let objects = (0..self.objects.len()).filter(|&i| !self.objects[i].clusters.is_empty() && !self.objects[i].environment).map(|i| self.vertex_bounds(i)).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
-        objects.or_else(|| self.objects.iter().any(|o| o.environment).then(crate::world::middle))
+        objects.or_else(|| self.objects.iter().any(|o| o.environment).then(set_middle))
     }
 
     pub fn focus_bounds(&self) -> (Vec3, Vec3) {

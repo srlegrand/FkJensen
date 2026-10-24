@@ -245,7 +245,7 @@ pub fn build() -> Scene {
         scene.append(part(name).expect("a built-in part"));
     }
     // Until the models are added, the subject is the middle of the plane.
-    scene.focus = Some(middle());
+    scene.focus = Some(crate::scene::set_middle());
     scene
 }
 
@@ -262,11 +262,6 @@ pub fn set_lights() -> Vec<PointLight> {
 
 /// Two small lamps near the origin (400 lm and 120 lm), whose reach is a
 /// few metres: for tests that need a light to touch only part of the set.
-/// The middle of the set, where the camera looks when there is nothing
-/// but the ground and the mountains.
-pub fn middle() -> (Vec3, Vec3) {
-    (Vec3::new(-6.0, 0.0, -6.0), Vec3::new(6.0, 5.0, 6.0))
-}
 
 #[cfg(test)]
 pub fn small_lights() -> Vec<PointLight> {
