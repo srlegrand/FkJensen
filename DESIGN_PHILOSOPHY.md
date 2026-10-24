@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 24/10/2026: the editor gets smaller and tighter: Inter at 11.5 points, small paddings, Phosphor icons in place of worded buttons, narrower panels and timeline. Where something goes and what it is called follow Maya unless it is FkJensen's own.
 - 24/10/2026: materials, shaded physically on every surface: GGX with Smith visibility and Schlick's Fresnel, multiple-scattering compensation, the sky's highlight, diffuse what the highlight leaves for the eye's angle; tint, roughness, metallic and specular per material, kept per triangle in the asset (`MATS`), changed per object in a scene and pushed into the asset when wanted. Replaces the one Blinn highlight; shading costs about a third more a point.
 - 24/10/2026: the Show menu (picture, light count, visual debug views) moves from the render settings to the viewport, over its top left corner.
 - 24/10/2026: navigation buttons over the editor's viewport, so the camera moves without a mouse: pads to drag on for tumble, track and dolly, buttons held to move, and the two framings.

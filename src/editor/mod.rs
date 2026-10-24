@@ -15,6 +15,7 @@ pub mod paint;
 mod materials;
 mod navigate;
 mod panels;
+pub mod style;
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -144,11 +145,7 @@ pub struct Editor {
 impl Editor {
     pub fn new(app: App) -> Editor {
         let ctx = egui::Context::default();
-        ctx.set_visuals(egui::Visuals::dark());
-        ctx.all_styles_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(6.0, 4.0);
-            s.interaction.selectable_labels = false;
-        });
+        style::apply(&ctx);
         let plan_budget = app.point_budget;
         let last_selection = app.selection;
         let mut app = app;
@@ -522,8 +519,8 @@ impl Editor {
         egui::Panel::top("tools").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status(ui));
         egui::Panel::bottom("timeline").resizable(false).show(ui, |ui| self.timeline(ui));
-        egui::Panel::left("outliner").resizable(true).default_size(230.0).min_size(150.0).show(ui, |ui| self.outliner(ui));
-        egui::Panel::right("attributes").resizable(true).default_size(310.0).min_size(220.0).show(ui, |ui| {
+        egui::Panel::left("outliner").resizable(true).default_size(200.0).min_size(140.0).show(ui, |ui| self.outliner(ui));
+        egui::Panel::right("attributes").resizable(true).default_size(280.0).min_size(200.0).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.attributes(ui));
         });
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.viewport(ui));
@@ -619,17 +616,18 @@ impl Editor {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        use style::icon;
         ui.horizontal(|ui| {
-            for (tool, name, key) in [(manip::Tool::Select, "Select", "Q"), (manip::Tool::Move, "Move", "W"), (manip::Tool::Rotate, "Rotate", "E"), (manip::Tool::Scale, "Scale", "R")] {
-                if ui.selectable_label(self.app.tool == tool, name).on_hover_text(key).clicked() {
+            for (tool, glyph, name) in [(manip::Tool::Select, icon::CURSOR, "Select (Q)"), (manip::Tool::Move, icon::MOVE, "Move (W)"), (manip::Tool::Rotate, icon::ROTATE, "Rotate (E)"), (manip::Tool::Scale, icon::SCALE, "Scale (R)")] {
+                if ui.selectable_label(self.app.tool == tool, style::ic(glyph, 14.0)).on_hover_text(name).clicked() {
                     self.app.tool = tool;
                 }
             }
             ui.separator();
-            if ui.button("Import...").clicked() {
+            if ui.button(style::ic(icon::IMPORT, 14.0)).on_hover_text("Import a model (Ctrl+I)").clicked() {
                 self.import(None);
             }
-            if ui.button("Frame").on_hover_text("F").clicked() {
+            if ui.button(style::ic(icon::FRAME, 14.0)).on_hover_text("Frame the selection (F)").clicked() {
                 self.app.frame_selection();
             }
         });

@@ -43,3 +43,16 @@ Licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/) by
 the Academy Software Foundation. Changes made here: converted from USD to
 `.fkj`, textures reduced to per-vertex colour, materials dropped, lights
 added.
+
+## fonts/InterVariable.ttf
+
+Inter by Rasmus Andersson and the Inter Project Authors
+(https://github.com/rsms/inter), licensed under the SIL Open Font License
+1.1 (`fonts/LICENSE-Inter.txt`). The editor's text. Taken unchanged from
+the `damascene-fonts-inter` crate.
+
+## fonts/Phosphor.ttf
+
+Phosphor Icons, regular weight (https://phosphoricons.com), MIT licence
+(`fonts/LICENSE-Phosphor.txt`). The editor's icons. Taken unchanged from
+the `egui-phosphor` crate.

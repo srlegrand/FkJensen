@@ -697,6 +697,10 @@ with egui, on the CPU like everything else: egui's triangles are filled by
 - **Viewport** in the middle: the same mouse and keys as the plain window
   (Controls, above), except Esc. Keys go to the viewport unless a text box
   is being typed in.
+- **Look**: Inter at 11.5 points, tight spacing, icons from Phosphor for
+  the tools, the navigation buttons and the timeline, each with its name
+  and key on hover (`src/editor/style.rs`; both fonts built in, credits
+  in `assets/README.md`).
 - **Show** menu over the viewport's top left corner: the picture, the
   light count, or a visual debug view, in menus by subject.
 - **Navigation buttons** in the viewport's bottom right corner, for

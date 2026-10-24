@@ -551,13 +551,14 @@ impl Editor {
     // ------------------------------------------------------------ timeline
 
     pub(super) fn timeline(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(3.0);
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
-            if ui.button(if self.playing { "Pause" } else { "Play" }).clicked() {
+            use super::style::icon;
+            if ui.button(super::style::ic(if self.playing { icon::PAUSE } else { icon::PLAY }, 12.0)).on_hover_text(if self.playing { "Pause" } else { "Play the day" }).clicked() {
                 self.playing = !self.playing;
             }
             egui::ComboBox::from_id_salt("speed")
-                .width(90.0)
+                .width(70.0)
                 .selected_text(match self.speed {
                     s if s < 0.1 => "1 min/s",
                     s if s < 0.5 => "10 min/s",
@@ -577,13 +578,13 @@ impl Editor {
             }
             self.time_ruler(ui);
         });
-        ui.add_space(3.0);
+        ui.add_space(2.0);
     }
 
     /// The day as Maya's time slider: an hour per tick, night shaded, the
     /// time a red mark; click or drag to set it.
     fn time_ruler(&mut self, ui: &mut egui::Ui) {
-        let size = egui::vec2(ui.available_width() - 4.0, 34.0);
+        let size = egui::vec2(ui.available_width() - 4.0, 24.0);
         let (rect, r) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
         let p = ui.painter_at(rect);
         let v = ui.visuals();

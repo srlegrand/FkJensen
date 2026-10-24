@@ -38,21 +38,30 @@ impl Editor {
         let area = egui::Area::new(egui::Id::unique("navigation")).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_BOTTOM).fixed_pos(rect.right_bottom() - egui::vec2(8.0, 8.0));
         area.show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
                 egui::Grid::new("navigation grid").num_columns(5).show(ui, |ui| {
                     // A pad to drag on, then buttons held to move.
                     let pad = |ui: &mut egui::Ui, name: &'static str, hint: &str, rects: &mut Vec<(&'static str, egui::Rect)>| -> egui::Vec2 {
-                        let (r, resp) = ui.allocate_exact_size(egui::vec2(68.0, 22.0), egui::Sense::drag());
+                        let (r, resp) = ui.allocate_exact_size(egui::vec2(48.0, 16.0), egui::Sense::drag());
                         rects.push((name, r));
                         let v = ui.visuals();
                         let fill = if resp.dragged() { v.selection.bg_fill } else if resp.hovered() { v.widgets.hovered.bg_fill } else { v.widgets.inactive.bg_fill };
                         ui.painter().rect_filled(r, 3.0, fill);
-                        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(12.0), v.strong_text_color());
+                        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(10.5), v.strong_text_color());
                         let resp = resp.on_hover_text(hint);
                         if resp.dragged() { resp.drag_delta() * ppp } else { egui::Vec2::ZERO }
                     };
                     let hold = |ui: &mut egui::Ui, text: &'static str, m: Move, held: &mut Option<Move>, rects: &mut Vec<(&'static str, egui::Rect)>| {
-                        let b = ui.add(egui::Button::new(text).min_size(egui::vec2(34.0, 22.0)));
+                        use super::style::icon;
+                        let glyph = match text {
+                            "Left" => icon::LEFT,
+                            "Right" => icon::RIGHT,
+                            "Up" => icon::UP,
+                            "Down" => icon::DOWN,
+                            "In" => icon::ZOOM_IN,
+                            _ => icon::ZOOM_OUT,
+                        };
+                        let b = ui.add(egui::Button::new(super::style::ic(glyph, 12.0)).min_size(egui::vec2(18.0, 16.0))).on_hover_text(text);
                         rects.push((text, b.rect));
                         if b.is_pointer_button_down_on() {
                             *held = Some(m);
@@ -85,12 +94,12 @@ impl Editor {
                     }
                     hold(ui, "In", Move::Dolly(1.0), &mut held, &mut rects);
                     hold(ui, "Out", Move::Dolly(-1.0), &mut held, &mut rects);
-                    let b = ui.add(egui::Button::new("Frame").min_size(egui::vec2(34.0, 22.0))).on_hover_text("Frame what is selected (F)");
+                    let b = ui.add(egui::Button::new(super::style::ic(super::style::icon::FRAME, 12.0)).min_size(egui::vec2(18.0, 16.0))).on_hover_text("Frame what is selected (F)");
                     rects.push(("Frame", b.rect));
                     if b.clicked() {
                         frame = Some(false);
                     }
-                    let b = ui.add(egui::Button::new("All").min_size(egui::vec2(34.0, 22.0))).on_hover_text("Frame the subject from afar (A)");
+                    let b = ui.add(egui::Button::new(super::style::ic(super::style::icon::FRAME_ALL, 12.0)).min_size(egui::vec2(18.0, 16.0))).on_hover_text("Frame the subject from afar (A)");
                     rects.push(("All", b.rect));
                     if b.clicked() {
                         frame = Some(true);
