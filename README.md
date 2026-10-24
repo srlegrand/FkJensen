@@ -669,6 +669,12 @@ with egui, on the CPU like everything else: egui's triangles are filled by
 - **Viewport** in the middle: the same mouse and keys as the plain window
   (Controls, above), except Esc. Keys go to the viewport unless a text box
   is being typed in.
+- **Navigation buttons** in the viewport's bottom right corner, for
+  working without a mouse (View > Navigation buttons hides them): drag on
+  Tumble, Track or Dolly with a touchpad, pen or finger, as Alt + left,
+  middle or right drag; hold Left, Right, Up, Down, In or Out to tumble
+  (60 degrees a second), track (half the view a second) or dolly; Frame
+  frames what is selected (F), All the subject from afar (A).
 
 The status bar and Render settings > Last frame give where each editor
 frame's time went: laying out the interface, rendering, copying the

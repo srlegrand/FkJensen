@@ -12,6 +12,7 @@
 pub mod files;
 pub mod importer;
 pub mod paint;
+mod navigate;
 mod panels;
 
 use std::num::NonZeroU32;
@@ -128,6 +129,11 @@ pub struct Editor {
     /// The last frame's times, and when this frame began.
     pub times: FrameTimes,
     began: Option<Instant>,
+    /// Buttons over the viewport to move the camera without a mouse.
+    pub navigate: bool,
+    /// Where each navigation control was last drawn (points), by its label;
+    /// the second "Left" is the track row's.
+    nav_rects: Vec<(&'static str, egui::Rect)>,
 }
 
 impl Editor {
@@ -164,6 +170,8 @@ impl Editor {
             frame_size: FrameSize::Hd,
             times: FrameTimes::default(),
             began: None,
+            navigate: true,
+            nav_rects: Vec::new(),
         }
     }
 
@@ -592,6 +600,7 @@ impl Editor {
                     crate::frame_camera(&mut self.app.cam, &self.app.scene, true);
                 }
                 ui.separator();
+                ui.checkbox(&mut self.navigate, "Navigation buttons");
                 ui.checkbox(&mut self.app.rig.show, "Lights (L)");
                 ui.checkbox(&mut self.app.settings.wireframe, "Wireframe (G)");
                 ui.checkbox(&mut self.app.settings.cull_backfaces, "Back-face culling (B)");
@@ -671,6 +680,8 @@ impl Editor {
         let at = rect.min + egui::vec2(8.0, 6.0);
         p.rect_filled(egui::Rect::from_min_size(at - egui::vec2(4.0, 2.0), galley.size() + egui::vec2(8.0, 4.0)), 3.0, egui::Color32::from_black_alpha(140));
         p.galley(at, galley, egui::Color32::WHITE);
+        let ctx = ui.ctx().clone();
+        self.navigation(&ctx, rect);
     }
 }
 
@@ -890,6 +901,48 @@ mod tests {
         ed.app.selection = Selection::Nothing;
         ed.view_button(0, true, 20.0, 300.0);
         ed.view_button(0, false, 20.0, 300.0);
+        assert_eq!(ed.app.selection, Selection::Nothing);
+    }
+
+    /// The navigation buttons move the camera: dragging the tumble pad
+    /// turns it, holding In brings it closer, All frames the subject.
+    #[test]
+    fn navigation_buttons_move_the_camera() {
+        let mut ed = editor();
+        let (w, h) = (1100, 700);
+        for _ in 0..2 {
+            ed.frame(raw(w, h), w, h);
+        }
+        let find = |ed: &Editor, name: &str| ed.nav_rects.iter().find(|(n, _)| *n == name).map(|(_, r)| r.center()).unwrap_or_else(|| panic!("no {name}"));
+        let ev = |events: Vec<egui::Event>| egui::RawInput { events, ..raw(w, h) };
+        let press = |p: egui::Pos2, down: bool| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: down, modifiers: Default::default() };
+        // Drag the tumble pad 40 points to the right.
+        let yaw = ed.app.cam.yaw;
+        let p = find(&ed, "Tumble");
+        ed.frame(ev(vec![egui::Event::PointerMoved(p), press(p, true)]), w, h);
+        for k in 1..=4 {
+            ed.frame(ev(vec![egui::Event::PointerMoved(p + egui::vec2(10.0 * k as f32, 0.0))]), w, h);
+        }
+        ed.frame(ev(vec![press(p + egui::vec2(40.0, 0.0), false)]), w, h);
+        assert!(ed.app.cam.yaw < yaw - 0.1, "{} then {}", yaw, ed.app.cam.yaw);
+        // Hold In.
+        let d = ed.app.cam.distance;
+        let p = find(&ed, "In");
+        ed.frame(ev(vec![egui::Event::PointerMoved(p), press(p, true)]), w, h);
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            ed.frame(ev(vec![]), w, h);
+        }
+        ed.frame(ev(vec![press(p, false)]), w, h);
+        assert!(ed.app.cam.distance < d, "{d} then {}", ed.app.cam.distance);
+        // All: framed from afar again.
+        let p = find(&ed, "All");
+        ed.frame(ev(vec![egui::Event::PointerMoved(p), press(p, true)]), w, h);
+        ed.frame(ev(vec![press(p, false)]), w, h);
+        let mut wide = crate::camera::OrbitCamera::new();
+        crate::frame_camera(&mut wide, &ed.app.scene, true);
+        assert!((ed.app.cam.distance - wide.distance).abs() < 1e-3 && ed.app.cam.yaw.abs() < 1e-6);
+        // The viewport under the buttons is not clicked through.
         assert_eq!(ed.app.selection, Selection::Nothing);
     }
 
