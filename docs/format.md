@@ -1,9 +1,20 @@
-# The .fkj scene format
+# The .fja asset format
 
-FkJensen does not read USD. Scenes are stored in its own format, laid out
-for the way this renderer draws: geometry already cut into small clusters,
+An `.fja` asset is one object with everything baked for it, laid out for
+the way this renderer draws: geometry already cut into small clusters,
 each with the bounds the renderer culls with, so loading is a decode and the
-first frame needs no preparation. `src/fkj.rs` reads and writes it.
+first frame needs no preparation. `src/fkj.rs` reads and writes it. A
+scene (`.fjs`, `docs/scene.md`) points at assets and places them.
+
+The old `.fkj` scenes are the same format holding a whole scene: several
+objects in `OBJS`, the ground, lights in `LITE`. They still open; saving
+turns them into an `.fjs` and `.fja` files.
+
+An `.fja` holds its object in its own space. Its `OBJS` section, when it
+has one, holds that one object over all its clusters, with the pivot,
+rotation and scale it rests at; without one it rests at the origin,
+unturned, at scale 1. A scene's transform for it is absolute, from that
+rest.
 
 The four kinds of primitive the format is meant to hold are triangle meshes,
 points (particles), curves (fur, hair) and volumes. Version 1 implements

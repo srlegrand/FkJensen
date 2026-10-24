@@ -1,10 +1,10 @@
-//! fkj-import: turn a glTF (.glb, .gltf), binary FBX or OBJ model into an .fkj
-//! scene for FkJensen, with its textures baked into per-triangle tiles.
+//! fkj-import: turn a glTF (.glb, .gltf), binary FBX or OBJ model into an
+//! .fja asset for FkJensen, with its textures baked into per-triangle tiles.
 //!
 //! Usage:
-//!   fkj-import model.glb -o model.fkj --length 12.3
-//!   fkj-import car.fbx -o car.fkj --length 4.8 --textures path/to/textures
-//!   fkj-import sculpt.obj -o sculpt.fkj --length 12.3 --texture colour.png
+//!   fkj-import model.glb -o model.fja --length 12.3
+//!   fkj-import car.fbx -o car.fja --length 4.8 --textures path/to/textures
+//!   fkj-import sculpt.obj -o sculpt.fja --length 12.3 --texture colour.png
 //!
 //! The model is set on the ground (lowest point at y = 0), centred on x and
 //! z, Y up, in metres: `--length` scales its longest horizontal side to that
@@ -22,7 +22,7 @@
 //! Surface samples and sky transfer (src/samples.rs, src/transfer.rs in
 //! FkJensen): points spread evenly over the model, each with what it sees
 //! of the sky past the model itself as order-2 spherical harmonics.
-//! `fkj-import --sky in.fkj -o out.fkj` adds them to a file made before.
+//! `fkj-import --sky in.fja -o out.fja` adds them to a file made before.
 //!
 //! Levels of detail (src/lod.rs in FkJensen): the mesh is built into a
 //! cluster hierarchy, each level about half the triangles of the one below,
@@ -121,7 +121,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fkj [--length M | --height M] [--rotate-x DEG] [--rotate-y DEG] [--texel M] [--max-level N] [--textures DIR] [--texture FILE (OBJ)] [--no-lod]\n       fkj-import --sky model.fkj -o out.fkj   (add surface samples and sky transfer to an .fkj made before them)");
+                eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fja [--length M | --height M] [--rotate-x DEG] [--rotate-y DEG] [--texel M] [--max-level N] [--textures DIR] [--texture FILE (OBJ)] [--no-lod]\n       fkj-import --sky model.fja -o out.fja   (add surface samples and sky transfer to an .fja made before them)");
                 return;
             }
             a => input = Some(PathBuf::from(a)),
@@ -129,14 +129,14 @@ fn main() {
         i += 1;
     }
     let Some(input) = input else {
-        eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fkj [--length M | --height M] ...");
+        eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fja [--length M | --height M] ...");
         std::process::exit(2);
     };
     if sky_only {
         add_sky(&input, out.as_deref());
         return;
     }
-    let out = out.unwrap_or_else(|| input.with_extension("fkj"));
+    let out = out.unwrap_or_else(|| input.with_extension("fja"));
     let t0 = std::time::Instant::now();
     let model = bake::load(&input, texture.as_deref(), &tex_dirs);
     let mut model = model.unwrap_or_else(|e| {
@@ -187,12 +187,12 @@ fn main() {
     );
 }
 
-/// Add surface samples and their sky transfer to an .fkj made without
+/// Add surface samples and their sky transfer to an .fja made without
 /// them, keeping everything else; texture tiles are copied from the input
 /// as they are written, never all in memory.
 fn add_sky(input: &std::path::Path, out: Option<&std::path::Path>) {
     let Some(out) = out else {
-        eprintln!("--sky needs -o out.fkj (not the input file: its tiles are read while writing)");
+        eprintln!("--sky needs -o out.fja (not the input file: its tiles are read while writing)");
         std::process::exit(2);
     };
     if std::fs::canonicalize(input).ok() == std::fs::canonicalize(out).ok() {

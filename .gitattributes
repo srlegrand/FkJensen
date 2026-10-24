@@ -1,1 +1,2 @@
+assets/models/*.fja filter=lfs diff=lfs merge=lfs -text
 assets/models/*.fkj filter=lfs diff=lfs merge=lfs -text

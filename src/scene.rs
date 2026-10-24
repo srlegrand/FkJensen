@@ -267,6 +267,21 @@ pub struct Scene {
     /// Points spread evenly over each object's surface (`samples.rs`), in
     /// order of their cluster, moved with it.
     pub samples: Vec<crate::samples::Sample>,
+    /// Where the geometry outside every object came from, for saving.
+    pub world: World,
+}
+
+/// Where a scene's geometry outside every object (the ground, the
+/// mountains) comes from.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum World {
+    /// None, or read from a file it is not kept in (an old .fkj scene).
+    #[default]
+    Unsaved,
+    /// The program's own ground and mountains (`world.rs`).
+    BuiltIn,
+    /// An .fja asset.
+    Asset(std::path::PathBuf),
 }
 
 /// A model in the scene: its clusters (and so its vertices, which they
@@ -296,13 +311,15 @@ pub struct Object {
     pub box_hi: Vec3,
     /// The group it is in, if any (an index into `Scene::objects`).
     pub parent: Option<usize>,
+    /// The .fja asset file it was read from, if any (`fjs.rs`).
+    pub asset: Option<std::path::PathBuf>,
 }
 
 impl Object {
     /// A new object of clusters `clusters` whose geometry is stored where it
     /// stands.
     pub fn new(name: String, clusters: std::ops::Range<usize>, pivot: Vec3, rotation: Vec3, scale: f32, parent: Option<usize>) -> Object {
-        Object { name, clusters, pivot, rotation, scale, lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent }
+        Object { name, clusters, pivot, rotation, scale, lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent, asset: None }
     }
 
     /// The eight corners of its oriented box, in the world.
@@ -595,6 +612,100 @@ impl Scene {
         self.samples.extend(other.samples.iter().map(|s| crate::samples::Sample { cluster: s.cluster + cbase as u32, ..*s }));
     }
 
+    /// Clusters `ranges` (in order) as a scene of their own, moved by
+    /// `back`: their vertices, triangles, levels of detail, texture tiles
+    /// (still read from where they are) and samples. No objects or lights.
+    pub fn extract(&self, ranges: &[std::ops::Range<usize>], back: glam::Affine3A) -> Scene {
+        let (k3, turn, _) = back.to_scale_rotation_translation();
+        let k = k3.x;
+        let turn = turn.normalize();
+        let still = turn.abs_diff_eq(glam::Quat::IDENTITY, 1e-7);
+        let mut out = Scene::default();
+        out.textures.sources = self.textures.sources.clone();
+        let mut index = std::collections::HashMap::new();
+        for r in ranges {
+            for ci in r.clone() {
+                let c = &self.clusters[ci];
+                let (fv, nv) = (c.first_vertex as usize, c.vertex_count as usize);
+                let (ft, nt) = (c.first_tri as usize, c.tri_count as usize);
+                let mut h = *c;
+                h.first_vertex = out.qpos.len() as u32;
+                h.first_tri = out.tris.len() as u32;
+                out.qpos.extend_from_slice(&self.qpos[fv..fv + nv]);
+                out.qnrm.extend_from_slice(&self.qnrm[fv..fv + nv]);
+                out.qcol.extend_from_slice(&self.qcol[fv..fv + nv]);
+                out.tris.extend_from_slice(&self.tris[ft..ft + nt]);
+                h.xf = back * c.xf;
+                if !still || c.turned {
+                    h.turn = (turn * c.turn).normalize();
+                    h.turned = true;
+                }
+                h.centre = back.transform_point3(c.centre);
+                h.radius = c.radius * k * (1.0 + 1e-5) + 1e-6;
+                h.cone_axis = turn * c.cone_axis;
+                h.move_lod(|p| back.transform_point3(p), k);
+                index.insert(ci as u32, out.clusters.len() as u32);
+                out.clusters.push(h);
+                out.textures.entries.push(self.textures.entry(ci));
+            }
+            for s in &self.samples[self.samples_in(r.clone())] {
+                out.samples.push(crate::samples::Sample { position: back.transform_point3(s.position), normal: turn * s.normal, area: s.area * k * k, cluster: index[&s.cluster], sky: turned_sky(&s.sky, turn, k) });
+            }
+        }
+        if out.textures.entries.iter().all(|e| e.level == 0) {
+            out.textures = Default::default();
+        }
+        out.samples.sort_by_key(|s| s.cluster);
+        let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        for c in &out.clusters {
+            for p in out.cluster_pos(c) {
+                lo = lo.min(p);
+                hi = hi.max(p);
+            }
+        }
+        if out.clusters.is_empty() {
+            (lo, hi) = (Vec3::ZERO, Vec3::ZERO);
+        }
+        out.bounds_min = lo;
+        out.bounds_max = hi;
+        out
+    }
+
+    /// Object `i` alone, where it stood before it was first moved (its
+    /// asset's own space), as one object at the pivot, rotation and scale
+    /// it had there: what an .fja holds.
+    pub fn extract_object(&self, i: usize) -> Scene {
+        let o = &self.objects[i];
+        let back = o.xf.inverse();
+        let (k3, turn, _) = o.xf.to_scale_rotation_translation();
+        let mut out = self.extract(&[o.clusters.clone()], back);
+        let n = out.clusters.len();
+        let rest_rotation = quat_euler(turn.normalize().inverse() * euler_quat(o.rotation));
+        let mut ob = Object::new(o.name.clone(), 0..n, back.transform_point3(o.pivot), rest_rotation, o.scale / k3.x.max(1e-12), None);
+        ob.asset = None;
+        out.objects.push(ob);
+        out.refresh_bounds(0);
+        out
+    }
+
+    /// The runs of clusters outside every object, in order.
+    pub fn loose_clusters(&self) -> Vec<std::ops::Range<usize>> {
+        let mut owned: Vec<std::ops::Range<usize>> = self.objects.iter().map(|o| o.clusters.clone()).filter(|r| !r.is_empty()).collect();
+        owned.sort_by_key(|r| r.start);
+        let mut out = Vec::new();
+        let mut at = 0;
+        for r in owned {
+            if r.start > at {
+                out.push(at..r.start);
+            }
+            at = at.max(r.end);
+        }
+        if at < self.clusters.len() {
+            out.push(at..self.clusters.len());
+        }
+        out
+    }
+
     /// The samples lying on clusters `clusters`.
     pub fn samples_in(&self, clusters: std::ops::Range<usize>) -> std::ops::Range<usize> {
         let a = self.samples.partition_point(|s| (s.cluster as usize) < clusters.start);
@@ -735,6 +846,19 @@ impl Scene {
         self.objects[i].box_lo = lo;
         self.objects[i].box_hi = hi;
         self.world_bounds(i);
+    }
+
+    /// Bounds in the world of object `i`'s finest level's vertices: tighter
+    /// than `object_bounds` when it is turned, for framing it.
+    pub fn vertex_bounds(&self, i: usize) -> (Vec3, Vec3) {
+        use rayon::prelude::*;
+        let range = self.objects[i].clusters.clone();
+        let finest = self.clusters[range.clone()].iter().map(|c| c.lod_level).min().unwrap_or(0);
+        self.clusters[range]
+            .par_iter()
+            .filter(|c| c.lod_level == finest)
+            .map(|c| self.cluster_pos(c).fold((Vec3::INFINITY, Vec3::NEG_INFINITY), |(lo, hi), p| (lo.min(p), hi.max(p))))
+            .reduce(|| (Vec3::INFINITY, Vec3::NEG_INFINITY), |a, b| (a.0.min(b.0), a.1.max(b.1)))
     }
 
     /// An object's bounds in the world, round its oriented box.

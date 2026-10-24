@@ -28,7 +28,7 @@ At the start of a session, run these and report each to the person as passed or 
        git push origin main && \
        cargo run --release
 
-   The commands are joined with `&&`: a patch that does not apply is never followed by a commit. The block holds no other commands; deletions travel in the patch. The exceptions: when the assistant sends `.fkj` models too large for a patch, the block moves them from `~/Downloads` into `assets/models/` before the commit; when a change to `tools/fkj-import` or the format means the models must be imported again, the block builds the importer and runs it on the source files (commands in `README.md`) before the commit. `cargo run` comes last so the program can stay open.
+   The commands are joined with `&&`: a patch that does not apply is never followed by a commit. The block holds no other commands; deletions travel in the patch. The exceptions: when the assistant sends `.fja` models too large for a patch, the block moves them from `~/Downloads` into `assets/models/` before the commit; when a change to `tools/fkj-import` or the format means the models must be imported again, the block builds the importer and runs it on the source files (commands in `README.md`) before the commit. `cargo run` comes last so the program can stay open.
 
    Then the Pi block, also on the desktop, after the local block has pushed. It cross-compiles for the Pi 1 (ARMv6, 32-bit), copies the binary over and runs it there headless, so the output comes back to the desktop terminal:
 
@@ -36,7 +36,7 @@ At the start of a session, run these and report each to the person as passed or 
        cross build --release --target arm-unknown-linux-gnueabihf && \
        scp target/arm-unknown-linux-gnueabihf/release/fkjensen simon@RPi-1:~/ && \
        ssh simon@RPi-1 'mkdir -p ~/assets/models' && \
-       scp assets/models/trex.fkj assets/models/car.fkj simon@RPi-1:~/assets/models/ && \
+       scp assets/models/trex.fja assets/models/car.fja simon@RPi-1:~/assets/models/ && \
        ssh simon@RPi-1 './fkjensen --hardware && ./fkjensen --png pi.png' && \
        scp simon@RPi-1:~/pi.png ~/Downloads/fkjensen-pi.png
 

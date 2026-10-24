@@ -6,9 +6,14 @@ A 3D viewport that renders on the CPU and nothing else, following the path
 maps, point-based bounce light, no ray tracing. No GPU API is linked; the frame is made on the cores
 with rayon and copied to the window through shared memory (softbuffer).
 
-It does not read USD. Scenes are in FkJensen's own `.fkj` format
-(`docs/format.md`), with geometry already cut into the clusters the renderer
-draws.
+It does not read USD. A scene is an `.fjs` file, a small JSON file
+(`docs/scene.md`) that points at `.fja` assets and says where each stands,
+the lights, the sun, the sky, the camera and the render settings. An
+`.fja` is one object with everything baked for it (`docs/format.md`):
+geometry already cut into the clusters the renderer draws, levels of
+detail, texture tiles, surface samples and their sky transfer. Old `.fkj`
+scenes, which held everything in one file, still open, and save as an
+`.fjs` and `.fja` files.
 
 The built-in set, all real geometry, in metres:
 
@@ -304,12 +309,12 @@ about 368 x 207 with micropolygons 2 pixels apart. Not yet run on the Pi.
 ## Models and texture tiles
 
 Models come in through `tools/fkj-import`, which reads glTF (.glb, .gltf),
-binary FBX and OBJ, and writes `.fkj`:
+binary FBX and OBJ, and writes an `.fja` asset:
 
     cd tools/fkj-import && cargo build --release && cd ../..
-    tools/fkj-import/target/release/fkj-import trex.glb -o assets/models/trex.fkj --length 12.3
-    tools/fkj-import/target/release/fkj-import car.fbx -o assets/models/car.fkj --length 4.79 --textures path/to/textures
-    tools/fkj-import/target/release/fkj-import trex_highres.obj -o assets/models/trex_highres.fkj --length 12.3 --texture trex_basecolor.png
+    tools/fkj-import/target/release/fkj-import trex.glb -o assets/models/trex.fja --length 12.3
+    tools/fkj-import/target/release/fkj-import car.fbx -o assets/models/car.fja --length 4.79 --textures path/to/textures
+    tools/fkj-import/target/release/fkj-import trex_highres.obj -o assets/models/trex_highres.fja --length 12.3 --texture trex_basecolor.png
 
 Each model is built into levels of detail as it is imported (`src/lod.rs`,
 the cluster hierarchy of Nanite: Karis, Stubbs, Wihlidal, SIGGRAPH 2021).
@@ -348,9 +353,10 @@ its tiles at that level are read with one positioned read and kept in a
 cache capped by the machine's plan (an eighth of available memory). Only
 visible triangles' textures, at the size they are seen at, reach memory.
 
-The built-in set places the T-rex (`trex_highres.fkj`, or `trex.fkj` when
-the plan says so or the high-resolution file is missing) and `car.fkj` on
-the ground plane. They are in the repository, in `assets/models/`, stored
+The built-in set places the T-rex (`trex_highres.fja`, or `trex.fja` when
+the plan says so or the high-resolution file is missing) and `car.fja` on
+the ground plane, each an object reading its asset, turned and moved by
+its transform. They are in the repository, in `assets/models/`, stored
 with Git LFS (credits in `assets/README.md`); clone with Git LFS
 installed.
 Models are looked for in `$FKJENSEN_ASSETS`, then `assets/models/` and
@@ -470,7 +476,8 @@ running.
 ## Run
 
     cargo run --release                     the built-in set
-    cargo run --release -- scene.fkj        another .fkj scene
+    cargo run --release -- scene.fjs        a scene (an .fja opens as a scene of that object; an old .fkj opens too)
+    cargo run --release -- --save my.fjs    write what is open as a scene, and .fja assets beside it for what has none
     cargo run --release -- --editor         the editor (below), 64-bit machines
 
 Headless, for tests and screenshots (no window, no display needed):
@@ -575,7 +582,7 @@ of each pass in milliseconds.
     B                      back-face culling (on at start)
     G                      wireframe             P    save frame.png
     Esc                    quit
-    drop an .fkj file on the window to open it
+    drop an .fjs, .fja or .fkj file on the window to open it
 
 Lights are drawn as discs in their colour; the selected one is larger, has
 a yellow ring, and a dashed line drops from it to the ground with a dot
@@ -674,10 +681,16 @@ Shortcuts: Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as, Ctrl+I import,
 Ctrl+G put the selected object in a new group. A scene file dropped on the
 window opens; a model dropped on it opens the importer.
 
-Saving writes the whole scene as it is (geometry where the objects now
-stand, texture tiles, the lights, the objects and their groups in an `OBJS`
-section) to the chosen `.fkj`, through a file beside it that replaces it
-once written, since the tiles may be read from the file being replaced.
+Saving writes the scene as an `.fjs` (`docs/scene.md`): each object's
+asset and transform, the groups, the lights, the directional lights, the
+sun, the sky and exposure, the time of day, the camera and the render
+settings. An object that has no `.fja` on disk yet (a model just
+imported, or one from an old `.fkj`) is written as one beside the scene,
+named after it, in its own space; the geometry outside every object of
+an old `.fkj` (its ground) becomes `<scene>_world.fja`. Assets already on
+disk are not written again: moving an object only changes the `.fjs`.
+Open takes `.fjs` and old `.fkj` scenes; an `.fja` dropped on the window
+or chosen in File > Import is added as an object.
 
 ### Importer
 
@@ -771,7 +784,8 @@ Painting the interface took about 7 ms a frame at 1920 x 1080 on the same
    frame are resolved again; the rest of the picture is kept.
 
 `src/scene.rs` holds the scene and builds clusters. `src/fkj.rs` reads
-and writes `.fkj`. `src/world.rs` makes the ground plane, valley and mountains,
+and writes the binary format of `.fja` assets (and old `.fkj` scenes);
+`src/fjs.rs` reads and writes `.fjs` scenes and places their assets. `src/world.rs` makes the ground plane, valley and mountains,
 and the set's lights. `src/lights.rs` is the light rig and the picking and dragging
 maths. `src/shadow.rs` and `src/bounce.rs` are the shadow maps and the
 bounce light. `src/texture.rs` is the texture tiles and their cache;
@@ -1033,7 +1047,11 @@ Not measured yet: a Raspberry Pi.
 - Texture tiles: base colour only (no normal or roughness maps); bounce
   light on a textured surface is coloured by its vertex colours; the importer does not read USD or ASCII FBX, and
   reads FBX transforms without pivots or offsets.
-- Points, curves and volumes in `.fkj` (tags reserved).
+- Points, curves and volumes in `.fja` (tags reserved).
+- Scenes: an asset used twice is read twice; the micropolygon spacing
+  and frame size follow the machine and are not saved; a scene saved
+  with the high-resolution T-rex asks for it on any machine (the Pi
+  included) rather than the plan picking the low-resolution one.
 - The editor: no undo; one object selected at a time; objects cannot be
   deleted or duplicated; a model is added at the origin; the interface is
   painted again every frame, even when nothing in it changed; a bake

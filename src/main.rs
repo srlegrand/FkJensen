@@ -4,7 +4,8 @@
 //! Usage:
 //!   fkjensen                           open the built-in set: the T-rex and
 //!                                      the car on a ground plane, mountains
-//!   fkjensen scene.fkj                 open an .fkj scene
+//!   fkjensen scene.fjs                 open a scene (.fjs; an .fja asset or an old .fkj also open)
+//!   fkjensen --save my.fjs             write what is open as a scene, with .fja assets beside it
 //!   fkjensen --png out.png             render one frame to a file, no window
 //!   fkjensen --size 1920x1080 --png out.png
 //!   fkjensen --light x,y,z[,lumens]    replace the scene's lights (repeatable)
@@ -36,7 +37,7 @@
 //!   fkjensen --shadow-res N            shadow map texels per cube face edge (512)
 //!   fkjensen --png out.png --bench-drag  then move the first light five times, timing each frame
 //!   fkjensen --png out.png --bench-orbit then turn the camera five times, timing each frame
-//!   fkjensen --editor [scene.fkj]      the editor: outliner, attribute editor, timeline, importer (64-bit)
+//!   fkjensen --editor [scene.fjs]      the editor: outliner, attribute editor, timeline, importer (64-bit)
 //!   fkjensen --editor --png out.png [--import model.glb]  the editor drawn to a file
 //!
 //! Controls are listed in README.md and printed at start.
@@ -47,6 +48,7 @@ mod camera;
 mod debug;
 #[cfg(target_os = "linux")]
 mod fbdev;
+mod fjs;
 mod fkj;
 mod hardware;
 mod lights;
@@ -155,7 +157,7 @@ Controls
   B                      back-face culling
   G                      wireframe             P    save frame.png
   Esc                    quit
-  drop an .fkj file on the window to open it";
+  drop an .fjs, .fja or .fkj file on the window to open it";
 
 /// The visual debug view shown, when `--visual-debug` is on. Built on
 /// 64-bit targets only.
@@ -230,6 +232,9 @@ struct App {
     /// The object being dragged and its pivot, rotation and scale when
     /// the drag began.
     drag_start: Option<(usize, Vec3, Vec3, f32)>,
+    /// What the machine's plan allows of shadows, bounce light and shadow
+    /// map texels, over what a scene file asks.
+    caps: (bool, bool, usize),
     /// Shading points a window frame may take, from the machine's plan:
     /// the micropolygon spacing and render scale follow it as the window
     /// is resized. None once either is set by hand.
@@ -286,6 +291,7 @@ impl App {
             output: (0, 0),
             frame_size: None,
             drag_start: None,
+            caps: (true, true, usize::MAX),
             point_budget: None,
             renderer: reyes::Renderer::new(),
             wide: true,
@@ -305,22 +311,145 @@ impl App {
         }
     }
 
+    /// Open a scene: an .fjs, an .fja on its own, or an old .fkj.
     fn open(&mut self, path: PathBuf) -> Result<(), String> {
-        match load_file(&path) {
-            Ok(mut scene) => {
-                prepare_opened(&mut scene, &path);
-                self.scene = scene;
-                self.scene_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.wide = true;
-                frame_camera(&mut self.cam, &self.scene, self.wide);
-                self.rig = LightRig::new(default_rig(&self.scene));
-                self.drag = None;
-                self.manip = None;
-                self.selection = Selection::Nothing;
-                Ok(())
-            }
-            Err(e) => Err(e),
+        let (scene, file) = load_scene(&path)?;
+        self.scene = scene;
+        self.scene_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.wide = true;
+        frame_camera(&mut self.cam, &self.scene, self.wide);
+        self.rig = LightRig::new(default_rig(&self.scene));
+        self.drag = None;
+        self.manip = None;
+        self.drag_start = None;
+        self.selection = Selection::Nothing;
+        if let Some(f) = file {
+            self.apply_file(&f);
         }
+        Ok(())
+    }
+
+    /// What an .fjs says about lights, the sun, the sky, the camera and
+    /// render settings. Shadows, their maps' size and bounce light stay
+    /// within what the machine's plan allows (`caps`).
+    fn apply_file(&mut self, f: &fjs::SceneFile) {
+        use fjs::v3;
+        if let Some(t) = f.time {
+            self.hours = t.rem_euclid(24.0);
+            self.apply_daylight();
+        }
+        let s = &mut self.settings;
+        for (k, d) in s.dir_lights.iter_mut().enumerate() {
+            *d = match f.directional.get(k) {
+                Some(e) => raster::DirLight { on: e.on, dir: raster::DirLight::towards(e.azimuth, e.elevation), color: v3(e.color), lux: e.lux.clamp(0.0, raster::DIR_MAX_LUX) },
+                None => raster::DirLight::default(),
+            };
+        }
+        if let Some(e) = f.sun {
+            s.sun.dir = v3(e.direction).normalize_or(s.sun.dir);
+            s.sun.color = v3(e.color);
+            s.sun.brightness = e.brightness.clamp(0.0, raster::SUN_MAX);
+        }
+        if let Some(e) = f.sky {
+            s.sky.on = e.on;
+            s.sky.lux = e.lux.max(0.0);
+            s.sky.tint = v3(e.tint);
+            s.sky.contrast = e.contrast.clamp(0.0, 1.0);
+        }
+        if let Some(e) = f.backdrop {
+            s.backdrop.zenith = v3(e.zenith);
+            s.backdrop.horizon = v3(e.horizon);
+            s.backdrop.contrast = e.contrast.clamp(0.0, 1.0);
+        }
+        if let Some(e) = f.exposure {
+            s.exposure = e.max(1e-12);
+        }
+        if let Some(r) = f.render {
+            let (shadows, bounce, res) = self.caps;
+            let set = |v: &mut bool, x: Option<bool>| {
+                if let Some(x) = x {
+                    *v = x;
+                }
+            };
+            if let Some(x) = r.shadows {
+                s.shadows = x && shadows;
+            }
+            if let Some(x) = r.shadow_res {
+                s.shadow_res = x.clamp(16, 4096).min(res);
+            }
+            if let Some(x) = r.bounce {
+                s.bounce = x && bounce;
+            }
+            set(&mut s.light_reach, r.light_reach);
+            set(&mut s.occlusion, r.occlusion_culling);
+            set(&mut s.adaptive, r.adaptive);
+            set(&mut s.sky_occlusion, r.sky_occlusion);
+            set(&mut s.incremental_moves, r.incremental_moves);
+            set(&mut s.cull_backfaces, r.backface_culling);
+            set(&mut s.wireframe, r.wireframe);
+            set(&mut s.drag_preview, r.drag_preview);
+            set(&mut s.bake_over_frames, r.bake_over_frames);
+            if let Some(x) = r.moving_rate {
+                s.moving_rate = x.clamp(1.0, 16.0);
+            }
+            if let Some(x) = r.moving_detail {
+                s.moving_detail = x.clamp(1.0, 16.0);
+            }
+        }
+        if let Some(c) = f.camera {
+            self.cam.target = v3(c.target);
+            self.cam.distance = c.distance.max(1e-4);
+            self.cam.yaw = c.yaw.to_radians();
+            self.cam.pitch = c.pitch.to_radians();
+            self.cam.fov_y = c.fov.clamp(1.0, 170.0).to_radians();
+        }
+    }
+
+    /// Save the scene as an .fjs at `path`, writing an .fja beside it for
+    /// each object (and the loose geometry) not already in one. Returns
+    /// what was written.
+    fn save(&mut self, path: &Path) -> Result<Vec<PathBuf>, String> {
+        use fjs::{a3, round6};
+        let mut written = fjs::save_assets(&mut self.scene, path)?;
+        self.scene.lights = self.rig.lights.clone();
+        let mut f = fjs::entries(&self.scene, path, &self.rig.lights);
+        let s = &self.settings;
+        f.directional = s
+            .dir_lights
+            .iter()
+            .filter(|d| d.on || **d != raster::DirLight::default())
+            .map(|d| {
+                let (az, el) = raster::DirLight::angles(d.dir);
+                fjs::DirEntry { on: d.on, azimuth: round6(az), elevation: round6(el), color: a3(d.color), lux: round6(d.lux) }
+            })
+            .collect();
+        f.time = Some(round6(self.hours));
+        f.sun = Some(fjs::SunEntry { direction: a3(s.sun.dir), color: a3(s.sun.color), brightness: round6(s.sun.brightness) });
+        f.sky = Some(fjs::SkyEntry { on: s.sky.on, lux: round6(s.sky.lux), tint: a3(s.sky.tint), contrast: round6(s.sky.contrast) });
+        f.backdrop = Some(fjs::BackdropEntry { zenith: a3(s.backdrop.zenith), horizon: a3(s.backdrop.horizon), contrast: round6(s.backdrop.contrast) });
+        f.exposure = Some(s.exposure);
+        let c = &self.cam;
+        f.camera = Some(fjs::CameraEntry { target: a3(c.target), distance: round6(c.distance), yaw: round6(c.yaw.to_degrees()), pitch: round6(c.pitch.to_degrees()), fov: round6(c.fov_y.to_degrees()) });
+        f.render = Some(fjs::RenderEntry {
+            shadows: Some(s.shadows),
+            shadow_res: Some(s.shadow_res),
+            bounce: Some(s.bounce),
+            light_reach: Some(s.light_reach),
+            occlusion_culling: Some(s.occlusion),
+            adaptive: Some(s.adaptive),
+            sky_occlusion: Some(s.sky_occlusion),
+            incremental_moves: Some(s.incremental_moves),
+            backface_culling: Some(s.cull_backfaces),
+            wireframe: Some(s.wireframe),
+            drag_preview: Some(s.drag_preview),
+            bake_over_frames: Some(s.bake_over_frames),
+            moving_rate: Some(round6(s.moving_rate)),
+            moving_detail: Some(round6(s.moving_detail)),
+        });
+        fjs::write(path, &f)?;
+        written.push(path.to_path_buf());
+        self.scene_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        Ok(written)
     }
 
     /// Set the sun, the sky and the exposure from `hours`, keeping the
@@ -1057,6 +1186,7 @@ fn built_in() -> Result<Scene, String> {
 /// (high-resolution when `highres`) and the car, and their lights.
 fn built_in_with(highres: bool) -> Result<Scene, String> {
     let mut scene = world::build();
+    scene.world = scene::World::BuiltIn;
     if let Some((lo, hi)) = add_models(&mut scene, highres) {
         scene.focus = Some((lo, hi));
     }
@@ -1131,7 +1261,36 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Read an .fkj file. Its texture tiles stay in the file and are streamed.
+/// Read a scene: an .fjs and the assets it points at, an .fja as a scene
+/// of that one object, or an old .fkj. With an .fjs, the file too, for
+/// what it says beyond the geometry.
+fn load_scene(path: &Path) -> Result<(Scene, Option<fjs::SceneFile>), String> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "fjs" => {
+            let t = Instant::now();
+            let f = fjs::read(path)?;
+            let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            let mut scene = fjs::build(&f, &dir, &assets_dirs()).map_err(|e| format!("{}: {e}", path.display()))?;
+            scene.scatter_missing_samples();
+            eprintln!("{}: {} objects, {} triangles, read in {:.2} s", path.display(), scene.objects.len(), scene.triangle_count(), t.elapsed().as_secs_f64());
+            Ok((scene, Some(f)))
+        }
+        "fja" => {
+            let mut scene = fjs::load_asset(path)?;
+            scene.focus = Some(scene.object_bounds(0));
+            Ok((scene, None))
+        }
+        _ => {
+            let mut scene = load_file(path)?;
+            prepare_opened(&mut scene, path);
+            Ok((scene, None))
+        }
+    }
+}
+
+/// Read an old .fkj scene, or an .fja's geometry. Its texture tiles stay in
+/// the file and are streamed.
 fn load_file(path: &Path) -> Result<Scene, String> {
     let t = Instant::now();
     let name = path.display().to_string();
@@ -1157,8 +1316,8 @@ fn load_file(path: &Path) -> Result<Scene, String> {
 /// turn about the vertical (degrees). Made with tools/fkj-import, in
 /// assets/models.
 const SET_MODELS: [(&str, Option<&str>, Vec3, f32); 2] = [
-    ("trex.fkj", Some("trex_highres.fkj"), world::TREX_AT, world::TREX_YAW),
-    ("car.fkj", None, world::CAR_AT, world::CAR_YAW),
+    ("trex.fja", Some("trex_highres.fja"), world::TREX_AT, world::TREX_YAW),
+    ("car.fja", None, world::CAR_AT, world::CAR_YAW),
 ];
 
 /// Where models are looked for: $FKJENSEN_ASSETS; then assets/models (in
@@ -1181,10 +1340,12 @@ fn assets_dirs() -> Vec<PathBuf> {
     d
 }
 
-/// Add the set's models that are present, and return their bounds.
+/// Add the set's models that are present, each an object reading its
+/// .fja (or an .fkj of the same name, from before assets were .fja), and
+/// return their bounds.
 fn add_models(scene: &mut Scene, highres: bool) -> Option<(Vec3, Vec3)> {
     let dirs = assets_dirs();
-    let find = |f: &str| dirs.iter().map(|d| d.join(f)).find(|p| p.exists());
+    let find = |f: &str| dirs.iter().flat_map(|d| [d.join(f), d.join(f).with_extension("fkj")]).find(|p| p.exists());
     let mut bounds: Option<(Vec3, Vec3)> = None;
     for (file, high, at, yaw) in SET_MODELS {
         let path = high.filter(|_| highres).and_then(find).or_else(|| find(file));
@@ -1192,19 +1353,16 @@ fn add_models(scene: &mut Scene, highres: bool) -> Option<(Vec3, Vec3)> {
             eprintln!("{file} not found in {}", dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", "));
             continue;
         };
-        match load_file(&path) {
-            Ok(mut m) => {
-                m.place(yaw.to_radians(), 1.0, at);
-                let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                let n = m.clusters.len();
-                m.add_object(name, 0..n, at, Vec3::new(0.0, yaw.to_radians(), 0.0));
-                let (lo, hi) = (m.bounds_min, m.bounds_max);
+        match fjs::load_asset(&path) {
+            Ok(m) => {
+                let i = scene.objects.len();
+                scene.append(m);
+                scene.set_object(i, at, Vec3::new(0.0, yaw.to_radians(), 0.0), 1.0);
+                let (lo, hi) = scene.vertex_bounds(i);
                 bounds = Some(match bounds {
                     Some((a, b)) => (a.min(lo), b.max(hi)),
                     None => (lo, hi),
                 });
-                eprintln!("{}: {} triangles", path.display(), m.triangle_count());
-                scene.append(m);
             }
             Err(e) => eprintln!("{e}"),
         }
@@ -1258,6 +1416,7 @@ fn main() {
     let mut sky_occlusion = true;
     let mut incremental_moves = true;
     let mut drag_preview = true;
+    let mut save_to: Option<PathBuf> = None;
     let mut bake_over_frames = true;
     let mut bench_move = false;
     let mut bench_dir = false;
@@ -1353,6 +1512,14 @@ fn main() {
             "--no-sky-occlusion" => sky_occlusion = false,
             "--relight-on-move" => incremental_moves = false,
             "--light-each-drag-step" => drag_preview = false,
+            "--save" => {
+                save_to = args.get(i + 1).map(PathBuf::from).filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("fjs")));
+                if save_to.is_none() {
+                    eprintln!("--save takes a scene file to write, e.g. --save my.fjs");
+                    std::process::exit(2);
+                }
+                i += 1;
+            }
             "--bake-at-once" => bake_over_frames = false,
             "--bench-move" => bench_move = true,
             "--bench-dir" => bench_dir = true,
@@ -1434,7 +1601,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--light-each-drag-step] [--bake-at-once] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--moving-rate K] [--moving-detail K] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fjs] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--light-each-drag-step] [--bake-at-once] [--save scene.fjs] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--moving-rate K] [--moving-detail K] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1460,10 +1627,11 @@ fn main() {
     };
     let highres = highres.or(plan.as_ref().map(|p| p.highres)).unwrap_or(true);
 
+    let mut scene_file = None;
     let (mut scene, name) = match &path {
-        Some(p) => match load_file(p) {
-            Ok(mut s) => {
-                prepare_opened(&mut s, p);
+        Some(p) => match load_scene(p) {
+            Ok((s, f)) => {
+                scene_file = f;
                 (s, p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
             }
             Err(e) => {
@@ -1486,6 +1654,15 @@ fn main() {
     let mut app = App::new(scene, name);
     app.apply_daylight();
     app.settings.sun.brightness = 600.0;
+    if let Some(p) = &plan {
+        app.caps = (p.shadows, p.bounce, p.shadow_res);
+        app.settings.shadows = p.shadows;
+        app.settings.shadow_res = p.shadow_res;
+        app.settings.bounce = p.bounce;
+    }
+    if let Some(f) = &scene_file {
+        app.apply_file(f);
+    }
     if let Some(h) = hours {
         app.hours = h;
         app.apply_daylight();
@@ -1526,9 +1703,6 @@ fn main() {
     app.settings.drag_preview = drag_preview;
     app.settings.bake_over_frames = bake_over_frames;
     if let Some(p) = &plan {
-        app.settings.shadows = p.shadows;
-        app.settings.shadow_res = p.shadow_res;
-        app.settings.bounce = p.bounce;
         app.settings.bounce_budget_ms = Some(p.bounce_budget_ms);
         app.settings.tile = p.tile;
         app.render_scale = p.render_scale;
@@ -1593,6 +1767,20 @@ fn main() {
         {
             let _ = &debug_view;
             eprintln!("--visual-debug is not in this build (64-bit machines only)");
+        }
+    }
+
+    if let Some(p) = &save_to {
+        match app.save(p) {
+            Ok(files) => {
+                for f in files {
+                    eprintln!("wrote {}", f.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("cannot save {}: {e}", p.display());
+                std::process::exit(1);
+            }
         }
     }
 

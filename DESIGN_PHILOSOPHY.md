@@ -23,7 +23,7 @@ Read `LLM_instructions.md` too: the checks to run first and how changes are deli
 
 ## Scenes are in our own format
 
-- FkJensen does not read USD or any interchange format at run time. A scene is an `.fkj` file (`docs/format.md`), laid out for this renderer: clusters with their bounds and normal cones, quantised attributes, tagged sections a reader can skip. Loading is a decode, not a conversion.
+- FkJensen does not read USD or any interchange format at run time. A scene is an `.fjs` file (`docs/scene.md`), small JSON that points at `.fja` assets and holds what belongs to the scene: transforms, groups, lights, sun, sky, camera, render settings. An asset is an `.fja` (`docs/format.md`), one object with everything baked for it, laid out for this renderer: clusters with their bounds and normal cones, quantised attributes, levels of detail, texture tiles, surface samples, tagged sections a reader can skip. Loading is a decode, not a conversion; an asset is written once and moving it only changes the scene.
 - Photoreal CG needs four kinds of primitive: polygon meshes, points (particles), curves (fur, hair) and volumes. The format reserves a section for each; meshes come first.
 
 ## Textures are tiles per triangle, streamed
@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 24/10/2026: scenes and assets are separate files: an `.fjs` scene (JSON) points at `.fja` assets and holds transforms, groups, lights, sun, sky, camera and render settings; an `.fja` is one object with its baked data, in its own space, in the binary format the `.fkj` scenes used. The built-in models are `.fja` and placed by their transforms. Saving writes an `.fja` only for objects that have none; old `.fkj` scenes open and save as `.fjs`.
 - 24/10/2026: letting go of a dragged object bakes it over several frames instead of one, the drag's last picture shown meanwhile: shadow maps, sky shares, the surfel cloud and its light a frame each, then shading, bounce gathering and resolving about 50 ms a frame. With the high-resolution T-rex at 1920 x 1080 on 2 cores the one 1.1 s frame becomes about 22 frames, the longest 250 ms (making the surfel cloud), the rest 20 to 150 ms; about 1.5 s in all.
 - 24/10/2026: a dragged object is a 2.5D layer: the scene without it and the object alone are drawn once when the drag begins, the object's pixels kept as points with their depth, and each step moves those points with the object and draws them over the scene without it, by depth, filling one-pixel gaps; turned or grown too far, the object alone is drawn again. A drag step with the high-resolution T-rex went from 110 to 125 ms to about 7 ms at 1280 x 720 and 18 to 24 ms at 1920 x 1080 on 2 cores; the first step, which draws both, takes 500 to 720 ms.
 - 24/10/2026: the editor times each frame (interface layout, render, copy, paint, present) in its status bar. With the high-resolution set at a 1920 x 1080 frame in a 2560 x 1440 window on 2 cores, the interface takes about 14 ms, copying and painting 8 to 10 ms, and a drag step's render 240 to 280 ms, of which the resolve is 120 to 150 ms: the renderer, not the interface, is what is slow.

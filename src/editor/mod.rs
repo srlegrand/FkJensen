@@ -334,12 +334,14 @@ impl Editor {
     /// importer.
     pub fn dropped(&mut self, path: PathBuf) {
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if ext == "fkj" {
+        if ext == "fjs" || ext == "fkj" {
             self.open(path);
+        } else if ext == "fja" {
+            self.add_asset(path);
         } else if crate::bake::FORMATS.contains(&ext.as_str()) {
             self.import(Some(path));
         } else {
-            self.say(format!("{}: not a scene (.fkj) or a model (.{})", path.display(), crate::bake::FORMATS.join(" .")), true);
+            self.say(format!("{}: not a scene (.fjs, .fkj), an asset (.fja) or a model (.{})", path.display(), crate::bake::FORMATS.join(" .")), true);
         }
     }
 
@@ -374,28 +376,37 @@ impl Editor {
         }
     }
 
-    /// Write the scene, its objects and the lights as they are now.
+    /// Write the scene as an .fjs, and an .fja beside it for each object
+    /// not already in one.
     pub fn save(&mut self, path: PathBuf) {
-        self.app.scene.lights = self.app.rig.lights.clone();
-        // Written beside it first: the scene's texture tiles may be read
-        // from the file being replaced.
-        let tmp = path.with_extension("fkj.part");
-        let written = std::fs::File::create(&tmp).and_then(|f| {
-            let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
-            crate::fkj::write_to(&mut w, &self.app.scene, &[])?;
-            std::io::Write::flush(&mut w)
-        });
-        match written.and_then(|_| std::fs::rename(&tmp, &path)) {
-            Ok(()) => {
-                let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                self.say(format!("saved {} ({})", path.display(), files::size_text(bytes)), false);
-                self.app.scene_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let path = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("fjs")) { path } else { path.with_extension("fjs") };
+        match self.app.save(&path) {
+            Ok(files) => {
+                let assets = files.len().saturating_sub(1);
+                let bytes: u64 = files.iter().map(|f| std::fs::metadata(f).map(|m| m.len()).unwrap_or(0)).sum();
+                let extra = if assets > 0 { format!(" and {assets} asset{}", if assets == 1 { "" } else { "s" }) } else { String::new() };
+                self.say(format!("saved {}{extra} ({})", path.display(), files::size_text(bytes)), false);
                 self.path = Some(path);
             }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                self.say(format!("cannot save {}: {e}", path.display()), true);
+            Err(e) => self.say(format!("cannot save {}: {e}", path.display()), true),
+        }
+    }
+
+    /// Add an .fja asset to the scene as an object, at the middle of what
+    /// the camera looks at when it was made elsewhere.
+    pub fn add_asset(&mut self, path: PathBuf) {
+        match crate::fjs::load_asset(&path) {
+            Ok(m) => {
+                let first = self.app.scene.objects.len();
+                let name = m.objects[0].name.clone();
+                let tris = m.triangle_count();
+                self.app.scene.append(m);
+                self.app.manip = None;
+                self.app.drag = None;
+                self.select(Selection::Object(first));
+                self.say(format!("added {name} from {} ({} triangles in all its levels)", path.display(), importer::thousands(tris)), false);
             }
+            Err(e) => self.say(e, true),
         }
     }
 
@@ -404,16 +415,20 @@ impl Editor {
     }
 
     pub fn ask_open(&mut self) {
-        self.browser = Some((Browser::new("Open a scene", Mode::Open, &["fkj"], self.start_dir().as_deref(), ""), Purpose::Open));
+        self.browser = Some((Browser::new("Open a scene", Mode::Open, &["fjs", "fkj"], self.start_dir().as_deref(), ""), Purpose::Open));
     }
 
     pub fn ask_save(&mut self) {
-        let name = self.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "scene.fkj".into());
-        self.browser = Some((Browser::new("Save the scene", Mode::Save, &["fkj"], self.start_dir().as_deref(), &name), Purpose::Save));
+        let name = self.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).map(|n| Path::new(&n).with_extension("fjs").display().to_string()).unwrap_or_else(|| "scene.fjs".into());
+        self.browser = Some((Browser::new("Save the scene", Mode::Save, &["fjs"], self.start_dir().as_deref(), &name), Purpose::Save));
     }
 
     /// Open the importer, on `model` if given.
     pub fn import(&mut self, model: Option<PathBuf>) {
+        if let Some(m) = model.as_ref().filter(|m| m.extension().is_some_and(|e| e.eq_ignore_ascii_case("fja"))) {
+            self.add_asset(m.clone());
+            return;
+        }
         let im = self.importer.get_or_insert_with(|| importer::Importer::new(None));
         if let Some(m) = model {
             im.path = m.display().to_string();
@@ -907,7 +922,9 @@ mod tests {
     }
 
     /// Moving an object from the attribute editor moves its group's
-    /// children; saving and opening keep the objects and groups.
+    /// children; saving writes an .fjs and an .fja for the ball, and
+    /// opening it keeps the objects, the groups, the lights, the time of
+    /// day, the camera and the render settings.
     #[test]
     fn groups_save_and_open() {
         let mut ed = editor();
@@ -918,15 +935,33 @@ mod tests {
         let before = ed.app.scene.objects[0].pivot;
         ed.app.scene.set_object(g, glam::Vec3::new(1.0, 0.0, 0.0), glam::Vec3::ZERO, 1.0);
         assert!((ed.app.scene.objects[0].pivot - before - glam::Vec3::X).length() < 1e-5);
-        let path = std::env::temp_dir().join(format!("fkj-editor-{}.fkj", std::process::id()));
+        ed.app.hours = 15.25;
+        ed.app.apply_daylight();
+        ed.app.settings.adaptive = false;
+        ed.app.settings.dir_lights[1] = crate::raster::DirLight { on: true, dir: crate::raster::DirLight::towards(100.0, 30.0), color: glam::Vec3::new(1.0, 0.5, 0.25), lux: 5000.0 };
+        ed.app.cam.yaw = 0.7;
+        let dir = std::env::temp_dir().join(format!("fkj-editor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("groups.fjs");
         ed.save(path.clone());
         assert!(path.is_file(), "{:?}", ed.message);
+        assert!(dir.join("ball.fja").is_file(), "{:?}", std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect::<Vec<_>>());
         let mut other = editor();
         other.open(path.clone());
-        assert_eq!(other.app.scene.objects.len(), 2);
-        assert_eq!(other.app.scene.objects[0].parent, Some(1));
-        assert_eq!(other.app.scene.objects[1].name, "ball_group");
-        let _ = std::fs::remove_file(&path);
+        let s = &other.app.scene;
+        assert_eq!(s.objects.len(), 2, "{:?}", other.message);
+        let ball = s.objects.iter().position(|o| o.name == "ball").unwrap();
+        let group = s.objects.iter().position(|o| o.name == "ball_group").unwrap();
+        assert_eq!(s.objects[ball].parent, Some(group));
+        assert!(s.objects[ball].pivot.distance(ed.app.scene.objects[0].pivot) < 1e-4);
+        assert_eq!(other.app.rig.lights.len(), ed.app.rig.lights.len());
+        assert!((other.app.hours - 15.25).abs() < 1e-4);
+        assert!(!other.app.settings.adaptive);
+        assert!(other.app.settings.dir_lights[0].on && (other.app.settings.dir_lights[0].lux - 5000.0).abs() < 1e-2);
+        assert!((other.app.cam.yaw - 0.7).abs() < 1e-4);
+        assert!((other.app.settings.exposure - ed.app.settings.exposure).abs() <= ed.app.settings.exposure * 1e-5);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The timeline plays the day: the sun and the sky follow.

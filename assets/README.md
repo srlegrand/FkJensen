@@ -1,26 +1,26 @@
 # Assets
 
-## models/trex.fkj
+## models/trex.fja
 
 "Tyrannosaurus rex" by IagoMendez
 (https://sketchfab.com/3d-models/tyrannosaurus-rex-497a7f22e77a4678b173fb511bea6064),
 licensed under CC BY 4.0 (http://creativecommons.org/licenses/by/4.0/), as
-stated in the glTF file's metadata. Changes made here: converted to `.fkj`
-with `tools/fkj-import`, scaled to 12.3 m long, base colour baked to
+stated in the glTF file's metadata. Changes made here: converted to an `.fja`
+asset with `tools/fkj-import`, scaled to 12.3 m long, base colour baked to
 per-triangle texture tiles, other maps dropped.
 
-## models/trex_highres.fkj
+## models/trex_highres.fja
 
-The same Tyrannosaurus rex as `trex.fkj`, as a ZBrush 2022 sculpt exported
+The same Tyrannosaurus rex as `trex.fja`, as a ZBrush 2022 sculpt exported
 to OBJ (5.4 M quads, 10.8 M triangles), supplied by Simon Legrand, with the
 glTF model's base colour texture. Converted with `tools/fkj-import`, scaled
 to 12.3 m long.
 
-## models/car.fkj
+## models/car.fja
 
 A Ford Explorer in "Jurassic Park" (1993) livery, from an FBX with its
 textures. The download came with no author or licence information.
-Changes made here: converted to `.fkj` with `tools/fkj-import`, scaled to
+Changes made here: converted to an `.fja` asset with `tools/fkj-import`, scaled to
 4.79 m long, base colour baked to per-triangle texture tiles, other maps
 dropped.
 
