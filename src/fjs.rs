@@ -459,7 +459,7 @@ pub fn build(f: &SceneFile, dir: &Path, search: &[PathBuf]) -> Result<Scene, Str
     }
     scene.lights = f.lights.iter().map(|l| PointLight { position: v3(l.position), color: v3(l.color), lumens: l.lumens.clamp(crate::scene::MIN_LUMENS, crate::scene::MAX_LUMENS) }).collect();
     scene.light_parents = f.lights.iter().map(|l| l.parent.and_then(|p| index.get(p).copied())).collect();
-    scene.focus = (0..scene.objects.len()).filter(|&i| !scene.objects[i].clusters.is_empty()).map(|i| scene.vertex_bounds(i)).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
+    scene.focus = scene.subject();
     Ok(scene)
 }
 
@@ -714,6 +714,13 @@ mod tests {
         assert_eq!(t.clusters.len(), s.clusters.len());
         let old = parse(r#"{ "fjs": 1, "world": "built-in" }"#).unwrap();
         assert_eq!(build(&old, &d, &[]).unwrap().objects.len(), 2);
+        // The camera's subject is the objects, not kilometres of ground: a
+        // subject that size put the near plane tens of metres out and hid
+        // everything closer.
+        assert_eq!(t.focus, Some(crate::world::middle()));
+        let with = parse(r#"{ "fjs": 1, "world": "built-in", "objects": [ { "name": "c", "asset": "built-in:cube", "pivot": [7.5, 0.0, 5.0] } ] }"#).unwrap();
+        let (lo, hi) = build(&with, &d, &[]).unwrap().focus.unwrap();
+        assert!(lo.distance(glam::Vec3::new(7.0, 0.0, 4.5)) < 1e-3 && hi.distance(glam::Vec3::new(8.0, 1.0, 5.5)) < 1e-3, "{lo} {hi}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

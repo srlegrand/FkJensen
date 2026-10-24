@@ -1349,7 +1349,7 @@ fn prepare_opened(scene: &mut Scene, path: &Path) {
     }
     scene.scatter_missing_samples();
     if scene.focus.is_none() {
-        scene.focus = (0..scene.objects.len()).filter(|&i| !scene.objects[i].clusters.is_empty()).map(|i| scene.object_bounds(i)).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
+        scene.focus = scene.subject();
     }
 }
 

@@ -64,8 +64,8 @@ moon, a key from a direction the sun never takes, or a second sun. Each is
 a direction (azimuth from -Z, the way the camera starts, turning towards
 +X; elevation above the horizon), a colour and an illuminance in lux, up
 to 150,000 (a little over full summer sun). `--dir AZ,EL,LUX` adds one;
-in the editor, "+ directional" under Lights. Not saved with the scene, as
-the sun and the sky are not.
+in the editor, Create > Lights > Directional Light. Scene files keep them
+(`docs/scene.md`).
 
 A directional light changed (turned, coloured, dimmed) is treated as a
 dragged point light is: it keeps a share of its own in each point's

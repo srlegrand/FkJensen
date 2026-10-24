@@ -609,6 +609,15 @@ impl Scene {
         ((self.bounds_max - self.bounds_min).length() * 0.5).max(1e-3)
     }
 
+    /// What the camera frames and opens on: the objects, not the ground
+    /// and mountains (which run for kilometres, and would put the near
+    /// plane tens of metres out); the middle of the set when there is
+    /// nothing else. None for a scene with neither.
+    pub fn subject(&self) -> Option<(Vec3, Vec3)> {
+        let objects = (0..self.objects.len()).filter(|&i| !self.objects[i].clusters.is_empty() && !self.objects[i].environment).map(|i| self.vertex_bounds(i)).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
+        objects.or_else(|| self.objects.iter().any(|o| o.environment).then(crate::world::middle))
+    }
+
     pub fn focus_bounds(&self) -> (Vec3, Vec3) {
         self.focus.unwrap_or((self.bounds_min, self.bounds_max))
     }
