@@ -403,6 +403,9 @@ build leaves them out.
 | `receivers` | bounce receivers: gathered or waiting |
 | `samples` | each object's surface samples, one colour each |
 | `sky-share` | each point's share of the sky: its object's sky transfer, times what other objects hide |
+| `ao` | ambient occlusion: band 0 of the sky transfer (the open share of the cosine-weighted hemisphere, whatever the sky), times what other objects hide |
+| `bent-normal` | where each point sees most open sky: band 1 of its sky transfer, as the normals view |
+| `sky-sh` | the sky transfer of the sample under the cursor, its nine numbers drawn over a cube (green: open sky it sees; blue: what an open sample would; red: ringing), and the samples round it by ambient occlusion |
 | `micro-raster` | the 6 x 8 x 8 cube raster of the receiver under the cursor, x4, and what its spherical harmonics give back |
 
 ## Without a display server
@@ -538,7 +541,7 @@ of each pass in milliseconds.
 
     View
     [ / ]                  exposure              0    exposure from the sky
-    B                      back-face culling
+    B                      back-face culling (on at start)
     G                      wireframe             P    save frame.png
     Esc                    quit
     drop an .fkj file on the window to open it

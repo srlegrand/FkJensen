@@ -509,8 +509,10 @@ pub fn shares(s: &Sample, l: &([f32; 9], [f32; 9])) -> [f32; 2] {
 /// Each sample's share of the sky and of the ground's light for the
 /// current sky, and a grid to find the samples around a point.
 pub struct SkyShare {
-    /// Per sample: share of the sky, share of the ground's light.
-    pub share: Vec<[f32; 2]>,
+    /// Per sample: share of the sky, share of the ground's light, ambient
+    /// occlusion (the open share of the cosine-weighted hemisphere, any
+    /// sky), and the bent normal (where it sees most open sky), x, y, z.
+    pub share: Vec<[f32; 6]>,
     /// Per cluster: the object whose samples shade it (`u32::MAX`: none).
     cluster_object: Vec<u32>,
     /// Per object: how far a sample counts, metres.
@@ -549,7 +551,20 @@ impl SkyShare {
     pub fn new(scene: &crate::scene::Scene, contrast: f32) -> SkyShare {
         let l = sky_coefficients(contrast);
         let samples = &scene.samples;
-        let share: Vec<[f32; 2]> = samples.iter().map(|s| shares(s, &l)).collect();
+        let share: Vec<[f32; 6]> = samples
+            .iter()
+            .map(|s| {
+                let [a, b] = shares(s, &l);
+                if s.sky[0].is_nan() {
+                    return [a, b, 1.0, s.normal.x, s.normal.y, s.normal.z];
+                }
+                // Band 0 of the transfer over an open one's is the ambient
+                // occlusion; band 1 points where the sky is most open.
+                let ao = (s.sky[0] / open_transfer(s.normal)[0]).clamp(0.0, 1.0);
+                let bent = Vec3::new(s.sky[3], s.sky[1], s.sky[2]).normalize_or(s.normal);
+                [a, b, ao, bent.x, bent.y, bent.z]
+            })
+            .collect();
         // Objects whose samples carry transfer.
         let mut cluster_object = vec![u32::MAX; scene.clusters.len()];
         let mut radius = vec![0f32; scene.objects.len()];
@@ -696,15 +711,52 @@ impl SkyShare {
 
     /// The share an object's own shape leaves a point of it.
     fn own(&self, ci: usize, scene: &crate::scene::Scene, p: Vec3, n: Vec3) -> [f32; 2] {
+        match self.own_all(ci, scene, p, n) {
+            Some(v) => [v[0], v[1]],
+            None => [1.0, 1.0],
+        }
+    }
+
+    /// Ambient occlusion at a point: what its object's own shape leaves
+    /// open of the cosine-weighted hemisphere, times what other objects
+    /// leave. 1 where nothing has samples.
+    pub fn ao_at(&self, ci: usize, scene: &crate::scene::Scene, p: Vec3, n: Vec3) -> f32 {
+        let own = self.own_all(ci, scene, p, n).map(|v| v[2]).unwrap_or(1.0);
+        let mut others = 1.0;
+        if let Some(&end) = self.near_at.get(ci + 1) {
+            for &j in &self.near[self.near_at[ci] as usize..end as usize] {
+                let Some((occ, c, r)) = &self.occluders[j as usize] else { continue };
+                let past = p.distance(*c) - r;
+                let reach = r * INFLUENCE;
+                if past >= reach {
+                    continue;
+                }
+                let fade = if past <= 0.5 * reach { 1.0 } else { 2.0 * (1.0 - past / reach) };
+                let h = occ.hidden(p, n, |_| [1.0, 0.0]);
+                others *= (1.0 - fade * h[0] / std::f32::consts::PI).clamp(0.0, 1.0);
+            }
+        }
+        own * others
+    }
+
+    /// The bent normal at a point of an object with sky transfer: where
+    /// its own shape leaves the sky most open. None elsewhere.
+    pub fn bent_at(&self, ci: usize, scene: &crate::scene::Scene, p: Vec3, n: Vec3) -> Option<Vec3> {
+        self.own_all(ci, scene, p, n).map(|v| Vec3::new(v[3], v[4], v[5]).normalize_or(n))
+    }
+
+    /// Everything kept per sample, blended at a point of its object.
+    fn own_all(&self, ci: usize, scene: &crate::scene::Scene, p: Vec3, n: Vec3) -> Option<[f32; 6]> {
         let o = match self.cluster_object.get(ci) {
             Some(&o) if o != u32::MAX => o,
-            _ => return [1.0, 1.0],
+            _ => return None,
         };
         let r = self.radius[o as usize];
         let r2 = r * r;
         let lo = ((p - Vec3::splat(r)) / self.cell).floor();
         let hi = ((p + Vec3::splat(r)) / self.cell).floor();
-        let (mut ws, mut s0, mut s1) = (0f32, 0f32, 0f32);
+        let mut ws = 0f32;
+        let mut sum = [0f32; 6];
         for z in lo.z as i32..=hi.z as i32 {
             for y in lo.y as i32..=hi.y as i32 {
                 for x in lo.x as i32..=hi.x as i32 {
@@ -722,13 +774,14 @@ impl SkyShare {
                         let a = 1.0 - d2 / r2;
                         let w = a * a * (f - 0.2);
                         ws += w;
-                        s0 += w * self.share[k][0];
-                        s1 += w * self.share[k][1];
+                        for (a, v) in sum.iter_mut().zip(&self.share[k]) {
+                            *a += w * v;
+                        }
                     }
                 }
             }
         }
-        if ws > 0.0 { [s0 / ws, s1 / ws] } else { [1.0, 1.0] }
+        if ws > 0.0 { Some(sum.map(|v| v / ws)) } else { None }
     }
 }
 

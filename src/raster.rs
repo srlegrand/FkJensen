@@ -327,7 +327,7 @@ impl RenderSettings {
     }
 
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: false, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true, sky_occlusion: true }
+        Self { cull_backfaces: true, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true, sky_occlusion: true }
     }
 }
 
@@ -1146,7 +1146,8 @@ mod tests {
         scene.push_mesh(&p, &[], &[], &[0, 1, 2]);
         let (w, h) = (160, 100);
         let mut frame = Frame::new(w, h);
-        let settings = settings();
+        // Either side: this is about clipping.
+        let settings = RenderSettings { cull_backfaces: false, ..settings() };
         render(&scene, &camera(w, h), &[], &settings, &mut frame);
         // Clipping yields one or two pieces, and every drawn pixel has finite depth.
         assert!(frame.stats.tris_drawn >= 1 && frame.stats.tris_drawn <= 2);
@@ -1184,7 +1185,7 @@ mod tests {
         scene.push_mesh(&behind, &[], &[], &idx);
         let (w, h) = (200, 150);
         let mut frame = Frame::new(w, h);
-        let settings = settings();
+        let settings = RenderSettings { cull_backfaces: false, ..settings() };
         render(&scene, &camera(w, h), &[], &settings, &mut frame);
         assert!(frame.stats.clusters_drawn * 2 <= frame.stats.clusters_in + 1, "{:?}", frame.stats);
         assert!(frame.stats.clusters_drawn > 0);

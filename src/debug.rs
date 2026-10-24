@@ -43,9 +43,12 @@ pub enum DebugView {
     MicroRaster,
     Samples,
     SkyShare,
+    Ao,
+    BentNormal,
+    SkySh,
 }
 
-pub const ALL: [DebugView; 26] = [
+pub const ALL: [DebugView; 29] = [
     DebugView::Final,
     DebugView::Clusters,
     DebugView::Lod,
@@ -72,6 +75,9 @@ pub const ALL: [DebugView; 26] = [
     DebugView::MicroRaster,
     DebugView::Samples,
     DebugView::SkyShare,
+    DebugView::Ao,
+    DebugView::BentNormal,
+    DebugView::SkySh,
 ];
 
 impl DebugView {
@@ -103,6 +109,9 @@ impl DebugView {
             DebugView::MicroRaster => "micro-raster",
             DebugView::Samples => "samples",
             DebugView::SkyShare => "sky-share",
+            DebugView::Ao => "ao",
+            DebugView::BentNormal => "bent-normal",
+            DebugView::SkySh => "sky-sh",
         }
     }
 
@@ -144,6 +153,9 @@ impl DebugView {
             DebugView::Receivers => ("BOUNCE RECEIVERS", &["SPREAD EVENLY, WHATEVER THE TRIANGLES: 15 CM ON OBJECTS, WIDER AWAY FROM THEM", "GREEN: GATHERED; RED: WAITING FOR ITS TURN"]),
             DebugView::Samples => ("SURFACE SAMPLES", &["EACH OBJECT'S SURFACE AS EVEN DISCS, ONE COLOUR EACH, WHATEVER ITS TRIANGLES", "THE SAME SPACING ON A LARGE FLAT TRIANGLE AS ON A DENSE SCULPT"]),
             DebugView::SkyShare => ("SKY SHARE", &["WHITE: ALL OF THE SKY; BLACK: NONE. AN OBJECT'S OWN SHAPE, PRECOMPUTED AT ITS SAMPLES,", "TIMES WHAT OTHER OBJECTS' SAMPLE DISCS HIDE; BLUE: NOTHING TAKES ITS SKY"]),
+            DebugView::Ao => ("AMBIENT OCCLUSION", &["THE OPEN SHARE OF THE COSINE-WEIGHTED HEMISPHERE: BAND 0 OF THE SKY TRANSFER", "TIMES WHAT OTHER OBJECTS HIDE; THE SAME FOR ANY SKY. BLUE: NO SAMPLES"]),
+            DebugView::BentNormal => ("BENT NORMAL", &["WHERE EACH POINT SEES MOST OPEN SKY: BAND 1 OF ITS SKY TRANSFER", "X Y Z AS RED GREEN BLUE, AS THE NORMALS VIEW; BLUE-GREY: NO TRANSFER"]),
+            DebugView::SkySh => ("SKY TRANSFER, SPHERICAL HARMONICS", &["EACH SAMPLE'S NINE NUMBERS AS A LOBE: WHAT IT SEES OF THE SKY, COSINE WEIGHTED", "UNDER THE CURSOR, BIG; THE SAMPLES AROUND IT AS DOTS COLOURED BY THEIR OPEN SHARE"]),
             DebugView::MicroRaster => ("MICRO-RASTER, X4", &["THE CUBE OF 6 X 8 X 8 TEXELS SEEN BY THE RECEIVER UNDER THE CURSOR", "NEAREST SURFELS FILL IT FIRST; THEN IT FOLDS INTO 4 NUMBERS PER COLOUR"]),
         }
     }
@@ -347,6 +359,14 @@ pub fn draw(view: DebugView, ctx: &Ctx, frame: &mut Frame) {
                         }
                     }
                 }
+                DebugView::Ao => match ctx.peek.sky_share {
+                    Some(s) if s.covers(hh.cluster) => Vec3::splat(s.ao_at(hh.cluster, ctx.scene, hh.p, hh.n).powf(2.2)),
+                    _ => Vec3::new(0.01, 0.015, 0.08),
+                },
+                DebugView::BentNormal => match ctx.peek.sky_share.and_then(|s| s.bent_at(hh.cluster, ctx.scene, hh.p, hh.n)) {
+                    Some(b) => (b * 0.5 + Vec3::splat(0.5)).powf(2.2),
+                    None => Vec3::new(0.03, 0.04, 0.06),
+                },
                 DebugView::SkyShare => match ctx.peek.sky_share {
                     Some(s) if s.covers(hh.cluster) => {
                         let v = s.at(hh.cluster, ctx.scene, hh.p, hh.n)[0];
@@ -457,6 +477,7 @@ pub fn draw(view: DebugView, ctx: &Ctx, frame: &mut Frame) {
         DebugView::Receivers => receivers(ctx, frame),
         DebugView::Samples => samples(ctx, frame),
         DebugView::MicroRaster => micro_raster(ctx, frame),
+        DebugView::SkySh => sky_sh(ctx, frame),
         _ => {}
     }
     legend(view, ctx, frame);
@@ -785,6 +806,90 @@ fn receiver_at(ctx: &Ctx, frame: &Frame, b: &Bounce, x: usize, y: usize) -> Opti
     Some((hh.cluster, r, hh.p))
 }
 
+/// The sky transfer of the sample nearest the point under the cursor, as
+/// the function its nine numbers make over the sphere, on a cube; the
+/// samples around it as dots by their ambient occlusion.
+fn sky_sh(ctx: &Ctx, frame: &mut Frame) {
+    let (w, h) = (frame.width, frame.height);
+    let (cx, cy) = ctx.cursor.map(|(x, y)| (x.clamp(0.0, w as f32 - 1.0) as usize, y.clamp(0.0, h as f32 - 1.0) as usize)).unwrap_or((w / 2, h / 2));
+    let Some(hh) = hit(ctx, frame, cx, cy) else {
+        text(frame, 16, h / 2, 2, "POINT AT A SURFACE", Vec3::ONE);
+        return;
+    };
+    let sc = ctx.scene;
+    let Some(o) = sc.object_of(hh.cluster) else {
+        text(frame, 16, h / 2, 2, "NO SAMPLES HERE: NOT AN OBJECT", Vec3::ONE);
+        return;
+    };
+    let r = sc.samples_in(sc.objects[o].clusters.clone());
+    let Some(k) = r.clone().filter(|&k| sc.samples[k].normal.dot(hh.n) > 0.0).min_by(|&a, &b| sc.samples[a].position.distance_squared(hh.p).total_cmp(&sc.samples[b].position.distance_squared(hh.p))) else {
+        text(frame, 16, h / 2, 2, "NO SAMPLES ON THIS OBJECT", Vec3::ONE);
+        return;
+    };
+    let sm = sc.samples[k];
+    if sm.sky[0].is_nan() {
+        text(frame, 16, h / 2, 2, "NO SKY TRANSFER: RUN FKJ-IMPORT --SKY ON THIS MODEL", Vec3::ONE);
+        return;
+    }
+    // The samples around it, by ambient occlusion.
+    let spacing = sm.area.sqrt();
+    for j in r {
+        let x = &sc.samples[j];
+        if x.position.distance(sm.position) > spacing * 12.0 || x.sky[0].is_nan() {
+            continue;
+        }
+        let ao = (x.sky[0] / crate::transfer::open_transfer(x.normal)[0]).clamp(0.0, 1.0);
+        if let Some((sx, sy, iw)) = raster::project(ctx.cam, w, h, x.position) {
+            let (px, py) = (sx as i32, sy as i32);
+            if px >= 1 && py >= 1 && (px as usize) < w - 1 && (py as usize) < h - 1 && frame.depth[py as usize * w + px as usize] <= iw * 1.01 {
+                for (dx, dy) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    frame.color[(py + dy) as usize * w + (px + dx) as usize] = raster::pack(Vec3::new(1.0 - ao, ao, 0.2 * ao));
+                }
+            }
+        }
+    }
+    if let Some((sx, sy, _)) = raster::project(ctx.cam, w, h, sm.position) {
+        let (x, y) = (sx as i32, sy as i32);
+        for d in -12..=12i32 {
+            for (xx, yy) in [(x + d, y), (x, y + d)] {
+                if d.abs() > 3 && xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
+                    frame.color[yy as usize * w + xx as usize] = raster::pack(rgb(255, 220, 90));
+                }
+            }
+        }
+    }
+    // The function on a cube: what the sample sees, against what an open
+    // sample facing the same way would.
+    let open = crate::transfer::open_transfer(sm.normal);
+    let peak = crate::transfer::dot9(&open, &crate::transfer::sh9(sm.normal)).max(1e-6);
+    let cell = ((h as f32 * 0.62 / 3.0).min(w as f32 * 0.5 / 4.0)).max(16.0) as usize;
+    let (x0, y0) = (w.saturating_sub(4 * cell + 16), h.saturating_sub(3 * cell + 16));
+    const FACES: [(Vec3, Vec3, Vec3); 6] = [
+        (Vec3::X, Vec3::NEG_Z, Vec3::Y),
+        (Vec3::NEG_X, Vec3::Z, Vec3::Y),
+        (Vec3::Y, Vec3::X, Vec3::NEG_Z),
+        (Vec3::NEG_Y, Vec3::X, Vec3::Z),
+        (Vec3::Z, Vec3::X, Vec3::Y),
+        (Vec3::NEG_Z, Vec3::NEG_X, Vec3::Y),
+    ];
+    cube_cross(frame, x0, y0, cell, |f, u, v| {
+        let (a, rr, up) = FACES[f];
+        let d = (a + rr * (u * 2.0 - 1.0) + up * (v * 2.0 - 1.0)).normalize();
+        let seen = crate::transfer::dot9(&sm.sky, &crate::transfer::sh9(d)) / peak;
+        let free = crate::transfer::dot9(&open, &crate::transfer::sh9(d)) / peak;
+        if seen >= 0.0 {
+            // Green: open sky it sees; dim blue: what an open one would.
+            Vec3::new(0.0, seen.min(1.0), 0.0) + Vec3::new(0.0, 0.0, free.max(0.0) * 0.25)
+        } else {
+            Vec3::new((-seen).min(1.0), 0.0, 0.0)
+        }
+    });
+    let ao = (sm.sky[0] / open[0]).clamp(0.0, 1.0);
+    let share = ctx.peek.sky_share.map(|s| s.share[k][0]).unwrap_or(f32::NAN);
+    let u = ui(frame);
+    text(frame, 16, h - 12 * u - 8, u, &format!("SAMPLE {k}: AMBIENT OCCLUSION {ao:.2}, SHARE OF THIS SKY {share:.2}; RED ON THE CUBE: RINGING OF 9 NUMBERS"), Vec3::splat(0.9));
+}
+
 fn micro_raster(ctx: &Ctx, frame: &mut Frame) {
     let (w, h) = (frame.width, frame.height);
     let Some(b) = ctx.peek.bounce else {
@@ -1037,8 +1142,8 @@ mod tests {
         for v in ALL {
             assert_eq!(DebugView::from_name(v.name()), Some(v));
         }
-        assert_eq!(DebugView::Final.step(-1), DebugView::SkyShare);
-        assert_eq!(DebugView::SkyShare.step(1), DebugView::Final);
+        assert_eq!(DebugView::Final.step(-1), DebugView::SkySh);
+        assert_eq!(DebugView::SkySh.step(1), DebugView::Final);
     }
 
     #[test]
