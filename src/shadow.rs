@@ -36,6 +36,8 @@ pub struct CubeShadow {
     inv_depth: Vec<f32>,
     /// Triangles drawn when it was built.
     pub tris: u64,
+    /// The reach it holds the geometry within.
+    pub reach: f32,
 }
 
 /// Which face a direction falls on.
@@ -75,7 +77,7 @@ impl CubeShadow {
             inv_depth.extend(d);
             tris += t;
         }
-        CubeShadow { position, res, inv_depth, tris }
+        CubeShadow { position, res, inv_depth, tris, reach }
     }
 
     #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]

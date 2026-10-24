@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 24/10/2026: a changed directional light keeps a share of its own like a dragged point light, and draws only its own map again (the sky, sun and exposure no longer throw away point lights' maps either); the sun's and directional lights' maps are drawn in bands of rows in parallel instead of merging copies of the whole map. A directional light's map went from about 1.4 s to 120 to 170 ms on 2 cores.
 - 24/10/2026: directional lights, up to four: parallel light and cascaded shadows like the sun's, in lux, on the scene only (the sky and exposure do not follow them). Views for ambient occlusion, bent normals and the sky transfer's nine numbers; back-face culling on at start.
 - 23/10/2026: objects have transforms: moving one changes its transform and its clusters' bounds, and its vertices are read through it, never rewritten; the selection box turns with the object. Moving the high-resolution T-rex went from about 900 ms to 19 ms before rendering. Saving bakes a moved object where it stands.
 - 23/10/2026: bounce receivers spread evenly over the surfaces, whatever their triangles: 15 cm apart on objects, growing with distance from objects on the ground, each pixel blending those around it. Per-vertex and per-cluster receivers are gone. The high-resolution set's first frame went from 4.3 s to 2.7 s on 2 cores (9,371 receivers gathered in 1.4 s, against 5,359 in 2.4 s).

@@ -42,6 +42,10 @@ use crate::shadow::CubeShadow;
 use crate::sun::SunShadow;
 use crate::transfer::SkyShare;
 
+/// Light ids from here on are directional lights (`RenderSettings::
+/// dir_lights`); below, point lights.
+const DIR_ID: usize = 64;
+
 /// How one triangle was diced, and where its points are kept.
 ///
 /// Its grid lies on the triangle as seen when it was diced: rows along its
@@ -215,8 +219,10 @@ struct ClusterShade {
     slots: Vec<u8>,
     gshare: Vec<Vec<[Vec3; 2]>>,
     vshare: Vec<Vec<[Vec3; 2]>>,
-    /// Lights changed since this cluster's shading was kept, one bit each.
-    light_todo: u64,
+    /// Lights changed since this cluster's shading was kept, one bit each
+    /// (`light ids`: point lights from 0, directional lights from
+    /// `DIR_ID`).
+    light_todo: u128,
     /// The view, rate and triangles needed when its grids were last
     /// checked, and what that found (vertices and grids needed, points
     /// used): while the camera holds still the check is not done again.
@@ -362,11 +368,15 @@ pub struct Renderer {
     /// only it keeps a share of its own in the shading cache, so memory
     /// grows by one share a point.
     hot: Vec<usize>,
-    prev_global: Option<(Sky, raster::Sun, f32, bool, bool, bool, usize, bool, bool, [raster::DirLight; raster::MAX_DIR_LIGHTS])>,
+    prev_global: Option<(Sky, raster::Sun, f32, bool, bool, bool, usize, bool, bool)>,
+    /// The directional lights as last shaded.
+    prev_dirs: [raster::DirLight; raster::MAX_DIR_LIGHTS],
     /// The sun's shadow map, and what it was built for (direction, texels,
     /// scene).
     sun_shadow: Option<SunShadow>,
     sun_key: Option<(Vec3, usize, (usize, usize, usize))>,
+    /// How point lights' shadow maps were drawn: shadows on, texels, lights.
+    shadow_how: Option<(bool, usize, usize)>,
     /// Each directional light's shadow map, and what it was built for.
     dir_shadows: Vec<Option<(SunShadow, (Vec3, usize, (usize, usize, usize)))>>,
     prev_backdrop: Option<raster::Backdrop>,
@@ -464,6 +474,8 @@ impl Renderer {
             sun_shadow: None,
             sun_key: None,
             dir_shadows: (0..raster::MAX_DIR_LIGHTS).map(|_| None).collect(),
+            shadow_how: None,
+            prev_dirs: [raster::DirLight::default(); raster::MAX_DIR_LIGHTS],
             prev_backdrop: None,
             bounce: None,
             vis_key: None,
@@ -553,20 +565,34 @@ impl Renderer {
         let reach: Vec<f32> = lights.iter().map(|l| if settings.light_reach { raster::light_reach(l, cut) } else { f32::INFINITY }).collect();
 
         // What changed since the last frame decides what is thrown away.
-        let global = (settings.sky, settings.sun, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.bounce, settings.shadow_res, settings.adaptive, settings.sky_occlusion, settings.dir_lights);
+        let global = (settings.sky, settings.sun, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.bounce, settings.shadow_res, settings.adaptive, settings.sky_occlusion);
         // Without incremental moves (to compare), a move relights all.
         let global_changed = self.prev_global != Some(global) || self.prev_lights.len() != lights.len() || (!settings.incremental_moves && !self.moves.is_empty());
         // Spheres (old and new position, with reach) of lights that changed,
         // and which light.
         let mut spheres: Vec<(Vec3, f32)> = Vec::new();
         let mut changed_lights: Vec<usize> = Vec::new();
+        let mut dir_changed = false;
         if global_changed {
             full_resolve = true;
             for c in &mut self.cache {
                 c.forget_light();
             }
             self.hot.clear();
-            self.shadows = (0..lights.len()).map(|_| None).collect();
+            // Point lights' maps stay unless how shadows are drawn changed,
+            // a light moved, or its reach grew past what its map holds: the
+            // sky, the sun, the exposure and the directional lights do not
+            // touch them.
+            let how = (settings.shadows, settings.shadow_res, lights.len());
+            if self.shadow_how != Some(how) || self.shadows.len() != lights.len() {
+                self.shadows = (0..lights.len()).map(|_| None).collect();
+                self.shadow_how = Some(how);
+            }
+            for (i, m) in self.shadows.iter_mut().enumerate() {
+                if m.as_ref().is_some_and(|m| m.position != lights[i].position || reach[i] > m.reach) {
+                    *m = None;
+                }
+            }
         } else {
             for (i, l) in lights.iter().enumerate() {
                 let old = &self.prev_lights[i];
@@ -582,19 +608,37 @@ impl Renderer {
                     }
                 }
             }
+            // A changed directional light reaches everything: its share is
+            // redone everywhere, and it becomes hot.
+            let mut dir_bits = 0u128;
+            for (k, d) in settings.dir_lights.iter().enumerate() {
+                if *d != self.prev_dirs[k] && (d.lights() || self.prev_dirs[k].lights()) {
+                    let id = DIR_ID + k;
+                    dir_bits |= 1u128 << id;
+                    self.hot.retain(|&h| h != id);
+                    self.hot.insert(0, id);
+                    self.hot.truncate(HOT_LIGHTS);
+                    dir_changed = true;
+                }
+            }
+            if dir_bits != 0 {
+                full_resolve = true;
+                self.cache.par_iter_mut().for_each(|e| e.light_todo |= dir_bits);
+            }
             if !spheres.is_empty() {
                 // Only the changed lights' shares are redone, where they
                 // reach or reached.
                 self.cache.par_iter_mut().zip(scene.clusters.par_iter()).for_each(|(e, c)| {
                     for (k, &i) in changed_lights.iter().enumerate() {
                         if spheres[2 * k..2 * k + 2].iter().any(|(p, r)| p.distance(c.centre) <= c.radius + r) {
-                            e.light_todo |= 1u64 << i;
+                            e.light_todo |= 1u128 << i;
                         }
                     }
                 });
             }
         }
         self.prev_global = Some(global);
+        self.prev_dirs = settings.dir_lights;
         self.prev_lights = lights.to_vec();
         self.prev_reach = reach.clone();
 
@@ -739,6 +783,20 @@ impl Renderer {
             }
         }
         let sun = &suns[..];
+        // The sun alone, and each directional light by its slot, for the
+        // sum and the shares.
+        let sun_main = [SunLit { lux: suns[0].lux, dir: suns[0].dir, shadow: suns[0].shadow }];
+        let dir_lit: Vec<Option<SunLit>> = settings
+            .dir_lights
+            .iter()
+            .enumerate()
+            .map(|(i, d)| d.lights().then(|| SunLit { lux: d.color * d.lux, dir: d.dir, shadow: if settings.shadows { self.dir_shadows[i].as_ref().map(|s| &s.0) } else { None } }))
+            .collect();
+        let dir_lit = &dir_lit;
+        let sun_main = &sun_main;
+        // Whether a light id stands for a light that is there.
+        let n_points = lights.len();
+        let valid = move |l: usize| l < n_points || (l >= DIR_ID && dir_lit.get(l - DIR_ID).is_some_and(|d| d.is_some()));
 
         // Bounce: light the surfels again where light changed, then throw
         // away the receivers that bounce could reach from there.
@@ -768,7 +826,7 @@ impl Renderer {
             }
             let surfel_share = &self.surfel_share;
             // A new surfel cloud (an object moved) is lit whole.
-            let all = global_changed || new_cloud;
+            let all = global_changed || new_cloud || dir_changed;
             if all || !spheres.is_empty() {
                 let lit = AtomicU64::new(0);
                 // The brightest change, as an intensity (cd): how far the
@@ -950,7 +1008,8 @@ impl Renderer {
                 // are redone, on what is on screen; what is kept off screen
                 // is shaded in full when it comes back.
                 // Lights that reach this cluster.
-                let in_reach: Vec<usize> = (0..lights.len()).filter(|&i| lights[i].position.distance(c.centre) <= c.radius + reach[i]).collect();
+                // Directional lights reach everything.
+                let in_reach: Vec<usize> = (0..lights.len()).filter(|&i| lights[i].position.distance(c.centre) <= c.radius + reach[i]).chain((0..dir_lit.len()).filter(|&k| dir_lit[k].is_some()).map(|k| DIR_ID + k)).collect();
                 let lchange = std::mem::take(&mut e.light_todo);
                 let (mut vlight, mut tlight) = (0u128, 0u128);
                 let (mut vtodo, mut ttodo) = (vtodo, ttodo);
@@ -961,7 +1020,7 @@ impl Renderer {
                     e.spec_done &= tneed;
                     // A changed light without a share of its own is in the
                     // sum: redo what is on screen in full.
-                    let all_kept = (0..64).filter(|l| lchange & (1u64 << l) != 0).all(|l| e.slots.contains(&(l as u8)));
+                    let all_kept = (0..128).filter(|l| lchange & (1u128 << l) != 0).all(|l| e.slots.contains(&(l as u8)));
                     if all_kept {
                         vlight = vneed & !vtodo;
                         tlight = tneed & !ttodo;
@@ -973,7 +1032,7 @@ impl Renderer {
                 // A light that has just become hot gets a share of its own:
                 // what is kept has it in the sum, so what is on screen is
                 // redone in full, the rest when it is next on screen.
-                let new_slot = hot.iter().any(|&l| l < lights.len() && in_reach.contains(&l) && !e.slots.contains(&(l as u8)));
+                let new_slot = hot.iter().any(|&l| valid(l) && in_reach.contains(&l) && !e.slots.contains(&(l as u8)));
                 let mut all_diffuse = lchange != 0;
                 if new_slot && (e.done != 0 || e.vdone != 0) {
                     e.vdone &= vneed;
@@ -1072,7 +1131,17 @@ impl Renderer {
                 };
                 // One light's share for every point of a batch.
                 let dark = Sky { on: false, ..sky };
-                let share_of = |batch: &Batch, l: usize, d: &mut [Vec3], s: &mut [Vec3]| -> u64 { shade_batch(batch, eye, dark, false, lights, &[l], &reach, &shadows, &[], d, s, true) };
+                let share_of = |batch: &Batch, l: usize, d: &mut [Vec3], s: &mut [Vec3]| -> u64 {
+                    if l >= DIR_ID {
+                        // A directional light alone.
+                        match dir_lit.get(l - DIR_ID).copied().flatten() {
+                            Some(dl) => shade_batch(batch, eye, dark, false, lights, &[], &reach, &shadows, &[dl], d, s, true),
+                            None => 0,
+                        }
+                    } else {
+                        shade_batch(batch, eye, dark, false, lights, &[l], &reach, &shadows, &[], d, s, true)
+                    }
+                };
 
                 // In full: the sky and the sun, then each light's share.
                 if vtodo != 0 || ttodo != 0 {
@@ -1124,8 +1193,11 @@ impl Renderer {
                         }
                     }
                     let mut lights_now: Vec<usize> = hot.iter().copied().filter(|&l| in_reach.contains(&l) || e.slots.contains(&(l as u8))).collect();
-                    lights_now.retain(|&l| l < lights.len());
-                    let in_sum: Vec<usize> = in_reach.iter().copied().filter(|l| !lights_now.contains(l)).collect();
+                    lights_now.retain(|&l| valid(l));
+                    // In the sum: point lights in reach and the sun, with the
+                    // directional lights that have no share of their own.
+                    let in_sum: Vec<usize> = in_reach.iter().copied().filter(|l| *l < DIR_ID && !lights_now.contains(l)).collect();
+                    let suns_sum: Vec<SunLit> = sun_main.iter().copied().chain(in_reach.iter().filter(|l| **l >= DIR_ID && !lights_now.contains(l)).filter_map(|l| dir_lit[*l - DIR_ID])).collect();
                     let mut batch = Batch::default();
                     let (mut vdest, mut gdest, mut dims) = (Vec::new(), Vec::new(), Vec::new());
                     gather(e, vtodo, ttodo, &mut batch, &mut vdest, &mut gdest, &mut dims);
@@ -1154,7 +1226,7 @@ impl Renderer {
                             }
                             None => b,
                         };
-                        let mut ev = shade_batch(b, eye, sky, ground, lights, &in_sum, &reach, &shadows, sun, d, s, true);
+                        let mut ev = shade_batch(b, eye, sky, ground, lights, &in_sum, &reach, &shadows, &suns_sum, d, s, true);
                         for (k, &l) in lights_now.iter().enumerate() {
                             if shares_in[k] {
                                 ev += share_of(b, l, &mut sd[k], &mut ss[k]);
@@ -1229,7 +1301,7 @@ impl Renderer {
                     while bits != 0 {
                         let l = bits.trailing_zeros() as usize;
                         bits &= bits - 1;
-                        if l >= lights.len() {
+                        if l < DIR_ID && l >= lights.len() {
                             continue;
                         }
                         let reaches = in_reach.contains(&l);
@@ -1491,6 +1563,7 @@ fn lookup_part(scene: &Scene, c: &crate::scene::Cluster, e: &ClusterShade, tri: 
 
 /// The sun as `shade_point` needs it: illuminance facing it, direction,
 /// shadow map.
+#[derive(Clone, Copy)]
 pub struct SunLit<'a> {
     pub lux: Vec3,
     pub dir: Vec3,
@@ -2555,5 +2628,37 @@ mod tests {
         assert!(shaded > 10, "{shaded} pixels in the card's shadow");
         let (az, el) = raster::DirLight::angles(raster::DirLight::towards(123.0, 37.0));
         assert!((az - 123.0).abs() < 1e-3 && (el - 37.0).abs() < 1e-3);
+    }
+
+    /// Turning a directional light redoes only its own share of each point,
+    /// and the picture is the one drawn fresh.
+    #[test]
+    fn a_turned_directional_light_matches_a_fresh_render() {
+        let (mut scene, lights) = world();
+        let (p, idx) = crate::scene::tests::uv_sphere(24);
+        let ball: Vec<Vec3> = p.iter().map(|v| *v * 0.3 + Vec3::new(0.0, 0.6, 0.0)).collect();
+        scene.push_mesh(&ball, &[], &[Vec3::new(0.8, 0.3, 0.2)], &idx);
+        let (w, h) = (200, 112);
+        let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.6, 0.0), 4.0, 0.15);
+        // Every point shaded, as the share is: adaptive shading would
+        // interpolate where the fresh render does not.
+        let mut settings = RenderSettings { adaptive: false, ..RenderSettings::new(Sky::new(30.0, true)) };
+        settings.dir_lights[0] = raster::DirLight { on: true, dir: raster::DirLight::towards(40.0, 50.0), color: Vec3::new(1.0, 0.9, 0.8), lux: 200.0 };
+        let mut r = Renderer::new();
+        let mut f = Frame::new(w, h);
+        r.render(&scene, &cam, &lights, &settings, &mut f);
+        for step in 1..=3 {
+            settings.dir_lights[0].dir = raster::DirLight::towards(40.0 + 20.0 * step as f32, 50.0 - 5.0 * step as f32);
+            r.render(&scene, &cam, &lights, &settings, &mut f);
+            assert!(f.stats.shadow_maps_built <= 1, "only its own map is drawn again");
+        }
+        let mut fresh = Frame::new(w, h);
+        render(&scene, &cam, &lights, &settings, &mut fresh);
+        assert!(worst(&f, &fresh) <= 1, "{}", worst(&f, &fresh));
+        // Off again: as if it had never been on.
+        settings.dir_lights[0].on = false;
+        r.render(&scene, &cam, &lights, &settings, &mut f);
+        render(&scene, &cam, &lights, &settings, &mut fresh);
+        assert!(worst(&f, &fresh) <= 1, "off: {}", worst(&f, &fresh));
     }
 }

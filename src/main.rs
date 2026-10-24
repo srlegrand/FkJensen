@@ -22,6 +22,7 @@
 //!   fkjensen --no-sky-occlusion        the sky not taken by objects' own shapes (to compare)
 //!   fkjensen --relight-on-move         light everything again when an object moves (to compare)
 //!   fkjensen --png out.png --bench-move  then move the first model five times, timing each frame
+//!   fkjensen --png out.png --bench-dir   then turn the first directional light five times, timing each frame
 //!   fkjensen --close                   start on the close framing of the subject
 //!   fkjensen --look ex,ey,ez,tx,ty,tz  camera at e looking at t, in metres
 //!   fkjensen --no-shadows              point lights without shadow maps
@@ -1213,6 +1214,7 @@ fn main() {
     let mut sky_occlusion = true;
     let mut incremental_moves = true;
     let mut bench_move = false;
+    let mut bench_dir = false;
     let mut close = false;
     let mut shadows: Option<bool> = None;
     let mut bounce: Option<bool> = None;
@@ -1304,6 +1306,7 @@ fn main() {
             "--no-sky-occlusion" => sky_occlusion = false,
             "--relight-on-move" => incremental_moves = false,
             "--bench-move" => bench_move = true,
+            "--bench-dir" => bench_dir = true,
             "--close" => close = true,
             "--no-shadows" => shadows = Some(false),
             "--shadows" => shadows = Some(true),
@@ -1369,7 +1372,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1653,6 +1656,35 @@ fn main() {
             let drag_out = out.replace(".png", "_dragged.png");
             if save_png(&app.frame, &drag_out).is_ok() {
                 eprintln!("wrote {drag_out}");
+            }
+        }
+        if bench_dir {
+            // Turn the first directional light 5 degrees at a time, as
+            // dragging its azimuth would.
+            app.settings.bounce_budget_ms = Some(30.0);
+            if !app.settings.dir_lights[0].on {
+                app.settings.dir_lights[0] = raster::DirLight { on: true, ..Default::default() };
+                app.render();
+            }
+            for step in 1..=5 {
+                let d = app.settings.dir_lights[0];
+                let (az, el) = raster::DirLight::angles(d.dir);
+                app.settings.dir_lights[0].dir = raster::DirLight::towards(az + 5.0, el);
+                let t = Instant::now();
+                app.render();
+                let s = app.frame.stats;
+                eprintln!(
+                    "turn step {step}: {:.1} ms: shadows {:.1} ms ({} maps, {} triangles), surfels {:.1} ms, shade {:.1} ms ({} points), gather {:.1} ms, resolve {:.1} ms",
+                    t.elapsed().as_secs_f32() * 1000.0,
+                    s.shadow_ms,
+                    s.shadow_maps_built,
+                    s.shadow_tris,
+                    s.bounce_ms,
+                    s.shade_ms,
+                    s.points_shaded,
+                    s.gather_ms,
+                    s.resolve_ms
+                );
             }
         }
         if bench_move && !app.scene.objects.is_empty() {

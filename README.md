@@ -53,9 +53,22 @@ moon, a key from a direction the sun never takes, or a second sun. Each is
 a direction (azimuth from -Z, the way the camera starts, turning towards
 +X; elevation above the horizon), a colour and an illuminance in lux, up
 to 150,000 (a little over full summer sun). `--dir AZ,EL,LUX` adds one;
-in the editor, "+ directional" under Lights. Changing one shades
-everything again, as the sun does. Not saved with the scene, as the sun
-and the sky are not.
+in the editor, "+ directional" under Lights. Not saved with the scene, as
+the sun and the sky are not.
+
+A directional light changed (turned, coloured, dimmed) is treated as a
+dragged point light is: it keeps a share of its own in each point's
+shading, so only that share is redone, one light a point, and only its
+own shadow map is drawn again; the point lights' maps and the sun's stay.
+Its map, like the sun's, is drawn in bands of 32 rows, each filled by one
+thread with the clusters that cover it, so no copy of the 2048 x 2048
+cascades is made and merged. On 2 cores with the high-resolution set
+(24/10/2026): drawing a directional light's map went from about 1.4 s to
+120 to 170 ms, and turning it 5 degrees from 1.0 s a frame (all four maps
+and every point shaded again) to 690 to 775 ms (`--bench-dir`), of which
+the resolve 200 to 260 ms and its shading 250 to 310 ms. Moving an object
+with one on costs about 70 ms more a step, for drawing its map again
+where the object was and is.
 
 **Time of day.** One value, in hours, sets the sun's direction (east at 6,
 south at noon at 60 degrees, west at 18) and colour, the sky's light and
@@ -474,6 +487,8 @@ Headless, for tests and screenshots (no window, no display needed):
 - `--sun B` sets the sun's brightness, 0 to 1000 (600 at start).
 - `--dir AZ,EL,LUX` adds a directional light (up to four): azimuth and
   elevation in degrees, illuminance in lux.
+- `--bench-dir` (with `--png`) turns the first directional light 5 degrees
+  five times and times each frame.
 - `--light-contrast C` and `--sky-contrast C`, 0 to 1 (0.5 at start).
 - `--sky LUX` sets the sky, 0 for none, and the exposure to match, after the time of day.
 - `--exposure E` sets the display value per cd/m².

@@ -130,47 +130,40 @@ impl SunShadow {
             .iter()
             .map(|&half| {
                 let texel = 2.0 * half / res as f32;
-                let (height, n) = scene
-                    .clusters
-                    .par_chunks(256)
-                    .fold(
-                        || (vec![f32::NEG_INFINITY; res * res], 0u64),
-                        |(mut buf, mut n), chunk| {
-                            for c in chunk {
-                                // The level of detail whose error is under
-                                // a texel of this cascade.
-                                if !c.lod_drawn(texel, |_, _| 1.0) {
-                                    continue;
-                                }
-                                let q = c.centre - centre;
-                                if q.dot(right).abs() > half + c.radius || q.dot(up).abs() > half + c.radius {
-                                    continue;
-                                }
-                                // Too small for this cascade's texels.
-                                if c.radius * 2.0 < texel * 0.5 {
-                                    continue;
-                                }
-                                for t in c.first_tri..c.first_tri + c.tri_count {
-                                    let ps = scene.tri_pos(c, t);
-                                    let v = [0, 1, 2].map(|k| {
-                                        let p = ps[k] - centre;
-                                        Vec4::new((p.dot(right) / half * 0.5 + 0.5) * res as f32, (p.dot(up) / half * 0.5 + 0.5) * res as f32, p.dot(d), 0.0)
-                                    });
-                                    n += fill_max(&mut buf, res, v[0], v[1], v[2], [0.0, 0.0, f32::INFINITY, f32::INFINITY]) as u64;
-                                }
-                            }
-                            (buf, n)
-                        },
-                    )
-                    .reduce(
-                        || (vec![f32::NEG_INFINITY; res * res], 0),
-                        |(mut a, na), (b, nb)| {
-                            for (x, y) in a.iter_mut().zip(b) {
-                                *x = x.max(y);
-                            }
-                            (a, na + nb)
-                        },
-                    );
+                let to_tex = |p: Vec3| {
+                    let p = p - centre;
+                    ((p.dot(right) / half * 0.5 + 0.5) * res as f32, (p.dot(up) / half * 0.5 + 0.5) * res as f32)
+                };
+                // The clusters drawn into this cascade, with the rows they
+                // can cover.
+                let drawn: Vec<(usize, f32, f32)> = (0..scene.clusters.len())
+                    .into_par_iter()
+                    .filter_map(|i| {
+                        let c = &scene.clusters[i];
+                        // The level of detail whose error is under a texel
+                        // of this cascade.
+                        if !c.lod_drawn(texel, |_, _| 1.0) {
+                            return None;
+                        }
+                        let q = c.centre - centre;
+                        if q.dot(right).abs() > half + c.radius || q.dot(up).abs() > half + c.radius {
+                            return None;
+                        }
+                        // Too small for this cascade's texels.
+                        if c.radius * 2.0 < texel * 0.5 {
+                            return None;
+                        }
+                        let (_, y) = to_tex(c.centre);
+                        let r = c.radius / texel;
+                        Some((i, y - r - 1.0, y + r + 1.0))
+                    })
+                    .collect();
+                let mut height = vec![f32::NEG_INFINITY; res * res];
+                let project = |p: Vec3| {
+                    let q = p - centre;
+                    Vec4::new((q.dot(right) / half * 0.5 + 0.5) * res as f32, (q.dot(up) / half * 0.5 + 0.5) * res as f32, q.dot(d), 0.0)
+                };
+                let n = draw_bands(&mut height, res, (0, res - 1), (0.0, res as f32 - 1.0), &drawn, scene, project);
                 tris += n;
                 Cascade { centre, half, res, height }
             })
@@ -278,31 +271,24 @@ impl SunShadow {
             for y in rect[1] as usize..=rect[3] as usize {
                 cas.height[y * res + rect[0] as usize..=y * res + rect[2] as usize].fill(f32::NEG_INFINITY);
             }
-            // What covers the rect, found in parallel, drawn in order.
-            let hit: Vec<usize> = (0..scene.clusters.len())
+            // What covers the rect, found in parallel, drawn in bands of
+            // rows in parallel.
+            let hit: Vec<(usize, f32, f32)> = (0..scene.clusters.len())
                 .into_par_iter()
-                .filter(|&i| {
+                .filter_map(|i| {
                     let c = &scene.clusters[i];
                     if !c.lod_drawn(texel, |_, _| 1.0) || c.radius * 2.0 < texel * 0.5 {
-                        return false;
+                        return None;
                     }
                     let o = rect_of(c.centre, c.radius);
-                    !(o[0] > rect[2] + 1.0 || o[2] < rect[0] - 1.0 || o[1] > rect[3] + 1.0 || o[3] < rect[1] - 1.0)
+                    (!(o[0] > rect[2] + 1.0 || o[2] < rect[0] - 1.0 || o[1] > rect[3] + 1.0 || o[3] < rect[1] - 1.0)).then_some((i, o[1] - 1.0, o[3] + 1.0))
                 })
                 .collect();
-            let height = &mut cas.height;
-            for i in hit {
-                let c = &scene.clusters[i];
-                for t in c.first_tri..c.first_tri + c.tri_count {
-                    let ps = scene.tri_pos(c, t);
-                    let v = [0, 1, 2].map(|k| {
-                        let p = ps[k];
-                        let (x, y) = to_tex(p);
-                        Vec4::new(x, y, (p - centre).dot(d), 0.0)
-                    });
-                    tris += fill_max(height, res, v[0], v[1], v[2], rect) as u64;
-                }
-            }
+            let project = |p: Vec3| {
+                let (x, y) = to_tex(p);
+                Vec4::new(x, y, (p - centre).dot(d), 0.0)
+            };
+            tris += draw_bands(&mut cas.height, res, (rect[1] as usize, rect[3] as usize), (rect[0], rect[2]), &hit, scene, project);
         }
         tris
     }
@@ -315,6 +301,59 @@ impl SunShadow {
 /// Rasterise a triangle (x, y in texels, z the height) keeping the largest
 /// height, inside `clip` (x0, y0, x1, y1 inclusive); whether it touched
 /// any texel.
+/// Draw clusters `drawn` (index, and the first and last row they can
+/// cover) into rows `rows` (inclusive) and columns `cols` of a `res`
+/// square map, keeping the largest height: the rows cut in bands, each
+/// filled by one thread with what covers it, so no copy of the map is made
+/// or merged. `project` takes a point to texels and height. Returns the
+/// triangles that covered a texel (once per band).
+fn draw_bands(height: &mut [f32], res: usize, rows: (usize, usize), cols: (f32, f32), drawn: &[(usize, f32, f32)], scene: &Scene, project: impl Fn(Vec3) -> Vec4 + Sync) -> u64 {
+    const BAND: usize = 32;
+    height[rows.0 * res..(rows.1 + 1) * res]
+        .par_chunks_mut(BAND * res)
+        .enumerate()
+        .map(|(b, buf)| {
+            let y0 = rows.0 + b * BAND;
+            let n_rows = buf.len() / res;
+            let (fy0, fy1) = (y0 as f32, (y0 + n_rows) as f32);
+            let mut n = 0u64;
+            for &(i, lo, hi) in drawn {
+                if hi < fy0 || lo > fy1 {
+                    continue;
+                }
+                let c = &scene.clusters[i];
+                for t in c.first_tri..c.first_tri + c.tri_count {
+                    // Rows of this band count from 0 in its own slice.
+                    let v = scene.tri_pos(c, t).map(|p| {
+                        let q = project(p);
+                        Vec4::new(q.x, q.y - fy0, q.z, 0.0)
+                    });
+                    n += fill_max_rows(buf, res, n_rows, cols, v[0], v[1], v[2]) as u64;
+                }
+            }
+            n
+        })
+        .sum()
+}
+
+/// `fill_max` into a band of `rows` rows, `res` texels wide, coordinates
+/// relative to the band, inside columns `cols`.
+fn fill_max_rows(buf: &mut [f32], res: usize, rows: usize, cols: (f32, f32), a: Vec4, b: Vec4, c: Vec4) -> bool {
+    let area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+    if area == 0.0 || !area.is_finite() {
+        return false;
+    }
+    let x0 = a.x.min(b.x).min(c.x).floor().max(0.0).max(cols.0);
+    let y0 = a.y.min(b.y).min(c.y).floor().max(0.0);
+    let x1 = a.x.max(b.x).max(c.x).ceil().min(res as f32 - 1.0).min(cols.1);
+    let y1 = a.y.max(b.y).max(c.y).ceil().min(rows as f32 - 1.0);
+    if x0 > x1 || y0 > y1 {
+        return false;
+    }
+    crate::simd::fill_max(buf, res, (a.x, a.y, a.z), (b.x, b.y, b.z), (c.x, c.y, c.z), x0 as usize, x1 as usize, y0 as usize, y1 as usize, 1.0 / area)
+}
+
+#[cfg(test)]
 fn fill_max(buf: &mut [f32], res: usize, a: Vec4, b: Vec4, c: Vec4, clip: [f32; 4]) -> bool {
     let rs = res as f32;
     let area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
@@ -383,5 +422,57 @@ mod tests {
         }
         assert_eq!(low.lit(Vec3::new(-1.0, 0.0, 0.0), Vec3::Y), 0.0);
         assert_eq!(low.lit(Vec3::new(1.0, 0.0, 0.0), Vec3::Y), 1.0);
+    }
+
+    /// The map drawn in bands is the map drawn whole.
+    #[test]
+    fn bands_draw_what_the_whole_map_draws() {
+        let (p, idx) = crate::scene::tests::uv_sphere(40);
+        let mut s = Scene::new();
+        for k in 0..6 {
+            let at = Vec3::new(k as f32 * 1.7 - 4.0, 0.5 + k as f32 * 0.3, (k as f32 * 1.3).sin() * 3.0);
+            let q: Vec<Vec3> = p.iter().map(|v| *v * (0.4 + k as f32 * 0.2) + at).collect();
+            s.push_mesh(&q, &[], &[], &idx);
+        }
+        let dir = Vec3::new(0.4, 0.8, -0.3).normalize();
+        let res = 256;
+        // Off the origin, so the cascade's centre counts.
+        let centre = Vec3::new(1.5, 0.3, -0.7);
+        let m = SunShadow::build(&s, dir, centre, &[6.0], res);
+        let c = &m.cascades[0];
+        let mut want = vec![f32::NEG_INFINITY; res * res];
+        for cl in &s.clusters {
+            for t in cl.first_tri..cl.first_tri + cl.tri_count {
+                let v = s.tri_pos(cl, t).map(|q| q - centre).map(|q| Vec4::new((q.dot(m.right) / c.half * 0.5 + 0.5) * res as f32, (q.dot(m.up) / c.half * 0.5 + 0.5) * res as f32, q.dot(m.dir), 0.0));
+                fill_max(&mut want, res, v[0], v[1], v[2], [0.0, 0.0, f32::INFINITY, f32::INFINITY]);
+            }
+        }
+        let differ = c.height.iter().zip(&want).filter(|(a, b)| a != b).count();
+        assert_eq!(differ, 0, "{differ} texels differ");
+    }
+
+    /// Drawing again where an object was and is gives the map drawn fresh.
+    #[test]
+    fn redrawing_where_something_moved_matches_a_fresh_map() {
+        let (p, idx) = crate::scene::tests::uv_sphere(24);
+        let mut s = Scene::new();
+        let quad = |c: Vec3, h: f32| [c + Vec3::new(-h, 0.0, h), c + Vec3::new(h, 0.0, h), c + Vec3::new(h, 0.0, -h), c + Vec3::new(-h, 0.0, -h)];
+        s.push_mesh(&quad(Vec3::ZERO, 8.0), &[], &[], &[0, 1, 2, 0, 2, 3]);
+        let first = s.clusters.len();
+        let ball: Vec<Vec3> = p.iter().map(|v| *v * 0.8 + Vec3::new(0.0, 1.0, 0.0)).collect();
+        s.push_mesh(&ball, &[], &[], &idx);
+        let o = s.add_object("ball".into(), first..s.clusters.len(), Vec3::ZERO, Vec3::ZERO);
+        let dir = Vec3::new(0.3, 0.9, 0.2).normalize();
+        let centre = Vec3::new(0.5, 0.0, -0.5);
+        let mut m = SunShadow::build(&s, dir, centre, &[5.0, 50.0], 512);
+        let from = s.object_bounds(o);
+        s.set_object(o, Vec3::new(2.0, 0.5, 1.0), Vec3::new(0.0, 0.7, 0.0), 1.3);
+        let to = s.object_bounds(o);
+        m.redraw(&s, &[from, to]);
+        let fresh = SunShadow::build(&s, dir, centre, &[5.0, 50.0], 512);
+        for (a, b) in m.cascades.iter().zip(&fresh.cascades) {
+            let differ = a.height.iter().zip(&b.height).filter(|(x, y)| x != y).count();
+            assert_eq!(differ, 0);
+        }
     }
 }
