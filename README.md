@@ -520,7 +520,9 @@ With the T-rex and the car, 1280 x 720, everything on: 2,523 MB
 - `--bench-move` (with `--png`) moves the first model 10 cm along X five
   times, as a drag would, times each frame, lets go, and writes
   `<out>_moved.png`. `--relight-on-move` throws away every shadow map and
-  all shading when an object moves instead, to compare.
+  all shading when an object moves instead, to compare. Each step gives
+  the triangles drawn and the points shaded, so `--moving-rate 1
+  --moving-detail 1` shows what drawing the moving model coarser saves.
 
 The window title shows the frame rate, the selected light's lumens,
 position and reach, the sky, whether visibility was kept from the last
@@ -626,8 +628,19 @@ with egui, on the CPU like everything else: egui's triangles are filled by
   then Z, as Maya's xyz order), uniform scale, triangles,
   levels of detail and size; a light's position, lumens and colour; the
   sun's time and brightness; the sky's illuminance, both contrasts and the
-  exposure; the render settings (micropolygon spacing, resolution, shadows,
-  bounce, the visual debug views) with the last frame's numbers.
+  exposure; the render settings (micropolygon spacing, frame size,
+  how much coarser a moving object is drawn, shadows, bounce, the visual
+  debug views) with the last frame's numbers.
+- **Frame size**: 1920 x 1080 at start, whatever the window's size, shown
+  as large as fits in the viewport with bars round it; Custom takes a
+  width and height; Viewport pixels follows the viewport, times the
+  resolution percentage, as the plain window does.
+- **While an object moves** (manipulator or attribute editor), it is
+  drawn with micropolygons "Moving: micropolygons" times further apart
+  (3 at start) and a level of detail allowed "Moving: geometry error"
+  times the error (3 at start); it is drawn in full once it is let go.
+  1 turns either off. `--moving-rate K`, `--moving-detail K` set them
+  for the plain window and `--bench-move`.
 - **Timeline** along the bottom: the day from 0 to 24 h, night shaded,
   the time a red mark. Click or drag to set it; Play runs the day at 1 or
   10 minutes, or 1 or 3 hours, a second. The time sets the sun, the sky and

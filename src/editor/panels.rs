@@ -3,7 +3,7 @@
 use glam::Vec3;
 
 use super::importer::{metres, thousands};
-use super::{Editor, Inspect};
+use super::{Editor, FrameSize, Inspect};
 use crate::lights::{self, LIGHT_COLOURS};
 use crate::{raster, scene, Selection};
 
@@ -407,19 +407,60 @@ impl Editor {
                 self.app.point_budget = None;
             }
             ui.end_row();
-            ui.label("Resolution");
-            let mut pct = self.app.render_scale * 100.0;
-            if ui.add(egui::Slider::new(&mut pct, 6.25..=100.0).suffix(" %").max_decimals(0)).changed() {
-                self.app.render_scale = pct / 100.0;
-                self.app.point_budget = None;
-                refit = true;
-            }
+            ui.label("Frame size");
+            let mut size = self.frame_size;
+            let text = |f: FrameSize| match f {
+                FrameSize::Hd => "1920 x 1080".to_string(),
+                FrameSize::Custom(..) => "Custom".to_string(),
+                FrameSize::Viewport => "Viewport pixels".to_string(),
+            };
+            egui::ComboBox::from_id_salt("frame size").selected_text(text(size)).show_ui(ui, |ui| {
+                let (w, h) = (self.app.frame.width, self.app.frame.height);
+                let custom = match size {
+                    FrameSize::Custom(..) => size,
+                    _ => FrameSize::Custom(w, h),
+                };
+                for f in [FrameSize::Hd, custom, FrameSize::Viewport] {
+                    ui.selectable_value(&mut size, f, text(f));
+                }
+            });
             ui.end_row();
+            if let FrameSize::Custom(mut w, mut h) = size {
+                ui.label("");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut w).range(16..=8192).speed(4.0));
+                    ui.label("x");
+                    ui.add(egui::DragValue::new(&mut h).range(16..=8192).speed(4.0));
+                });
+                ui.end_row();
+                size = FrameSize::Custom(w, h);
+            }
+            if size != self.frame_size {
+                self.set_frame_size(size);
+            }
+            if size == FrameSize::Viewport {
+                ui.label("Resolution");
+                let mut pct = self.app.render_scale * 100.0;
+                if ui.add(egui::Slider::new(&mut pct, 6.25..=100.0).suffix(" %").max_decimals(0)).changed() {
+                    self.app.render_scale = pct / 100.0;
+                    self.app.point_budget = None;
+                    refit = true;
+                }
+                ui.end_row();
+            }
             ui.label("");
             if ui.add_enabled(self.plan_budget.is_some() && self.app.point_budget.is_none(), egui::Button::new("Fit to this machine")).clicked() {
                 self.app.point_budget = self.plan_budget;
                 refit = true;
             }
+            ui.end_row();
+            ui.label("Moving: micropolygons");
+            ui.add(egui::Slider::new(&mut self.app.settings.moving_rate, 1.0..=8.0).logarithmic(true).prefix("x ").suffix(" apart").max_decimals(1))
+                .on_hover_text("While an object is moved, its micropolygons are this many times further apart. 1: as when still.");
+            ui.end_row();
+            ui.label("Moving: geometry error");
+            ui.add(egui::Slider::new(&mut self.app.settings.moving_detail, 1.0..=8.0).logarithmic(true).prefix("x ").max_decimals(1))
+                .on_hover_text("While an object is moved, its level of detail may show this many times the error. 1: as when still.");
             ui.end_row();
             ui.label("Shadows");
             ui.checkbox(&mut self.app.settings.shadows, "");

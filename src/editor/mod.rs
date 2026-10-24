@@ -42,6 +42,27 @@ pub enum Inspect {
     Render,
 }
 
+/// How big the viewport's frame is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrameSize {
+    /// 1920 x 1080, whatever the window's size.
+    Hd,
+    /// Width and height set by hand.
+    Custom(usize, usize),
+    /// The viewport's own pixels, times the resolution percentage.
+    Viewport,
+}
+
+impl FrameSize {
+    pub fn pixels(self) -> Option<(usize, usize)> {
+        match self {
+            FrameSize::Hd => Some((1920, 1080)),
+            FrameSize::Custom(w, h) => Some((w.max(16), h.max(16))),
+            FrameSize::Viewport => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Purpose {
     Open,
@@ -76,6 +97,7 @@ pub struct Editor {
     pub quit: bool,
     /// The point budget the machine's plan gave, to go back to.
     plan_budget: Option<f64>,
+    pub frame_size: FrameSize,
 }
 
 impl Editor {
@@ -88,6 +110,8 @@ impl Editor {
         });
         let plan_budget = app.point_budget;
         let last_selection = app.selection;
+        let mut app = app;
+        app.frame_size = FrameSize::Hd.pixels();
         Editor {
             app,
             ctx,
@@ -107,6 +131,17 @@ impl Editor {
             size: (0, 0),
             quit: false,
             plan_budget,
+            frame_size: FrameSize::Hd,
+        }
+    }
+
+    /// Use frame size `f`, from the next frame.
+    pub fn set_frame_size(&mut self, f: FrameSize) {
+        self.frame_size = f;
+        self.app.frame_size = f.pixels();
+        let (ow, oh) = self.app.output;
+        if ow > 0 && oh > 0 {
+            self.app.fit_frame(ow, oh);
         }
     }
 
@@ -167,6 +202,13 @@ impl Editor {
         if vw == 0 || vh == 0 || fw == 0 || fh == 0 || vx + vw > w || vy + vh > h {
             return;
         }
+        // Bars round a frame of its own size.
+        let (sx, sy, sw, sh) = self.app.shown();
+        if (sx, sy, sw, sh) != (0, 0, vw, vh) {
+            const BAR: u32 = 0x0018_1818;
+            self.buf[vy * w..(vy + vh) * w].par_chunks_mut(w).for_each(|row| row[vx..vx + vw].fill(BAR));
+        }
+        let (vx, vy, vw, vh) = (vx + sx, vy + sy, sw.min(vw - sx), sh.min(vh - sy));
         let xs: Vec<usize> = (0..vw).map(|x| (x * fw / vw).min(fw - 1)).collect();
         let src = &f.color;
         self.buf[vy * w..(vy + vh) * w].par_chunks_mut(w).enumerate().for_each(|(y, row)| {
@@ -195,8 +237,8 @@ impl Editor {
 
     pub fn view_cursor(&mut self, x: f32, y: f32) {
         if self.captured.iter().any(|b| *b) || self.on_view(x, y) {
-            let (vx, vy, _, _) = self.view;
-            self.app.on_cursor(x - vx as f32, y - vy as f32);
+            let (vx, vy) = self.frame_origin();
+            self.app.on_cursor(x - vx, y - vy);
         }
     }
 
@@ -204,8 +246,8 @@ impl Editor {
         if pressed {
             if self.on_view(x, y) {
                 self.captured[idx] = true;
-                let (vx, vy, _, _) = self.view;
-                self.app.on_cursor(x - vx as f32, y - vy as f32);
+                let (vx, vy) = self.frame_origin();
+                self.app.on_cursor(x - vx, y - vy);
                 self.app.on_button(idx, true);
                 self.sync_selection();
             }
@@ -213,6 +255,13 @@ impl Editor {
             self.captured[idx] = false;
             self.app.on_button(idx, false);
         }
+    }
+
+    /// Where the frame's top left corner is in the window.
+    fn frame_origin(&self) -> (f32, f32) {
+        let (vx, vy, _, _) = self.view;
+        let (sx, sy, _, _) = self.app.shown();
+        ((vx + sx) as f32, (vy + sy) as f32)
     }
 
     pub fn view_wheel(&mut self, steps: f32, x: f32, y: f32) {
@@ -716,6 +765,7 @@ mod tests {
         let mut ed = Editor::new(crate::tests::ball_app());
         ed.app.point_budget = None;
         ed.app.render_scale = 1.0;
+        ed.set_frame_size(FrameSize::Viewport);
         ed
     }
 
@@ -753,6 +803,34 @@ mod tests {
         ed.view_button(0, true, 20.0, 300.0);
         ed.view_button(0, false, 20.0, 300.0);
         assert_eq!(ed.app.selection, Selection::Nothing);
+    }
+
+    /// At 1920 x 1080 the frame keeps its size as the window changes, is
+    /// shown as large as fits with bars round it, and the pointer still
+    /// lands on what is under it.
+    #[test]
+    fn a_1080p_frame_keeps_its_size_and_takes_the_mouse() {
+        let mut ed = editor();
+        ed.set_frame_size(FrameSize::Hd);
+        for (w, h) in [(1100, 700), (1400, 600)] {
+            for _ in 0..2 {
+                ed.frame(raw(w, h), w, h);
+            }
+            assert_eq!((ed.app.frame.width, ed.app.frame.height), (1920, 1080));
+            let (vx, vy, vw, vh) = ed.view;
+            let (sx, sy, sw, sh) = ed.app.shown();
+            assert!(sx + sw <= vw && sy + sh <= vh && (sw == vw || sh == vh), "{:?} in {:?}", (sx, sy, sw, sh), ed.view);
+            assert!(((sw as f32 / sh as f32) - 16.0 / 9.0).abs() < 0.02);
+            ed.app.selection = Selection::Nothing;
+            let (mx, my) = ((vx + sx + sw / 2) as f32, (vy + sy + sh / 2) as f32);
+            ed.view_cursor(mx, my);
+            ed.view_button(0, true, mx, my);
+            ed.view_button(0, false, mx, my);
+            assert_eq!(ed.app.selection, Selection::Object(0), "window {w} x {h}");
+        }
+        ed.set_frame_size(FrameSize::Custom(640, 480));
+        ed.frame(raw(1100, 700), 1100, 700);
+        assert_eq!((ed.app.frame.width, ed.app.frame.height), (640, 480));
     }
 
     /// Moving an object from the attribute editor moves its group's

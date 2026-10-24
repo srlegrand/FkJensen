@@ -351,6 +351,8 @@ struct VisKey {
     cull: bool,
     wireframe: bool,
     lod_px: u32,
+    /// The clusters drawn coarser while they move, and how much.
+    moving: u64,
 }
 
 static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
@@ -395,6 +397,9 @@ pub struct Renderer {
     frame_no: u64,
     /// The shading rate is multiplied by this to fit the cache budget.
     rate_scale: f32,
+    /// Clusters of the object being moved: drawn and shaded coarser
+    /// (`RenderSettings::moving_rate`, `moving_detail`) until it settles.
+    moving: Vec<std::ops::Range<usize>>,
     /// Each sample's share of the sky, for the sky contrast it was made for.
     sky_share: Option<(SkyShare, u32)>,
     /// Each surfel's share of the sky, for the shares above.
@@ -487,9 +492,16 @@ impl Renderer {
             base_view: None,
             frame_no: 0,
             rate_scale: 1.0,
+            moving: Vec::new(),
             sky_share: None,
             surfel_share: Vec::new(),
         }
+    }
+
+    /// The clusters of the object being moved, drawn and shaded coarser
+    /// until this is called with none (the object settled).
+    pub fn set_moving(&mut self, clusters: Vec<std::ops::Range<usize>>) {
+        self.moving = clusters;
     }
 
     /// For tests: in which frame each cluster's bounce light was last
@@ -536,6 +548,19 @@ impl Renderer {
             }
         }
         self.vis_key = None;
+    }
+
+    /// What the coarser drawing of moving clusters depends on, for the
+    /// visibility key.
+    fn moving_key(&self, settings: &RenderSettings) -> u64 {
+        use std::hash::{Hash, Hasher};
+        if self.moving.is_empty() {
+            return 0;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.moving.hash(&mut h);
+        settings.moving_detail.to_bits().hash(&mut h);
+        h.finish() | 1
     }
 
     pub fn memory(&self) -> usize {
@@ -866,7 +891,7 @@ impl Renderer {
         frame.stats.bounce_ms = tb.elapsed().as_secs_f32() * 1000.0;
 
         // Visibility, unless the camera and the frame are as they were.
-        let vk = VisKey { occlusion: settings.occlusion, tile: settings.tile, view: cam.view, proj: cam.proj, size: (frame.width, frame.height), cull: settings.cull_backfaces, wireframe: settings.wireframe, lod_px: settings.lod_px().to_bits() };
+        let vk = VisKey { occlusion: settings.occlusion, tile: settings.tile, view: cam.view, proj: cam.proj, size: (frame.width, frame.height), cull: settings.cull_backfaces, wireframe: settings.wireframe, lod_px: settings.lod_px().to_bits(), moving: self.moving_key(settings) };
         if self.vis_key == Some(vk) && frame.vis_stamp == self.vis_stamp && self.vis_stamp != 0 {
             frame.stats.visibility_kept = true;
             frame.stats.clusters_in = scene.clusters.len();
@@ -878,7 +903,7 @@ impl Renderer {
             // What owned a pixel last frame is drawn first, to hide the rest
             // behind.
             let prev = (settings.occlusion && self.need.len() == scene.clusters.len()).then_some(&self.need[..]);
-            self.levels = raster::visibility(scene, cam, settings.cull_backfaces, settings.wireframe, settings.tile, settings.lod_px(), prev, frame);
+            self.levels = raster::visibility(scene, cam, settings.cull_backfaces, settings.wireframe, settings.tile, settings.lod_px(), (&self.moving, settings.moving_detail), prev, frame);
             self.vis_key = Some(vk);
             self.vis_stamp = NEXT_STAMP.fetch_add(1, Ordering::Relaxed);
             frame.vis_stamp = self.vis_stamp;
@@ -910,7 +935,9 @@ impl Renderer {
         let interpolated = AtomicU64::new(0);
         let vp = cam.proj * cam.view;
         let (near, size) = (cam.near, (frame.width, frame.height));
-        let rate = settings.shading_rate_px.max(0.25) * self.rate_scale;
+        let still_rate = settings.shading_rate_px.max(0.25) * self.rate_scale;
+        let moving_rate = still_rate * settings.moving_rate.max(1.0);
+        let moving = &self.moving;
         if settings.view == View::Shaded {
             self.cache.par_iter_mut().enumerate().for_each(|(ci, e)| {
                 let need_tris = need[ci];
@@ -919,6 +946,7 @@ impl Renderer {
                 }
                 let c = &scene.clusters[ci];
                 let fv = c.first_vertex as usize;
+                let rate = if moving.iter().any(|r| r.contains(&ci)) { moving_rate } else { still_rate };
                 e.seen = frame_no;
                 if e.state.len() != c.tri_count as usize {
                     e.init(c.tri_count as usize, c.vertex_count as usize);
@@ -2430,6 +2458,48 @@ mod tests {
         r.render(&scene, &cam, &lights, &settings, &mut f);
         render(&scene, &cam, &lights, &settings, &mut fresh);
         assert!(worst(&f, &fresh) <= 1, "after the sky changed: {}", worst(&f, &fresh));
+    }
+
+    /// While an object moves its micropolygons are further apart, the rest
+    /// is shaded as before, and once it settles the picture is a fresh
+    /// render's.
+    #[test]
+    fn a_moving_object_is_shaded_coarser_until_it_settles() {
+        let (mut scene, lights) = world();
+        let (p, idx) = crate::scene::tests::uv_sphere(24);
+        let first = scene.clusters.len();
+        let ball: Vec<Vec3> = p.iter().map(|v| *v * 0.3 + Vec3::new(0.0, 0.6, 0.0)).collect();
+        scene.push_mesh(&ball, &[], &[Vec3::new(0.8, 0.3, 0.2)], &idx);
+        let n = scene.clusters.len();
+        scene.add_object("ball".into(), first..n, Vec3::new(0.0, 0.3, 0.0), Vec3::ZERO);
+        let (w, h) = (200, 112);
+        let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.6, 0.0), 2.0, 0.15);
+        let settings = RenderSettings { adaptive: false, shading_rate_px: 1.0, ..RenderSettings::new(Sky::new(30.0, true)) };
+        let ball_points = |r: &Renderer| -> usize { r.cache[first..n].iter().map(|e| e.diced.2 as usize).sum() };
+        let mut r = Renderer::new();
+        let mut f = Frame::new(w, h);
+        r.render(&scene, &cam, &lights, &settings, &mut f);
+        let still = ball_points(&r);
+        let mut step = |r: &mut Renderer, x: f32| {
+            let from = scene.object_bounds(0);
+            scene.set_object(0, Vec3::new(x, 0.3, 0.0), Vec3::ZERO, 1.0);
+            let to = scene.object_bounds(0);
+            r.moved(first..n, from, to, false);
+            r.set_moving(vec![first..n]);
+        };
+        step(&mut r, 0.05);
+        r.render(&scene, &cam, &lights, &settings, &mut f);
+        let moving = ball_points(&r);
+        assert!(moving * 4 < still, "{moving} points on the ball moving, {still} still");
+        // Settled.
+        r.set_moving(Vec::new());
+        let b = scene.object_bounds(0);
+        r.moved(first..n, b, b, true);
+        r.render(&scene, &cam, &lights, &settings, &mut f);
+        assert!(ball_points(&r) * 10 > still * 9, "{} points settled, {still} before", ball_points(&r));
+        let mut fresh = Frame::new(w, h);
+        render(&scene, &cam, &lights, &settings, &mut fresh);
+        assert!(worst(&f, &fresh) <= 1, "settled: {}", worst(&f, &fresh));
     }
 
     /// A card between a light and the floor darkens the floor under it.

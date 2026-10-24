@@ -365,7 +365,18 @@ pub struct RenderSettings {
     /// Directional lights: parallel light like the sun's, but only on the
     /// scene, not the sky.
     pub dir_lights: [DirLight; MAX_DIR_LIGHTS],
+    /// While an object is being moved, its micropolygons are this many
+    /// times further apart than `shading_rate_px` (1: as when still).
+    pub moving_rate: f32,
+    /// While an object is being moved, the geometric error its level of
+    /// detail may show is this many times `lod_px` (1: as when still).
+    pub moving_detail: f32,
 }
+
+/// Default `RenderSettings::moving_rate`.
+pub const MOVING_RATE: f32 = 3.0;
+/// Default `RenderSettings::moving_detail`.
+pub const MOVING_DETAIL: f32 = 3.0;
 
 /// Shading cache budget when the machine's plan does not set one.
 pub const CACHE_BUDGET: usize = if cfg!(target_pointer_width = "64") { 1 << 30 } else { 16 << 20 };
@@ -378,7 +389,7 @@ impl RenderSettings {
     }
 
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: true, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true, sky_occlusion: true, dir_lights: [DirLight::default(); MAX_DIR_LIGHTS] }
+        Self { cull_backfaces: true, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true, sky_occlusion: true, dir_lights: [DirLight::default(); MAX_DIR_LIGHTS], moving_rate: MOVING_RATE, moving_detail: MOVING_DETAIL }
     }
 }
 
@@ -612,7 +623,8 @@ pub const HIZ_BLOCK: usize = 4;
 ///
 /// Of clusters with levels of detail, only those whose error looks no
 /// bigger than `lod_px` pixels and whose replacement's does are drawn
-/// (`Cluster::lod_drawn`).
+/// (`Cluster::lod_drawn`); `lod_px * moving_detail` for the clusters in
+/// `moving`.
 ///
 /// Occlusion culling in two passes (as Nanite does): the clusters that
 /// owned a pixel last frame (`prev`, one entry per cluster, non-zero when
@@ -624,7 +636,7 @@ pub const HIZ_BLOCK: usize = 4;
 /// less useful. Without `prev` (the first frame) everything is drawn in
 /// one pass.
 #[allow(clippy::too_many_arguments)]
-pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile: usize, lod_px: f32, prev: Option<&[u128]>, frame: &mut Frame) -> Vec<u8> {
+pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile: usize, lod_px: f32, moving: (&[std::ops::Range<usize>], f32), prev: Option<&[u128]>, frame: &mut Frame) -> Vec<u8> {
     // The last frame's setup records go before the new ones are made: with
     // the high-resolution T-rex they are about 1 GB.
     frame.setups = Vec::new();
@@ -643,7 +655,8 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile
         .into_par_iter()
         .filter(|&i| {
             let c = &scene.clusters[i as usize];
-            c.lod_drawn(lod_px, &lod_scale) && !cluster_hidden(c, &planes, eye, cull)
+            let px = if moving.0.iter().any(|r| r.contains(&(i as usize))) { lod_px * moving.1.max(1.0) } else { lod_px };
+            c.lod_drawn(px, &lod_scale) && !cluster_hidden(c, &planes, eye, cull)
         })
         .collect();
     let prev = prev.filter(|p| p.len() == scene.clusters.len());

@@ -223,8 +223,10 @@ struct App {
     quit: bool,
     /// Size of what the frame is shown on (window or framebuffer).
     output: (usize, usize),
-    /// When set, the render scale follows the output size so that a frame
-    /// holds about this many pixels (from the machine's plan).
+    /// A frame of this many pixels whatever the output's size, shown as
+    /// large as fits inside it; None: the frame follows the output
+    /// (`render_scale`).
+    frame_size: Option<(usize, usize)>,
     /// Shading points a window frame may take, from the machine's plan:
     /// the micropolygon spacing and render scale follow it as the window
     /// is resized. None once either is set by hand.
@@ -279,6 +281,7 @@ impl App {
             alt: false,
             quit: false,
             output: (0, 0),
+            frame_size: None,
             point_budget: None,
             renderer: reyes::Renderer::new(),
             wide: true,
@@ -475,13 +478,17 @@ impl App {
         let from = self.scene.object_bounds(i);
         self.scene.set_object(i, pivot, rotation, scale);
         let to = self.scene.object_bounds(i);
-        for r in self.scene.moving_clusters(i) {
-            self.renderer.moved(r, from, to, false);
+        let moving = self.scene.moving_clusters(i);
+        for r in &moving {
+            self.renderer.moved(r.clone(), from, to, false);
         }
+        // Drawn and shaded coarser until it settles.
+        self.renderer.set_moving(moving);
     }
 
     /// Object `i` stopped moving: bounce light is made again.
     fn object_settled(&mut self, i: usize) {
+        self.renderer.set_moving(Vec::new());
         let b = self.scene.object_bounds(i);
         for r in self.scene.moving_clusters(i) {
             self.renderer.moved(r, b, b, true);
@@ -757,6 +764,18 @@ impl App {
         }
     }
 
+    /// Where the frame is shown in the output, in output pixels: x, y,
+    /// width, height. All of it unless the frame has a size of its own.
+    fn shown(&self) -> (usize, usize, usize, usize) {
+        let (ow, oh) = self.output;
+        if self.frame_size.is_none() {
+            return (0, 0, ow, oh);
+        }
+        let k = 1.0 / self.render_scale.max(1e-6);
+        let (w, h) = (((self.frame.width as f32 * k).round() as usize).clamp(1, ow.max(1)), ((self.frame.height as f32 * k).round() as usize).clamp(1, oh.max(1)));
+        ((ow.saturating_sub(w)) / 2, (oh.saturating_sub(h)) / 2, w, h)
+    }
+
     /// The cursor moved to (x, y) in output pixels.
     fn on_cursor(&mut self, x: f32, y: f32) {
         self.raw_mouse = (x, y);
@@ -824,8 +843,20 @@ impl App {
 
     /// Size the frame for an output of `ow` x `oh` pixels: micropolygon
     /// spacing, then render scale, follow the point budget unless set by
-    /// hand.
+    /// hand. With a fixed frame size only the spacing follows it, and the
+    /// render scale is the frame's pixels per output pixel where it is
+    /// shown.
     fn fit_frame(&mut self, ow: usize, oh: usize) {
+        if let Some((fw, fh)) = self.frame_size {
+            let (fw, fh) = (fw.max(1), fh.max(1));
+            if let Some(b) = self.point_budget {
+                self.settings.shading_rate_px = hardware::window_rate(b, fw * fh).0;
+            }
+            let k = (ow.max(1) as f32 / fw as f32).min(oh.max(1) as f32 / fh as f32);
+            self.render_scale = 1.0 / k;
+            self.frame.resize(fw, fh);
+            return;
+        }
         if let Some(b) = self.point_budget {
             let (r, scale) = hardware::window_rate(b, ow * oh);
             self.settings.shading_rate_px = r;
@@ -1222,6 +1253,7 @@ fn main() {
     let mut hardware_only = false;
     let mut scale: Option<f32> = None;
     let mut shading_rate: Option<f32> = None;
+    let mut moving: (Option<f32>, Option<f32>) = (None, None);
     let mut bench_drag = false;
     let mut bench_orbit = false;
     let mut use_fb = false;
@@ -1322,6 +1354,19 @@ fn main() {
                 }
                 i += 1;
             }
+            "--moving-rate" | "--moving-detail" => {
+                let v = args.get(i + 1).and_then(|s| s.parse::<f32>().ok()).filter(|r| *r >= 1.0 && *r <= 16.0);
+                if v.is_none() {
+                    eprintln!("{} takes a factor, 1 to 16, e.g. 3 (1: as when still)", args[i]);
+                    std::process::exit(2);
+                }
+                if args[i] == "--moving-rate" {
+                    moving.0 = v;
+                } else {
+                    moving.1 = v;
+                }
+                i += 1;
+            }
             "--scale" => {
                 scale = args.get(i + 1).and_then(|s| s.parse().ok());
                 if scale.is_none() {
@@ -1372,7 +1417,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--moving-rate K] [--moving-detail K] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1485,6 +1530,12 @@ fn main() {
     if let Some(v) = scale {
         app.render_scale = v.clamp(0.0625, 1.0);
         app.point_budget = None;
+    }
+    if let Some(k) = moving.0 {
+        app.settings.moving_rate = k;
+    }
+    if let Some(k) = moving.1 {
+        app.settings.moving_detail = k;
     }
     if let Some(r) = shading_rate {
         app.settings.shading_rate_px = r;
@@ -1690,6 +1741,7 @@ fn main() {
         if bench_move && !app.scene.objects.is_empty() {
             // Move the first model 10 cm at a time, as a drag would.
             app.settings.bounce_budget_ms = Some(30.0);
+            eprintln!("moving {}", app.scene.objects[0].name);
             for step in 1..=5 {
                 let o = app.scene.objects[0].clone();
                 app.move_object(0, o.pivot + Vec3::new(0.1, 0.0, 0.0), o.rotation, o.scale);
@@ -1697,15 +1749,17 @@ fn main() {
                 app.render();
                 let s = app.frame.stats;
                 eprintln!(
-                    "move step {step}: {:.1} ms: shadows {:.1} ms ({} maps drawn again in part or whole, {} triangles), {} clusters lit again, visibility {:.1} ms, shade {:.1} ms ({} points), gather {:.1} ms, resolve {:.1} ms",
+                    "move step {step}: {:.1} ms: shadows {:.1} ms ({} maps drawn again in part or whole, {} triangles), {} clusters lit again, visibility {:.1} ms ({} triangles drawn), shade {:.1} ms ({} points shaded of {} used), gather {:.1} ms, resolve {:.1} ms",
                     t.elapsed().as_secs_f32() * 1000.0,
                     s.shadow_ms,
                     s.shadow_maps_built,
                     s.shadow_tris,
                     s.clusters_relit,
                     s.setup_ms + s.bin_ms + s.raster_ms,
+                    s.tris_drawn,
                     s.shade_ms,
                     s.points_shaded,
+                    s.points_used,
                     s.gather_ms,
                     s.resolve_ms
                 );
