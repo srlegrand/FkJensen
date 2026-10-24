@@ -124,7 +124,12 @@ whatever their triangles (`src/samples.rs`): 15 cm apart on objects, and
 on the rest (the ground) from 15 cm next to an object growing by a
 quarter of the distance from it, since bounce light changes near things
 and little across open ground; a cluster smaller than its spacing gets
-one. A receiver walks the tree nearest first, taking
+one. An object gets 6,000 receivers at most, spread wider when its
+surface is larger (a tree's leaf cards), and its surfels come from the
+level of detail whose error is under 0.4% of its size: gathering is the
+cost, receiver by receiver, and a forest of instances would otherwise
+take minutes to gather. 25 instances of an 8 m tree: 407,000 receivers
+gathered in 119 s before, 192,000 in 56 s after, on 2 cores. A receiver walks the tree nearest first, taking
 near surfels one by one and far groups as one disc, and lays each onto a
 6 x 8 x 8 cube raster around itself: a small or far disc by its solid
 angle, a large near one by meeting each texel's direction with the disc.
