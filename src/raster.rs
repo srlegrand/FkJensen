@@ -576,6 +576,13 @@ pub fn frustum_planes(vp: Mat4, near: f32) -> [Vec4; 5] {
     [norm(r3 + r0), norm(r3 - r0), norm(r3 + r1), norm(r3 - r1), norm(r3 - Vec4::new(0.0, 0.0, 0.0, near))]
 }
 
+/// Whether a box (its eight corners) is wholly outside one of `planes`,
+/// by more than `margin` (coarser levels of detail stray a little outside
+/// the finest level's box).
+pub fn box_outside(corners: &[Vec3; 8], planes: &[Vec4], margin: f32) -> bool {
+    planes.iter().any(|p| corners.iter().all(|c| p.truncate().dot(*c) + p.w < -margin))
+}
+
 /// Whether a cluster can be skipped: outside a frustum plane, or (with
 /// back-face culling) every face turned away from the eye.
 fn cluster_hidden(c: &Cluster, planes: &[Vec4; 5], eye: Vec3, cull_backfaces: bool) -> bool {
@@ -674,10 +681,15 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile
     let eye = cam.eye;
     let lod_scale = crate::scene::perspective_scale(eye, cam.proj.y_axis.y * height as f32 * 0.5, near);
 
+    // Objects first: one wholly outside the frustum (its oriented box)
+    // takes none of its clusters along, which matters with many instances.
+    let mut runs = scene.loose_clusters();
+    runs.extend(scene.objects.iter().filter(|o| !o.clusters.is_empty() && !box_outside(&o.corners(), &planes, (o.hi - o.lo).length() * 0.02)).map(|o| o.clusters.clone()));
     // Clusters that can be seen at all: the level of detail for this view,
     // in the frustum, not all turned away.
-    let candidates: Vec<u32> = (0..scene.clusters.len() as u32)
+    let candidates: Vec<u32> = runs
         .into_par_iter()
+        .flat_map_iter(|r| r.start as u32..r.end as u32)
         .filter(|&i| {
             let c = &scene.clusters[i as usize];
             let px = match part {
@@ -718,7 +730,7 @@ pub fn visibility(scene: &Scene, cam: &Camera, cull: bool, wireframe: bool, tile
     frame.stats.clusters_drawn = level.iter().filter(|l| **l != NOT_VISIBLE).count();
     frame.stats.clusters_first = first_n;
     frame.stats.clusters_occluded = occluded;
-    frame.stats.tris_in = scene.triangle_count();
+    frame.stats.tris_in = scene.drawable_triangles();
     frame.stats.tris_drawn = setups.len();
     frame.stats.setup_ms = times[0] + (t0.elapsed().as_secs_f32() * 1000.0 - times.iter().sum::<f32>()).max(0.0);
     frame.stats.bin_ms = times[1];

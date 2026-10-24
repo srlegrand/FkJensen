@@ -88,6 +88,11 @@ pub struct ObjectEntry {
     /// How its materials differ from its asset's, in this scene.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub materials: Vec<MaterialEntry>,
+    /// An instance of an earlier entry (an index into `objects`): its
+    /// geometry, materials and texture tiles, stored once. `asset` and
+    /// `materials` are then that entry's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_of: Option<usize>,
 }
 
 /// A change to one of an object's materials: only what differs from the
@@ -431,6 +436,13 @@ pub fn build(f: &SceneFile, dir: &Path, search: &[PathBuf]) -> Result<Scene, Str
     let mut index = Vec::with_capacity(f.objects.len());
     for o in &f.objects {
         let parent = o.parent.map(|p| index[p]);
+        if let Some(k) = o.instance_of {
+            let j = *index.get(k).ok_or_else(|| format!("{}: instance_of {k} is not an earlier object", o.name))?;
+            let i = scene.instance_object(j, o.name.clone());
+            scene.objects[i].parent = parent;
+            index.push(i);
+            continue;
+        }
         match &o.asset {
             Some(a) => {
                 let mut m = match crate::world::part_of(Path::new(a)) {
@@ -487,7 +499,16 @@ pub fn save_assets(scene: &mut Scene, scene_path: &Path) -> Result<Vec<PathBuf>,
     let dir = scene_path.parent().map(Path::to_path_buf).unwrap_or_default();
     let stem = scene_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "scene".into());
     let mut written = Vec::new();
+    let mut done: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
     for i in 0..scene.objects.len() {
+        // An instance of an object already written is in its asset.
+        if let Some(g) = scene.geometry_of(i) {
+            if let Some(&j) = done.get(&g) {
+                scene.objects[i].asset = scene.objects[j].asset.clone();
+                continue;
+            }
+            done.insert(g, i);
+        }
         if scene.objects[i].clusters.is_empty() || scene.objects[i].asset.as_ref().is_some_and(|p| p.exists() || crate::world::part_of(p).is_some()) {
             continue;
         }
@@ -541,10 +562,33 @@ pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight], light_pa
     for (k, &i) in order.iter().enumerate() {
         at[i] = k;
     }
-    let objects = order
+    // An instance names the first entry with its geometry.
+    let mut first_with: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
+    let source: Vec<Option<usize>> = order
         .iter()
         .map(|&i| {
+            let g = scene.geometry_of(i)?;
+            let first = *first_with.entry(g).or_insert(i);
+            (first != i).then_some(first)
+        })
+        .collect();
+    let objects = order
+        .iter()
+        .zip(&source)
+        .map(|(&i, &src)| {
             let o = &scene.objects[i];
+            if let Some(j) = src {
+                return ObjectEntry {
+                    name: o.name.clone(),
+                    asset: None,
+                    pivot: a3(o.pivot),
+                    rotation: a3(o.rotation).map(|r| round6(r.to_degrees())),
+                    scale: round6(o.scale),
+                    parent: o.parent.filter(|&p| p < n && at[p] < at[i]).map(|p| at[p]),
+                    materials: Vec::new(),
+                    instance_of: Some(at[j]),
+                };
+            }
             ObjectEntry {
                 name: o.name.clone(),
                 asset: if o.clusters.is_empty() {
@@ -557,6 +601,7 @@ pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight], light_pa
                 scale: round6(o.scale),
                 parent: o.parent.filter(|&p| p < n && at[p] < at[i]).map(|p| at[p]),
                 materials: if o.clusters.is_empty() { Vec::new() } else { material_changes(scene, i) },
+                instance_of: None,
             }
         })
         .collect();

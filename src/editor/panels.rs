@@ -129,9 +129,18 @@ impl Editor {
         let o = &scene.objects[i];
         let kids = scene.children(Some(i));
         let sel = self.app.selection == Selection::Object(i) && self.inspect == Inspect::Selection;
-        let text = if o.clusters.is_empty() { egui::RichText::new(&o.name).italics() } else { egui::RichText::new(&o.name) };
+        let instances = scene.instances_of(i).len();
+        let text = if o.clusters.is_empty() {
+            egui::RichText::new(&o.name).italics()
+        } else if instances > 1 {
+            // An instance, as Maya shows them: in italics, and tinted.
+            egui::RichText::new(&o.name).italics().color(egui::Color32::from_rgb(150, 200, 255))
+        } else {
+            egui::RichText::new(&o.name)
+        };
         let mut row = |ui: &mut egui::Ui| {
             let r = ui.selectable_label(sel, text.clone()).interact(egui::Sense::drag());
+            let r = if instances > 1 { r.on_hover_text(format!("instanced: {instances} objects share this geometry")) } else { r };
             if r.drag_started() {
                 r.dnd_set_drag_payload(i);
             }
@@ -229,6 +238,10 @@ impl Editor {
             ui.label(if group { "group" } else { "object" });
             ui.text_edit_singleline(&mut self.app.scene.objects[i].name);
         });
+        let others = self.app.scene.instances_of(i).len().saturating_sub(1);
+        if others > 0 {
+            ui.weak(format!("Instanced: shares its geometry, materials and textures with {others} other{}; a material change shows on all.", if others > 1 { "s" } else { "" }));
+        }
         ui.add_space(4.0);
         let o = self.app.scene.objects[i].clone();
         let (mut p, mut r, mut k) = (o.pivot, o.rotation * (180.0 / std::f32::consts::PI), o.scale);

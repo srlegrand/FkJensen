@@ -1317,7 +1317,7 @@ impl Renderer {
             frame.stats.visibility_kept = true;
             frame.stats.clusters_in = scene.clusters.len();
             frame.stats.clusters_drawn = self.levels.iter().filter(|l| **l != NOT_VISIBLE).count();
-            frame.stats.tris_in = scene.triangle_count();
+            frame.stats.tris_in = scene.drawable_triangles();
             frame.stats.tris_drawn = frame.setups.len();
         } else {
             full_resolve = true;

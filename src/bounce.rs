@@ -48,6 +48,15 @@ const RECEIVER_SPACING: f32 = 0.15;
 /// from the nearest object: bounce light changes near things, and little
 /// across open ground.
 const RECEIVER_GROWTH: f32 = 0.25;
+/// Receivers an object gets at most: a big leafy one (a tree, its
+/// thousands of leaf cards) spreads them wider rather than taking more.
+/// Bounce light is soft, and gathering is the cost, receiver by receiver,
+/// so a forest of instances would otherwise take minutes.
+const MAX_OBJECT_RECEIVERS: f32 = 6000.0;
+/// An object's surfels come from the level of detail whose error is under
+/// this share of its size too (and at least `SURFEL_LOD_ERROR`): a tree
+/// gives a coarser cloud than a chess piece.
+const SURFEL_LOD_SHARE: f32 = 0.004;
 /// A receiver's light is blended over this many of its spacings.
 const RECEIVER_REACH: f32 = 2.0;
 /// The surfel cloud is made from the level of detail whose error is under
@@ -310,9 +319,14 @@ impl Bounce {
             let f = (pb - pa).cross(pc - pa);
             ((pa + pb + pc) / 3.0, f * 0.5, (scene.color(a) + scene.color(b) + scene.color(c)) / 3.0)
         };
+        // Each cluster's surfel error: its object's share, or the least.
+        let mut surfel_error = vec![SURFEL_LOD_ERROR; scene.clusters.len()];
+        for o in scene.objects.iter().filter(|o| !o.environment && !o.clusters.is_empty()) {
+            surfel_error[o.clusters.clone()].fill(((o.hi - o.lo).length() * SURFEL_LOD_SHARE).max(SURFEL_LOD_ERROR));
+        }
         for (ci, c) in scene.clusters.iter().enumerate() {
             // One level of detail only, or surfaces would be counted twice.
-            if !c.lod_drawn(1.0, |_, _| 1.0 / SURFEL_LOD_ERROR) {
+            if !c.lod_drawn(1.0, |_, _| 1.0 / surfel_error[ci]) {
                 continue;
             }
             if c.radius <= SMALL_CLUSTER {
@@ -360,7 +374,7 @@ impl Bounce {
         // of detail, whatever their triangles: RECEIVER_SPACING apart on
         // objects; on the rest, wider with distance from the nearest
         // object.
-        let at_lod = |c: &crate::scene::Cluster| c.lod_drawn(1.0, |_, _| 1.0 / SURFEL_LOD_ERROR);
+        let at_lod = |ci: usize| scene.clusters[ci].lod_drawn(1.0, |_, _| 1.0 / surfel_error[ci]);
         let mut object_of = vec![u32::MAX; scene.clusters.len()];
         let mut spheres: Vec<(Vec3, f32)> = Vec::new();
         // The ground and the mountains are open ground, objects or not.
@@ -381,6 +395,7 @@ impl Bounce {
                 (ci, v.map(|v| scene.pos(c, v)), v.map(|v| scene.normal(c, v)))
             };
             let area: f32 = (0..tris.len()).map(|k| crate::samples::tri_area(get(k).1)).sum();
+            let h = h.max((area / MAX_OBJECT_RECEIVERS).sqrt());
             let mut out: Vec<(Vec3, Vec3, f32, u32)> = crate::samples::scatter(tris.len(), get, area, h).into_iter().map(|s| (s.position, s.normal, h, s.cluster)).collect();
             if out.is_empty() && area > 0.0 {
                 // Smaller than one spacing: one receiver in its middle.
@@ -397,7 +412,7 @@ impl Bounce {
         };
         let mut recv: Vec<(Vec3, Vec3, f32, u32)> = Vec::new();
         for o in scene.objects.iter().filter(|o| !o.environment) {
-            let cs: Vec<usize> = o.clusters.clone().filter(|&c| at_lod(&scene.clusters[c])).collect();
+            let cs: Vec<usize> = o.clusters.clone().filter(|&c| at_lod(c)).collect();
             if !cs.is_empty() {
                 recv.extend(spread(&cs, RECEIVER_SPACING));
             }
@@ -405,7 +420,7 @@ impl Bounce {
         {
             // The rest (the ground): spacing grows with distance from the
             // nearest object, whatever the triangles.
-            let rest: Vec<usize> = (0..scene.clusters.len()).filter(|&c| object_of[c] == u32::MAX && at_lod(&scene.clusters[c])).collect();
+            let rest: Vec<usize> = (0..scene.clusters.len()).filter(|&c| object_of[c] == u32::MAX && at_lod(c)).collect();
             let tris = tris_of(&rest);
             let get = |k: usize| {
                 let (ci, t) = tris[k];

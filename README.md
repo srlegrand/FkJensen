@@ -761,9 +761,24 @@ navigation buttons, lights, wireframe and back-face toggles; framing is
 in the viewport's View menu.
 
 Edit, as Maya's: Copy (Ctrl+C), Paste (Ctrl+V, where it was copied),
-Duplicate (Ctrl+D), Duplicate Instanced (Ctrl+Shift+D; not built yet:
-instancing is next), Delete (Del), on the selected object (with
-everything under it), point light or directional light, then Group.
+Duplicate (Ctrl+D), Duplicate Instanced (Ctrl+Shift+D), Delete (Del), on
+the selected object (with everything under it), point light or
+directional light, then Group.
+
+Instances, as Maya's. Duplicate Instanced makes new objects over the same
+geometry: vertices, triangles, levels of detail, materials and texture
+tiles are stored once, and an instance holds only its clusters' headers
+(where they are, their bounds) and its surface samples. Each instance
+moves, turns and scales on its own and is shaded on its own; a material
+change shows on all of them, as a shape's shading does in Maya. The
+outliner shows instances in tinted italics, and the attribute editor says
+how many share the geometry. Deleting one keeps the geometry for the
+rest. The texture cache keys tiles by where they are stored, not by
+cluster, so instances read each tile once. The renderer tests each
+object's box against the view before looking at its clusters, and picks
+each cluster's level of detail for the view, so a far instance draws its
+coarse levels. Scene files write an instance as `instance_of` an earlier
+object (`docs/scene.md`).
 
 Shortcuts: Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as, Ctrl+I import,
 Ctrl+G put the selected object in a new group. A scene file dropped on the
@@ -1143,8 +1158,9 @@ Not measured yet: a Raspberry Pi.
   with the high-resolution T-rex asks for it on any machine (the Pi
   included) rather than the plan picking the low-resolution one.
 - The editor: no undo; one object selected at a time; a copied or
-  duplicated object is a full copy of its geometry in memory until
-  instancing is built; a model is added at the origin; the interface is
+  duplicated object is a full copy of its geometry (Duplicate Instanced
+  shares it); instances share their materials (no per-instance material
+  changes); a model is added at the origin; the interface is
   painted again every frame, even when nothing in it changed; a bake
   cannot be stopped once started (closing the importer leaves it to
   finish); the importer reads the formats fkj-import reads, nothing more

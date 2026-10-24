@@ -368,6 +368,10 @@ impl Editor {
                     self.duplicate();
                     return;
                 }
+                KeyCode::KeyD if self.app.ctrl && self.app.shift => {
+                    self.duplicate_instanced();
+                    return;
+                }
                 KeyCode::KeyP if self.app.shift => {
                     self.unparent_selected();
                     return;
@@ -670,7 +674,11 @@ impl Editor {
                     self.duplicate();
                     ui.close();
                 }
-                ui.add_enabled(false, egui::Button::new("Duplicate Instanced").shortcut_text("Ctrl+Shift+D")).on_disabled_hover_text("Instances share one copy of the geometry: next to be built");
+                let object = matches!(self.app.selection, Selection::Object(_)) && self.inspect == Inspect::Selection;
+                if ui.add_enabled(object, egui::Button::new("Duplicate Instanced").shortcut_text("Ctrl+Shift+D")).on_hover_text("A new object over the same geometry, materials and textures, stored once").clicked() {
+                    self.duplicate_instanced();
+                    ui.close();
+                }
                 ui.separator();
                 if ui.add_enabled(some, egui::Button::new("Delete").shortcut_text("Del")).clicked() {
                     self.delete_selected();
@@ -1262,6 +1270,71 @@ mod tests {
         ed.select(Selection::Object(0));
         ed.delete_selected();
         assert_eq!(ed.app.rig.lights.len(), n - 1);
+    }
+
+    /// Duplicate Instanced makes objects over the same geometry: nothing is
+    /// stored again, each moves on its own and is seen where it stands,
+    /// deleting the original keeps the rest, and a scene saves and opens
+    /// them as instances.
+    #[test]
+    fn instances_share_geometry_and_move_on_their_own() {
+        let mut ed = editor();
+        ed.make(create::Make::Primitive("sphere"));
+        let Selection::Object(a) = ed.app.selection else { panic!() };
+        let (verts, tris) = (ed.app.scene.qpos.len(), ed.app.scene.tris.len());
+        ed.duplicate_instanced();
+        let Selection::Object(b) = ed.app.selection else { panic!() };
+        ed.duplicate_instanced();
+        let Selection::Object(c) = ed.app.selection else { panic!() };
+        assert_eq!(ed.app.scene.objects[b].name, "sphere2");
+        assert_eq!(ed.app.scene.objects[c].name, "sphere3");
+        assert_eq!((ed.app.scene.qpos.len(), ed.app.scene.tris.len()), (verts, tris), "nothing stored again");
+        assert_eq!(ed.app.scene.instances_of(a), vec![a, b, c]);
+        for (k, &i) in [a, b, c].iter().enumerate() {
+            ed.app.scene.set_object(i, glam::Vec3::new(k as f32 * 1.5 - 1.5, 0.0, 2.0), glam::Vec3::new(0.0, k as f32, 0.0), 1.0 + k as f32 * 0.2);
+        }
+        ed.app.cam.look_from(glam::Vec3::new(0.0, 3.0, 7.0), glam::Vec3::new(0.0, 0.3, 2.0));
+        let seen = |ed: &mut Editor, objs: &[usize]| -> Vec<usize> {
+            let (w, h) = (640, 400);
+            for _ in 0..2 {
+                ed.frame(raw(w, h), w, h);
+            }
+            let f = &ed.app.frame;
+            objs.iter()
+                .map(|&i| {
+                    let r = ed.app.scene.objects[i].clusters.clone();
+                    f.tri_id.iter().filter(|&&id| id != crate::raster::NO_TRI && r.contains(&(f.setups[id as usize].cluster as usize))).count()
+                })
+                .collect()
+        };
+        let px = seen(&mut ed, &[a, b, c]);
+        assert!(px.iter().all(|&p| p > 200), "{px:?}");
+        assert!(px[2] > px[0], "the larger one covers more: {px:?}");
+        // The original deleted: its instances keep the geometry, once.
+        ed.select(Selection::Object(a));
+        ed.delete_selected();
+        let b = ed.app.scene.objects.iter().position(|o| o.name == "sphere2").unwrap();
+        let c = ed.app.scene.objects.iter().position(|o| o.name == "sphere3").unwrap();
+        assert_eq!(ed.app.scene.instances_of(b), vec![b, c]);
+        assert_eq!((ed.app.scene.qpos.len(), ed.app.scene.tris.len()), (verts, tris));
+        let px = seen(&mut ed, &[b, c]);
+        assert!(px.iter().all(|&p| p > 200), "{px:?}");
+        // Saved and opened: instances again.
+        let d = std::env::temp_dir().join(format!("fkj-inst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        ed.save(d.join("i.fjs"));
+        let text = std::fs::read_to_string(d.join("i.fjs")).unwrap();
+        assert!(text.contains("\"instance_of\""), "{text}");
+        let mut other = editor();
+        other.open(d.join("i.fjs"));
+        let _ = std::fs::remove_dir_all(&d);
+        let b2 = other.app.scene.objects.iter().position(|o| o.name == "sphere2").unwrap();
+        let c2 = other.app.scene.objects.iter().position(|o| o.name == "sphere3").unwrap();
+        assert_eq!(other.app.scene.instances_of(b2), vec![b2, c2]);
+        assert!(other.app.scene.objects[c2].pivot.distance(ed.app.scene.objects[c].pivot) < 1e-4);
+        assert!((other.app.scene.objects[c2].scale - 1.4).abs() < 1e-4);
+        assert_eq!(other.app.scene.qpos.len(), ed.app.scene.qpos.len());
     }
 
     /// A camera made from the view, looked through and navigated, moves;

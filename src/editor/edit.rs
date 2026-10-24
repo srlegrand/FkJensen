@@ -154,6 +154,36 @@ impl Editor {
         }
     }
 
+    /// Duplicate Instanced, as Maya's: the selected object and what is
+    /// under it again, each model an instance of its original (its
+    /// geometry, materials and texture tiles shared, not copied), each
+    /// group a new group. The new tree stands where the old one does, in
+    /// the same group, and is selected.
+    pub fn duplicate_instanced(&mut self) {
+        let Some(Target::Object(i)) = self.edit_target() else { return };
+        let s = &mut self.app.scene;
+        let tree: Vec<usize> = std::iter::once(i).chain(s.descendants(i)).collect();
+        let mut made: Vec<usize> = Vec::with_capacity(tree.len());
+        for (k, &j) in tree.iter().enumerate() {
+            let name = next_name(s, &s.objects[j].name);
+            let n = s.instance_object(j, name);
+            // The group copied too keeps the original's place.
+            if s.objects[n].clusters.is_empty() {
+                let (r, sc) = (s.objects[j].rotation, s.objects[j].scale);
+                s.objects[n].rotation = r;
+                s.objects[n].scale = sc;
+            }
+            let parent = if k == 0 { s.objects[j].parent } else { s.objects[j].parent.and_then(|p| tree.iter().position(|&t| t == p)).map(|p| made[p]) };
+            s.objects[n].parent = parent;
+            made.push(n);
+        }
+        self.app.manip = None;
+        self.app.drag = None;
+        let n = made.len();
+        self.select(Selection::Object(made[0]));
+        self.say(format!("{} instanced{}", self.app.scene.objects[made[0]].name, if n > 1 { format!(" with {} under it", n - 1) } else { String::new() }), false);
+    }
+
     /// Copy and paste in one, leaving the clipboard as it was.
     pub fn duplicate(&mut self) {
         let kept = self.clip.take();
@@ -169,6 +199,17 @@ enum Target {
     Light(usize),
     Directional(usize),
     Camera(usize),
+}
+
+/// `name` with its trailing number the next not taken: tree1 gives tree2,
+/// or tree3 if tree2 is.
+fn next_name(s: &Scene, name: &str) -> String {
+    let stem = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    let mut k: usize = name[stem.len()..].parse().unwrap_or(0) + 1;
+    while s.objects.iter().any(|o| o.name == format!("{stem}{k}")) {
+        k += 1;
+    }
+    format!("{stem}{k}")
 }
 
 /// A scene's copy (its texture tiles still read from where they are).

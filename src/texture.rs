@@ -149,8 +149,12 @@ fn srgb_lut() -> &'static [f32; 256] {
     })
 }
 
+/// A block's key: where its data is (source, offset) and its level, so
+/// that instances, whose clusters point at the same tiles, share blocks.
+type Key = (u16, u64, u8);
+
 struct Cache {
-    blocks: HashMap<(u32, u8), (Arc<Block>, u64)>,
+    blocks: HashMap<Key, (Arc<Block>, u64)>,
     bytes: usize,
     clock: u64,
 }
@@ -202,7 +206,7 @@ impl Textures {
         if e.level == 0 || level == 0 {
             return false;
         }
-        let key = (c as u32, level.min(e.level));
+        let key = (e.source, e.offset, level.min(e.level));
         self.cache.lock().unwrap().blocks.contains_key(&key)
     }
 
@@ -240,7 +244,7 @@ impl Textures {
             return None;
         }
         let level = level.min(e.level);
-        let key = (c as u32, level);
+        let key = (e.source, e.offset, level);
         {
             let mut cache = self.cache.lock().unwrap();
             cache.clock += 1;
@@ -318,6 +322,18 @@ mod tests {
         // Asking finer than stored gives the finest stored.
         assert_eq!(tex.block(0, 2, 5).unwrap().level, 2);
         assert!(tex.block(1, 2, 1).is_none(), "no entry, no tiles");
+    }
+
+    /// Two clusters over the same tiles (instances) share one block: the
+    /// second asks for it and nothing more is read.
+    #[test]
+    fn instances_share_blocks() {
+        let (mut tex, _) = sample_textures();
+        tex.entries.push(tex.entries[0]);
+        let a = tex.block(0, 2, 2).unwrap();
+        let b = tex.block(1, 2, 2).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(tex.stats().reads, 1);
     }
 
     #[test]

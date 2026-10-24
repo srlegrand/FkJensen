@@ -73,6 +73,7 @@ An object:
 | `scale` | uniform; 1 when left out |
 | `parent` | the group it is in, the index of an earlier entry in `objects` |
 | `materials` | how its materials differ from its asset's in this scene: each an `index` (from 0, in the asset's order), its `name` (for reading), and whichever of `tint`, `roughness`, `metallic`, `specular` differ |
+| `instance_of` | an instance of an earlier entry in `objects` (its index): that entry's geometry, materials and texture tiles, stored once; `asset` and `materials` are left out |
 
 `pivot`, `rotation` and `scale` are absolute, from the rest the asset
 stores (`docs/format.md`): an asset made by `fkj-import` rests at the
@@ -97,7 +98,8 @@ scene.
 
 ## Not done yet
 
-- An asset used by several objects is read once per object.
+- An asset used by several objects is read once per object, unless they
+  are written as instances (`instance_of`).
 - A scene saved with the high-resolution T-rex asks for it on every
   machine; the plan does not swap in the low-resolution one.
 - Cameras are orbit cameras: no roll, no film back, no clipping planes

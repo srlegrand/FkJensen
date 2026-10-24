@@ -454,6 +454,12 @@ impl Scene {
         self.tris.len()
     }
 
+    /// Triangles over every cluster, instances counted each time (what
+    /// can be drawn, at every level of detail).
+    pub fn drawable_triangles(&self) -> usize {
+        self.clusters.iter().map(|c| c.tri_count as usize).sum()
+    }
+
     pub fn vertex_count(&self) -> usize {
         self.qpos.len()
     }
@@ -747,20 +753,32 @@ impl Scene {
         out.textures.sources = self.textures.sources.clone();
         out.materials = self.materials.clone();
         let mut index = std::collections::HashMap::new();
+        // Instances share their vertices and triangles: each stretch is
+        // copied once, and every cluster that used it uses the copy.
+        let mut copied: std::collections::HashMap<(u32, u32), (u32, u32)> = std::collections::HashMap::new();
         for r in ranges {
             for ci in r.clone() {
                 let c = &self.clusters[ci];
                 let (fv, nv) = (c.first_vertex as usize, c.vertex_count as usize);
                 let (ft, nt) = (c.first_tri as usize, c.tri_count as usize);
                 let mut h = *c;
-                h.first_vertex = out.qpos.len() as u32;
-                h.first_tri = out.tris.len() as u32;
-                out.qpos.extend_from_slice(&self.qpos[fv..fv + nv]);
-                out.qnrm.extend_from_slice(&self.qnrm[fv..fv + nv]);
-                out.qcol.extend_from_slice(&self.qcol[fv..fv + nv]);
-                out.tris.extend_from_slice(&self.tris[ft..ft + nt]);
-                if !self.tri_mat.is_empty() {
-                    out.tri_mat.extend((ft..ft + nt).map(|t| self.tri_mat.get(t).copied().unwrap_or(0)));
+                match copied.get(&(c.first_vertex, c.first_tri)) {
+                    Some(&(v, t)) => {
+                        h.first_vertex = v;
+                        h.first_tri = t;
+                    }
+                    None => {
+                        h.first_vertex = out.qpos.len() as u32;
+                        h.first_tri = out.tris.len() as u32;
+                        copied.insert((c.first_vertex, c.first_tri), (h.first_vertex, h.first_tri));
+                        out.qpos.extend_from_slice(&self.qpos[fv..fv + nv]);
+                        out.qnrm.extend_from_slice(&self.qnrm[fv..fv + nv]);
+                        out.qcol.extend_from_slice(&self.qcol[fv..fv + nv]);
+                        out.tris.extend_from_slice(&self.tris[ft..ft + nt]);
+                        if !self.tri_mat.is_empty() {
+                            out.tri_mat.extend((ft..ft + nt).map(|t| self.tri_mat.get(t).copied().unwrap_or(0)));
+                        }
+                    }
                 }
                 h.xf = back * c.xf;
                 if !still || c.turned {
@@ -821,6 +839,58 @@ impl Scene {
         out.objects.push(ob);
         out.refresh_bounds(0);
         out
+    }
+
+    /// An instance of object `i`, as Maya's: a new object with clusters of
+    /// its own (where they are, their bounds, their shading) over the same
+    /// vertices, triangles, levels of detail, materials and texture tiles,
+    /// which are stored once. Its samples are copied (they hold where they
+    /// are). It stands where `i` stands, at the top of the hierarchy.
+    /// Returns it.
+    pub fn instance_object(&mut self, i: usize, name: String) -> usize {
+        let o = self.objects[i].clone();
+        let base = self.clusters.len();
+        if o.clusters.is_empty() {
+            return self.add_group(name, o.pivot);
+        }
+        let headers: Vec<Cluster> = self.clusters[o.clusters.clone()].to_vec();
+        self.clusters.extend(headers);
+        if !self.textures.is_empty() {
+            self.textures.entries.resize(base, Default::default());
+            for c in o.clusters.clone() {
+                let e = self.textures.entry(c);
+                self.textures.entries.push(e);
+            }
+        }
+        let shift = base as u32 - o.clusters.start as u32;
+        let r = self.samples_in(o.clusters.clone());
+        let copies: Vec<crate::samples::Sample> = self.samples[r].iter().map(|s| crate::samples::Sample { cluster: s.cluster + shift, ..*s }).collect();
+        // The new clusters are the last, so their samples go last.
+        self.samples.extend(copies);
+        let n = self.clusters.len();
+        self.objects.push(Object { name, clusters: base..n, parent: None, ..o });
+        self.objects.len() - 1
+    }
+
+    /// The geometry object `i` stands on: its first cluster's vertices and
+    /// triangles. Instances share it. None for a group.
+    pub fn geometry_of(&self, i: usize) -> Option<(u32, u32)> {
+        let o = self.objects.get(i)?;
+        let c = self.clusters.get(o.clusters.start).filter(|_| !o.clusters.is_empty())?;
+        Some((c.first_vertex, c.first_tri))
+    }
+
+    /// The objects sharing object `i`'s geometry, `i` among them, in order.
+    pub fn instances_of(&self, i: usize) -> Vec<usize> {
+        match self.geometry_of(i) {
+            Some(g) => (0..self.objects.len()).filter(|&j| self.geometry_of(j) == Some(g)).collect(),
+            None => vec![i],
+        }
+    }
+
+    /// Whether object `i` shares its geometry with another.
+    pub fn is_instanced(&self, i: usize) -> bool {
+        self.instances_of(i).len() > 1
     }
 
     /// Delete objects `which` and everything under them: their clusters,
