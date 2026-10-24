@@ -15,20 +15,23 @@ At the start of a session, run these and report each to the person as passed or 
 ## The loop
 
 1. The person asks for a change in plain words.
-2. The assistant works in its own clone. Before every change it fetches `main` and starts from it. It builds, runs `cargo test --release`, renders the built-in scene headless (`--png`) and looks at the image, and updates `README.md` and `docs/`. It fetches `main` again just before making the patch and rebases if anything came in.
-3. The assistant makes one patch of everything since `origin/main`: `git diff --binary origin/main > fkjensen-<what>-<DDMMYYYY-HHMM>.patch`. The suffix is new every time, so the chat shows a new download. It checks the patch applies on a clean copy of `main` (`git worktree add` on `origin/main`, `git apply`).
-4. The assistant sends the patch and any screenshot worth looking at, with the two blocks of commands below filled in, and says what changed, what was tested and what was not. One patch and three blocks per response, every time: one for the local machine, one for the Raspberry Pi, one for the Windows machine.
-5. The person clicks "Download all" and pastes the local block on the desktop:
+2. The assistant works in its own clone. Before every change it fetches `main` and starts from it. It builds, runs `cargo test --release`, renders the built-in scene headless (`--png`) and looks at the image, and updates `README.md` and `docs/`. It fetches `main` again just before making the bundle and rebases if anything came in.
+3. The assistant makes one git bundle of its commits since `origin/main`, authored and committed by Simon Legrand, on a branch named `fkjensen-update`: `git bundle create fkjensen-<what>-<DDMMYYYY-HHMM>.bundle origin/main..fkjensen-update`. The suffix is new every time, so the chat shows a new download. A bundle carries whole commits (renames, deletions, binary files, Git LFS pointers) and holds everything not yet on GitHub, so any machine at `origin/main` takes it whole, whatever was sent before. The assistant checks it with `git bundle verify` and by fast-forwarding a clean copy of `origin/main` to it.
+4. The assistant sends the bundle and any screenshot worth looking at, with the two blocks of commands below filled in, and says what changed, what was tested and what was not. One bundle and three blocks per response, every time: one for the local machine, one for the Raspberry Pi, one for the Windows machine.
+5. The person clicks "Download all" and pastes the local block on whichever machine they are at, the desktop or the laptop:
 
        cd ~/Software/FkJensen && \
-       git pull --rebase origin main && \
-       git apply ~/Downloads/fkjensen-<what>-<suffix>.patch && \
-       git add -A && \
-       git commit -m "<what changed>" && \
+       git fetch origin && \
+       git switch main && \
+       git branch -f before-update && \
+       git reset --keep origin/main && \
+       git pull --ff-only ~/Downloads/fkjensen-<what>-<suffix>.bundle fkjensen-update && \
+       git lfs pull && \
+       cargo build --release && cargo test --release && \
        git push origin main && \
        cargo run --release
 
-   The commands are joined with `&&`: a patch that does not apply is never followed by a commit. The block holds no other commands; deletions travel in the patch. The exceptions: when the assistant sends `.fja` models too large for a patch, the block moves them from `~/Downloads` into `assets/models/` before the commit; when a change to `tools/fkj-import` or the format means the models must be imported again, the block builds the importer and runs it on the source files (commands in `README.md`) before the commit. `cargo run` comes last so the program can stay open.
+   The commands are joined with `&&`: a bundle that does not fast-forward is never pushed. `before-update` keeps whatever the machine had committed and not pushed; `reset --keep` stops rather than lose changes not committed. The block holds no other commands; deletions and renames travel in the bundle. Once pushed, every other machine takes it with `git pull`. The exceptions: when the assistant sends `.fja` models too large for the chat's limit, the block moves them from `~/Downloads` into `assets/models/` and commits them; when a change to `tools/fkj-import` or the format means the models must be imported again, the block builds the importer and runs it on the source files (commands in `README.md`) before the commit. `cargo run` comes last so the program can stay open.
 
    Then the Pi block, also on the desktop, after the local block has pushed. It cross-compiles for the Pi 1 (ARMv6, 32-bit), copies the binary over and runs it there headless, so the output comes back to the desktop terminal:
 
@@ -51,8 +54,8 @@ At the start of a session, run these and report each to the person as passed or 
        cargo run --release -- --png $HOME\Downloads\fkjensen-win.png --debug-view all
        cargo run --release -- --visual-debug
 
-6. When `git apply` fails, the person pastes the terminal output; the assistant fetches `main`, rebases, tests again and sends a new patch.
-7. Until the person says a patch is pushed, the assistant keeps its work committed locally and makes the next patch on top of it.
+6. When the pull from the bundle fails, the person pastes the terminal output; the assistant fetches `main`, rebases, tests again and sends a new bundle.
+7. Until the person says a bundle is pushed, the assistant keeps its work committed locally and makes the next bundle on top of it, holding everything since `origin/main`; it fetches `origin/main` first and rebases onto it when it has moved.
 
 ## Conventions
 
@@ -64,5 +67,5 @@ At the start of a session, run these and report each to the person as passed or 
 - Say what was tested and what was not. Numbers in the docs are measured and say on what hardware.
 - No GPU API, ever: no wgpu, Vulkan, OpenGL, Metal, DirectX, no shader files. The frame reaches the screen through softbuffer. A dependency that pulls a GPU API in is a bug.
 - Dates DD/MM/YYYY. No em dashes.
-- Files under 100 MB in the repository, patches under 30 MB in the chat.
+- Files under 100 MB in the repository, bundles under 30 MB in the chat.
 - Credit: FkJensen was created by Simon Legrand. No attribution to AI tools anywhere in the repository, commits or pull requests.
