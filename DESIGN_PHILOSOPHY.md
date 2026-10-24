@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 24/10/2026: a shelf and a Create menu as Maya's: polygon sphere, cube, cylinder and plane (built in, `built-in:<name>` in a scene), point and directional lights, empty group.
 - 24/10/2026: the ground and the mountains are objects (`built-in:ground`, `built-in:mountains`), deletable like anything else; Maya's Edit menu: Copy, Paste, Duplicate, Duplicate Instanced (next), Delete, Group, with Maya's keys. Delete leaves the attribute editor.
 - 24/10/2026: the editor gets smaller and tighter: Inter at 11.5 points, small paddings, Phosphor icons in place of worded buttons, narrower panels and timeline. Where something goes and what it is called follow Maya unless it is FkJensen's own.
 - 24/10/2026: materials, shaded physically on every surface: GGX with Smith visibility and Schlick's Fresnel, multiple-scattering compensation, the sky's highlight, diffuse what the highlight leaves for the eye's angle; tint, roughness, metallic and specular per material, kept per triangle in the asset (`MATS`), changed per object in a scene and pushed into the asset when wanted. Replaces the one Blinn highlight; shading costs about a third more a point.

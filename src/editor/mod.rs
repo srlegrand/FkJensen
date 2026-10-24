@@ -12,6 +12,7 @@
 pub mod files;
 pub mod importer;
 pub mod paint;
+mod create;
 mod edit;
 mod materials;
 mod navigate;
@@ -624,19 +625,10 @@ impl Editor {
                 ui.separator();
                 if ui.add(egui::Button::new("Group").shortcut_text("Ctrl+G")).clicked() {
                     self.group_selected();
-                }
-                if ui.button("New empty group").clicked() {
-                    self.new_group();
-                }
-                ui.separator();
-                if ui.button("Add a light").clicked() {
-                    self.add_light();
-                }
-                if ui.add(egui::Button::new("Reset the lights").shortcut_text("Ctrl+R")).clicked() {
-                    self.app.rig = crate::lights::LightRig::new(crate::default_rig(&self.app.scene));
-                    self.select(Selection::Nothing);
+                    ui.close();
                 }
             });
+            self.create_menu(ui);
             ui.menu_button("View", |ui| {
                 if ui.add(egui::Button::new("Frame the selection").shortcut_text("F")).clicked() {
                     self.app.frame_selection();
@@ -665,6 +657,8 @@ impl Editor {
                     self.app.tool = tool;
                 }
             }
+            ui.separator();
+            self.shelf_create(ui);
             ui.separator();
             if ui.button(style::ic(icon::IMPORT, 14.0)).on_hover_text("Import a model (Ctrl+I)").clicked() {
                 self.import(None);
@@ -1104,6 +1098,51 @@ mod tests {
         ed.select(Selection::Light(n));
         ed.delete_selected();
         assert_eq!(ed.app.rig.lights.len(), n);
+    }
+
+    /// The shelf's primitives come out standing on the ground at the
+    /// origin, a metre across, facing out (seen with back-face culling on),
+    /// named sphere1, cube1...; save as built-in assets, no files.
+    #[test]
+    fn primitives_are_made_and_seen() {
+        let mut ed = editor();
+        ed.app.settings.cull_backfaces = true;
+        let names = ["sphere", "cube", "cylinder", "plane"];
+        for (k, n) in names.iter().enumerate() {
+            ed.make(create::Make::Primitive(n));
+            let Selection::Object(i) = ed.app.selection else { panic!() };
+            assert_eq!(ed.app.scene.objects[i].name, format!("{n}1"));
+            let (lo, hi) = ed.app.scene.object_bounds(i);
+            assert!(lo.y.abs() < 1e-3 && (hi.x - lo.x - 1.0).abs() < 0.05, "{n}: {lo} {hi}");
+            ed.app.scene.set_object(i, glam::Vec3::new(k as f32 * 1.5 - 2.25, 0.0, 2.0), glam::Vec3::ZERO, 1.0);
+        }
+        ed.make(create::Make::Primitive("cube"));
+        assert!(ed.app.scene.objects.iter().any(|o| o.name == "cube2"));
+        ed.app.cam.look_from(glam::Vec3::new(0.0, 3.0, 7.0), glam::Vec3::new(0.0, 0.3, 2.0));
+        let (w, h) = (800, 500);
+        for _ in 0..2 {
+            ed.frame(raw(w, h), w, h);
+        }
+        if let Ok(p) = std::env::var("FKJ_PRIM_SHOT") {
+            crate::save_png(&ed.app.frame, &p).unwrap();
+        }
+        let f = &ed.app.frame;
+        for n in names {
+            let i = ed.app.scene.objects.iter().position(|o| o.name == format!("{n}1")).unwrap();
+            let r = ed.app.scene.objects[i].clusters.clone();
+            let px = f.tri_id.iter().filter(|&&id| id != crate::raster::NO_TRI && r.contains(&(f.setups[id as usize].cluster as usize))).count();
+            assert!(px > 300, "{n}: {px} pixels");
+        }
+        let d = std::env::temp_dir().join(format!("fkj-prim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        ed.save(d.join("p.fjs"));
+        let text = std::fs::read_to_string(d.join("p.fjs")).unwrap();
+        assert!(text.contains("built-in:cylinder"), "{text}");
+        let mut other = editor();
+        other.open(d.join("p.fjs"));
+        assert!(other.app.scene.objects.iter().any(|o| o.name == "cylinder1"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// At 1920 x 1080 the frame keeps its size as the window changes, is

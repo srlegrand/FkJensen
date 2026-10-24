@@ -63,7 +63,7 @@ An object:
 | field | meaning |
 |---|---|
 | `name` | shown in the outliner |
-| `asset` | the `.fja` it is, or `built-in:ground` or `built-in:mountains` for the program's own; left out for a group |
+| `asset` | the `.fja` it is, or the program's own: `built-in:ground`, `built-in:mountains`, `built-in:sphere`, `built-in:cube`, `built-in:cylinder`, `built-in:plane`; left out for a group |
 | `pivot` | where it stands: the point it turns and scales about, metres |
 | `rotation` | degrees about X, Y and Z, applied in that order (Maya's xyz); 0 when left out |
 | `scale` | uniform; 1 when left out |

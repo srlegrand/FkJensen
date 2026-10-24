@@ -82,21 +82,7 @@ impl Editor {
                         }
                     }
                 }
-                ui.horizontal(|ui| {
-                    if ui.small_button("+ light").clicked() {
-                        actions.push(Action::Inspect(Inspect::Selection));
-                        self.add_light();
-                    }
-                    if ui.small_button("+ directional").clicked() {
-                        match self.app.settings.dir_lights.iter().position(|d| !d.on) {
-                            Some(k) => {
-                                self.app.settings.dir_lights[k] = raster::DirLight { on: true, ..Default::default() };
-                                actions.push(Action::Inspect(Inspect::Directional(k)));
-                            }
-                            None => self.say(format!("{} directional lights at most", raster::MAX_DIR_LIGHTS), true),
-                        }
-                    }
-                });
+
             });
             ui.separator();
             for (what, name) in [(Inspect::Sun, "Sun"), (Inspect::Sky, "Sky and exposure"), (Inspect::Render, "Render settings")] {

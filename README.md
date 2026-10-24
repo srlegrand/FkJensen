@@ -723,6 +723,15 @@ frame into the window, painting the interface and presenting it.
 moves the first object five times and lets go, printing each frame's
 times.
 
+The shelf under the menus, as Maya's: the tools (select, move, rotate,
+scale), then polygon sphere, cube, cylinder and plane, point light,
+directional light, empty group, then import and frame; an icon each, its
+name on hover. Create holds the same: Polygon Primitives, Lights, Empty
+Group. A primitive is a metre across, standing on the ground at the
+origin, mid grey with a material of its own, named sphere1, cube1 and so
+on; it is built in (`src/primitives.rs`), so a scene names it as the
+asset `built-in:sphere` and no file is written for it.
+
 Edit, as Maya's: Copy (Ctrl+C), Paste (Ctrl+V, where it was copied),
 Duplicate (Ctrl+D), Duplicate Instanced (Ctrl+Shift+D; not built yet:
 instancing is next), Delete (Del), on the selected object (with

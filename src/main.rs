@@ -54,6 +54,7 @@ mod hardware;
 mod lights;
 mod lod;
 mod manip;
+mod primitives;
 mod raster;
 mod reyes;
 mod samples;

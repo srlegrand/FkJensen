@@ -178,9 +178,10 @@ pub fn asset_name(part: &str) -> String {
     format!("built-in:{part}")
 }
 
-/// The built-in part an asset name stands for, if any.
+/// The built-in part an asset name stands for, if any: a part of the
+/// world or a primitive (`primitives.rs`).
 pub fn part_of(asset: &std::path::Path) -> Option<&str> {
-    asset.to_str()?.strip_prefix("built-in:").filter(|p| PARTS.contains(p))
+    asset.to_str()?.strip_prefix("built-in:").filter(|p| PARTS.contains(p) || crate::primitives::NAMES.contains(p))
 }
 
 /// One part of the built-in world as a scene of one object, its asset
@@ -188,6 +189,9 @@ pub fn part_of(asset: &std::path::Path) -> Option<&str> {
 /// surface samples): the ground (the paved square and the valley floor to
 /// the horizon) or the mountains.
 pub fn part(name: &str) -> Option<Scene> {
+    if crate::primitives::NAMES.contains(&name) {
+        return crate::primitives::part(name);
+    }
     let mut scene = Scene::new();
     match name {
         "ground" => {
