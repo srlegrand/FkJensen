@@ -134,6 +134,10 @@ pub struct Editor {
     /// Where each navigation control was last drawn (points), by its label;
     /// the second "Left" is the track row's.
     nav_rects: Vec<(&'static str, egui::Rect)>,
+    /// Where the viewport's Show menu button was last drawn (points).
+    show_rect: egui::Rect,
+    /// Where its "Light count" entry was last drawn, when open.
+    show_item: egui::Rect,
 }
 
 impl Editor {
@@ -172,6 +176,8 @@ impl Editor {
             began: None,
             navigate: true,
             nav_rects: Vec::new(),
+            show_rect: egui::Rect::NOTHING,
+            show_item: egui::Rect::NOTHING,
         }
     }
 
@@ -675,13 +681,56 @@ impl Editor {
             manip::Tool::Scale => "scale",
         };
         let text = format!("{tool}   {what}   {:02}:{:02}", self.app.hours as u32, (self.app.hours.fract() * 60.0) as u32);
-        let p = ui.painter();
-        let galley = p.layout_no_wrap(text, egui::FontId::proportional(13.0), egui::Color32::from_gray(230));
-        let at = rect.min + egui::vec2(8.0, 6.0);
-        p.rect_filled(egui::Rect::from_min_size(at - egui::vec2(4.0, 2.0), galley.size() + egui::vec2(8.0, 4.0)), 3.0, egui::Color32::from_black_alpha(140));
-        p.galley(at, galley, egui::Color32::WHITE);
         let ctx = ui.ctx().clone();
+        // Over the picture's corner: what it shows, then the tool and what
+        // is selected.
+        egui::Area::new(egui::Id::unique("viewport menu")).order(egui::Order::Foreground).fixed_pos(rect.min + egui::vec2(6.0, 4.0)).show(&ctx, |ui| {
+            egui::Frame::NONE.fill(egui::Color32::from_black_alpha(150)).corner_radius(3.0).inner_margin(egui::Margin::symmetric(4, 2)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    self.show_menu(ui);
+                    ui.label(egui::RichText::new(text).color(egui::Color32::from_gray(230)));
+                });
+            });
+        });
         self.navigation(&ctx, rect);
+    }
+
+    /// The viewport's Show menu: the picture, the light count, or a visual
+    /// debug view, the views in menus by subject so the list never runs
+    /// off the window.
+    fn show_menu(&mut self, ui: &mut egui::Ui) {
+        let name = match self.app.visual {
+            Some(v) => v.title(),
+            None if self.app.settings.view == crate::raster::View::LightCount => "light count".to_string(),
+            None => "picture".to_string(),
+        };
+        let menu = ui.menu_button(format!("Show: {name}"), |ui| {
+            if ui.selectable_label(self.app.visual.is_none() && self.app.settings.view == crate::raster::View::Shaded, "Picture").clicked() {
+                self.app.visual = None;
+                self.app.settings.view = crate::raster::View::Shaded;
+                ui.close();
+            }
+            let lc = ui.selectable_label(self.app.settings.view == crate::raster::View::LightCount, "Light count");
+            self.show_item = lc.rect;
+            if lc.clicked() {
+                self.app.visual = None;
+                self.app.settings.view = crate::raster::View::LightCount;
+                ui.close();
+            }
+            ui.separator();
+            for group in crate::debug::GROUPS {
+                ui.menu_button(group, |ui| {
+                    for v in crate::debug::ALL.into_iter().filter(|v| v.group() == group && *v != crate::debug::DebugView::Final) {
+                        if ui.selectable_label(self.app.visual == Some(v), v.title()).on_hover_text(format!("--debug-view {}", v.name())).clicked() {
+                            self.app.visual = Some(v);
+                            self.app.settings.view = crate::raster::View::Shaded;
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        });
+        self.show_rect = menu.response.rect;
     }
 }
 
@@ -944,6 +993,34 @@ mod tests {
         assert!((ed.app.cam.distance - wide.distance).abs() < 1e-3 && ed.app.cam.yaw.abs() < 1e-6);
         // The viewport under the buttons is not clicked through.
         assert_eq!(ed.app.selection, Selection::Nothing);
+    }
+
+    /// The Show menu sits over the viewport: it opens there and sets what
+    /// the viewport shows.
+    #[test]
+    fn the_show_menu_is_over_the_viewport() {
+        let mut ed = editor();
+        let (w, h) = (1100, 700);
+        for _ in 0..2 {
+            ed.frame(raw(w, h), w, h);
+        }
+        let (vx, vy, vw, _) = ed.view;
+        let ppp = 1.0;
+        let r = ed.show_rect;
+        assert!(r.min.x * ppp >= vx as f32 && r.min.y * ppp >= vy as f32 && r.max.x * ppp < (vx + vw) as f32, "{r:?} in {:?}", ed.view);
+        let ev = |events: Vec<egui::Event>| egui::RawInput { events, ..raw(w, h) };
+        let press = |p: egui::Pos2, down: bool| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: down, modifiers: Default::default() };
+        let c = r.center();
+        ed.frame(ev(vec![egui::Event::PointerMoved(c), press(c, true)]), w, h);
+        ed.frame(ev(vec![press(c, false)]), w, h);
+        ed.frame(ev(vec![]), w, h);
+        let p = ed.show_item.center();
+        assert!(p.y > r.max.y, "the menu opened under the button: {:?}", ed.show_item);
+        ed.frame(ev(vec![egui::Event::PointerMoved(p), press(p, true)]), w, h);
+        ed.frame(ev(vec![press(p, false)]), w, h);
+        let picked = ed.app.settings.view == crate::raster::View::LightCount;
+        assert!(picked, "Light count not picked from the viewport's Show menu");
+        assert_eq!(ed.app.selection, Selection::Nothing, "the click did not go through to the viewport");
     }
 
     /// At 1920 x 1080 the frame keeps its size as the window changes, is

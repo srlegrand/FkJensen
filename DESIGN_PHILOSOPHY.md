@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 24/10/2026: the Show menu (picture, light count, visual debug views) moves from the render settings to the viewport, over its top left corner.
 - 24/10/2026: navigation buttons over the editor's viewport, so the camera moves without a mouse: pads to drag on for tumble, track and dolly, buttons held to move, and the two framings.
 - 24/10/2026: scenes and assets are separate files: an `.fjs` scene (JSON) points at `.fja` assets and holds transforms, groups, lights, sun, sky, camera and render settings; an `.fja` is one object with its baked data, in its own space, in the binary format the `.fkj` scenes used. The built-in models are `.fja` and placed by their transforms. Saving writes an `.fja` only for objects that have none; old `.fkj` scenes open and save as `.fjs`.
 - 24/10/2026: letting go of a dragged object bakes it over several frames instead of one, the drag's last picture shown meanwhile: shadow maps, sky shares, the surfel cloud and its light a frame each, then shading, bounce gathering and resolving about 50 ms a frame. With the high-resolution T-rex at 1920 x 1080 on 2 cores the one 1.1 s frame becomes about 22 frames, the longest 250 ms (making the surfel cloud), the rest 20 to 150 ms; about 1.5 s in all.

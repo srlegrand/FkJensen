@@ -403,7 +403,7 @@ build leaves them out.
     cargo run --release -- --png out.png --debug-view reshaded --bench-drag
     cargo run --release -- --png out.png --close --debug-view shadow-map --select 2
 
-`--select N` picks the light the light views show (1 is the first). In the editor the views are under Render settings > Show, in menus by subject.
+`--select N` picks the light the light views show (1 is the first). In the editor the views are in the viewport's Show menu, top left over the picture, in menus by subject.
 
 ![Six of the views: clusters, micropolygons, light reach, a shadow map unfolded, the surfel cloud, dicing levels](docs/debug_views.png)
 
@@ -637,8 +637,8 @@ with egui, on the CPU like everything else: egui's triangles are filled by
   levels of detail and size; a light's position, lumens and colour; the
   sun's time and brightness; the sky's illuminance, both contrasts and the
   exposure; the render settings (micropolygon spacing, frame size,
-  how much coarser a moving object is drawn, shadows, bounce, the visual
-  debug views) with the last frame's numbers.
+  how much coarser a moving object is drawn, shadows, bounce) with the
+  last frame's numbers.
 - **Frame size**: 1920 x 1080 at start, whatever the window's size, shown
   as large as fits in the viewport with bars round it; Custom takes a
   width and height; Viewport pixels follows the viewport, times the
@@ -669,6 +669,8 @@ with egui, on the CPU like everything else: egui's triangles are filled by
 - **Viewport** in the middle: the same mouse and keys as the plain window
   (Controls, above), except Esc. Keys go to the viewport unless a text box
   is being typed in.
+- **Show** menu over the viewport's top left corner: the picture, the
+  light count, or a visual debug view, in menus by subject.
 - **Navigation buttons** in the viewport's bottom right corner, for
   working without a mouse (View > Navigation buttons hides them): drag on
   Tumble, Track or Dolly with a touchpad, pen or finger, as Alt + left,

@@ -505,40 +505,6 @@ impl Editor {
             ui.label("Wireframe");
             ui.checkbox(&mut self.app.settings.wireframe, "");
             ui.end_row();
-            ui.label("Show");
-            let name = match self.app.visual {
-                Some(v) => v.name(),
-                None if self.app.settings.view == raster::View::LightCount => "light count",
-                None => "picture",
-            };
-            let name = self.app.visual.map(|v| v.title()).unwrap_or_else(|| name.to_string());
-            // The views in groups, each a menu of its own, so the list
-            // never runs off the window.
-            ui.menu_button(name, |ui| {
-                if ui.selectable_label(self.app.visual.is_none() && self.app.settings.view == raster::View::Shaded, "Picture").clicked() {
-                    self.app.visual = None;
-                    self.app.settings.view = raster::View::Shaded;
-                    ui.close();
-                }
-                if ui.selectable_label(self.app.settings.view == raster::View::LightCount, "Light count").clicked() {
-                    self.app.visual = None;
-                    self.app.settings.view = raster::View::LightCount;
-                    ui.close();
-                }
-                ui.separator();
-                for group in crate::debug::GROUPS {
-                    ui.menu_button(group, |ui| {
-                        for v in crate::debug::ALL.into_iter().filter(|v| v.group() == group && *v != crate::debug::DebugView::Final) {
-                            if ui.selectable_label(self.app.visual == Some(v), v.title()).on_hover_text(format!("--debug-view {}", v.name())).clicked() {
-                                self.app.visual = Some(v);
-                                self.app.settings.view = raster::View::Shaded;
-                                ui.close();
-                            }
-                        }
-                    });
-                }
-            });
-            ui.end_row();
         });
         if refit {
             let (ow, oh) = self.app.output;
