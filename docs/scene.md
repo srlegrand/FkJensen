@@ -33,6 +33,8 @@ what changes when things move. Several scenes can use the same asset.
       "backdrop": { "zenith": [0.5, 0.69, 1.33], "horizon": [1.32, 1.02, 0.78], "contrast": 0.5 },
       "exposure": 0.0128,
       "camera": { "target": [3.17, 2.68, 0.96], "distance": 20.4, "yaw": 0.0, "pitch": 4.0, "fov": 45.0 },
+      "cameras": [ { "name": "camera1", "target": [0.0, 1.0, 0.0], "distance": 6.0, "yaw": 30.0, "pitch": 10.0, "fov": 35.0 } ],
+      "view": "camera1",
       "render": { "shadows": true, "shadow_res": 512, "bounce": true, "backface_culling": true }
     }
 
@@ -55,7 +57,9 @@ left out keeps the program's own value.
 | `sky` | `on`, `lux`, `tint`, `contrast` (lighting contrast, 0 to 1) |
 | `backdrop` | the sky as seen: `zenith`, `horizon` colours, `contrast` (0 to 1) |
 | `exposure` | display value per cd/m² before the tone curve |
-| `camera` | orbit camera: `target`, `distance` (metres), `yaw`, `pitch`, `fov` (degrees) |
+| `camera` | the perspective camera, Maya's persp: `target`, `distance` (metres), `yaw`, `pitch`, `fov` (degrees) |
+| `cameras` | the scene's cameras: each a `name` and the same fields as `camera` |
+| `view` | the camera the view looks through, by name; persp when absent |
 | `render` | `shadows`, `shadow_res`, `bounce`, `light_reach`, `occlusion_culling`, `adaptive`, `sky_occlusion`, `incremental_moves`, `backface_culling`, `wireframe`, `drag_preview`, `bake_over_frames`, `moving_rate`, `moving_detail` |
 
 An object:
@@ -96,7 +100,7 @@ scene.
 - An asset used by several objects is read once per object.
 - A scene saved with the high-resolution T-rex asks for it on every
   machine; the plan does not swap in the low-resolution one.
-- No other kinds of camera than the orbit camera, and one camera a
-  scene.
-- Materials, textures and levels of detail are the asset's; a scene
-  cannot override them.
+- Cameras are orbit cameras: no roll, no film back, no clipping planes
+  to set.
+- Textures and levels of detail are the asset's; a scene overrides only
+  material values.

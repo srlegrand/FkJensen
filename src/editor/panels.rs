@@ -92,6 +92,7 @@ impl Editor {
             if let Some(p) = lights.header_response.dnd_release_payload::<LightDrag>() {
                 actions.push(Action::ParentLight(p.0, None));
             }
+            self.camera_rows(ui);
             ui.separator();
             for (what, name) in [(Inspect::Sun, "Sun"), (Inspect::Sky, "Sky and exposure"), (Inspect::Render, "Render settings")] {
                 if ui.selectable_label(self.inspect == what, name).clicked() {
@@ -211,6 +212,7 @@ impl Editor {
         match (self.inspect, self.app.selection) {
             (Inspect::Selection, Selection::Object(i)) if i < self.app.scene.objects.len() => self.object_attributes(ui, i),
             (Inspect::Selection, Selection::Light(i)) if i < self.app.rig.lights.len() => self.light_attributes(ui, i),
+            (Inspect::Selection, Selection::Camera(k)) if k < self.app.cameras.len() => self.camera_attributes(ui, k),
             (Inspect::Sun, _) => self.sun_attributes(ui),
             (Inspect::Directional(k), _) if k < raster::MAX_DIR_LIGHTS => self.directional_attributes(ui, k),
             (Inspect::Sky, _) => self.sky_attributes(ui),

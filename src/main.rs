@@ -173,6 +173,16 @@ enum Selection {
     Nothing,
     Object(usize),
     Light(usize),
+    /// A camera of `App::cameras`.
+    Camera(usize),
+}
+
+/// A camera of the scene, as Maya's: a name and where it looks from. The
+/// view looks through one of them or through the perspective camera.
+#[derive(Clone, Debug, PartialEq)]
+struct SceneCamera {
+    name: String,
+    cam: OrbitCamera,
 }
 
 /// A manipulator handle being dragged, and how things were when it was
@@ -236,6 +246,12 @@ struct App {
     /// What the machine's plan allows of shadows, bounce light and shadow
     /// map texels, over what a scene file asks.
     caps: (bool, bool, usize),
+    /// The scene's cameras, the one the view looks through (None: the
+    /// perspective camera, `persp`), and the perspective camera while the
+    /// view is elsewhere.
+    cameras: Vec<SceneCamera>,
+    through: Option<usize>,
+    persp: OrbitCamera,
     /// Shading points a window frame may take, from the machine's plan:
     /// the micropolygon spacing and render scale follow it as the window
     /// is resized. None once either is set by hand.
@@ -293,6 +309,9 @@ impl App {
             frame_size: None,
             drag_start: None,
             caps: (true, true, usize::MAX),
+            cameras: Vec::new(),
+            through: None,
+            persp: OrbitCamera::new(),
             point_budget: None,
             renderer: reyes::Renderer::new(),
             wide: true,
@@ -317,6 +336,8 @@ impl App {
     /// Open a scene: an .fjs, an .fja on its own, or an old .fkj.
     fn open(&mut self, path: PathBuf) -> Result<(), String> {
         let (scene, file) = load_scene(&path)?;
+        self.look_through(None);
+        self.cameras.clear();
         self.scene = scene;
         self.scene_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         self.wide = true;
@@ -400,13 +421,28 @@ impl App {
                 s.moving_detail = x.clamp(1.0, 16.0);
             }
         }
-        if let Some(c) = f.camera {
-            self.cam.target = v3(c.target);
-            self.cam.distance = c.distance.max(1e-4);
-            self.cam.yaw = c.yaw.to_radians();
-            self.cam.pitch = c.pitch.to_radians();
-            self.cam.fov_y = c.fov.clamp(1.0, 170.0).to_radians();
+        let from = |c: &fjs::CameraEntry, cam: &mut OrbitCamera| {
+            cam.target = v3(c.target);
+            cam.distance = c.distance.max(1e-4);
+            cam.yaw = c.yaw.to_radians();
+            cam.pitch = c.pitch.to_radians();
+            cam.fov_y = c.fov.clamp(1.0, 170.0).to_radians();
+        };
+        self.look_through(None);
+        if let Some(c) = &f.camera {
+            from(c, &mut self.cam);
         }
+        self.cameras = f
+            .cameras
+            .iter()
+            .map(|c| {
+                let mut cam = self.cam;
+                from(&c.camera, &mut cam);
+                SceneCamera { name: c.name.clone(), cam }
+            })
+            .collect();
+        let view = f.view.as_ref().and_then(|v| self.cameras.iter().position(|c| &c.name == v));
+        self.look_through(view);
     }
 
     /// Save the scene as an .fjs at `path`, writing an .fja beside it for
@@ -434,8 +470,17 @@ impl App {
         f.sky = Some(fjs::SkyEntry { on: s.sky.on, lux: round6(s.sky.lux), tint: a3(s.sky.tint), contrast: round6(s.sky.contrast) });
         f.backdrop = Some(fjs::BackdropEntry { zenith: a3(s.backdrop.zenith), horizon: a3(s.backdrop.horizon), contrast: round6(s.backdrop.contrast) });
         f.exposure = Some(s.exposure);
-        let c = &self.cam;
-        f.camera = Some(fjs::CameraEntry { target: a3(c.target), distance: round6(c.distance), yaw: round6(c.yaw.to_degrees()), pitch: round6(c.pitch.to_degrees()), fov: round6(c.fov_y.to_degrees()) });
+        let entry = |c: &OrbitCamera|fjs::CameraEntry { target: a3(c.target), distance: round6(c.distance), yaw: round6(c.yaw.to_degrees()), pitch: round6(c.pitch.to_degrees()), fov: round6(c.fov_y.to_degrees()) };
+        // The view's camera holds what navigating did.
+        match self.through {
+            Some(k) if k < self.cameras.len() => {
+                self.cameras[k].cam = self.cam;
+                f.camera = Some(entry(&self.persp));
+            }
+            _ => f.camera = Some(entry(&self.cam)),
+        }
+        f.cameras = self.cameras.iter().map(|c| fjs::NamedCamera { name: c.name.clone(), camera: entry(&c.cam) }).collect();
+        f.view = self.through.map(|_| self.view_name());
         f.render = Some(fjs::RenderEntry {
             shadows: Some(s.shadows),
             shadow_res: Some(s.shadow_res),
@@ -530,8 +575,68 @@ impl App {
         }
     }
 
+    /// Look through camera `k` (None: the perspective camera); navigating
+    /// then moves that camera.
+    fn look_through(&mut self, k: Option<usize>) {
+        let k = k.filter(|&k| k < self.cameras.len());
+        if k == self.through {
+            return;
+        }
+        match self.through {
+            Some(j) if j < self.cameras.len() => self.cameras[j].cam = self.cam,
+            _ => self.persp = self.cam,
+        }
+        self.cam = match k {
+            Some(k) => self.cameras[k].cam,
+            None => self.persp,
+        };
+        self.through = k;
+    }
+
+    /// The camera the view looks through, by name.
+    fn view_name(&self) -> String {
+        match self.through {
+            Some(k) => self.cameras.get(k).map(|c| c.name.clone()).unwrap_or_default(),
+            None => "persp".into(),
+        }
+    }
+
+    /// Make a camera, Maya's camera1, camera2...: where the view is
+    /// (`from_view`), else at the origin looking down -Z. Returns it.
+    fn add_camera(&mut self, from_view: bool) -> usize {
+        let mut cam = self.cam;
+        if !from_view {
+            cam.look_from(Vec3::ZERO, Vec3::new(0.0, 0.0, -5.0));
+        }
+        let mut k = 1;
+        while self.cameras.iter().any(|c| c.name == format!("camera{k}")) {
+            k += 1;
+        }
+        self.cameras.push(SceneCamera { name: format!("camera{k}"), cam });
+        self.cameras.len() - 1
+    }
+
+    /// Delete camera `k`; the view goes back to the perspective camera if
+    /// it looked through it.
+    fn delete_camera(&mut self, k: usize) {
+        if k >= self.cameras.len() {
+            return;
+        }
+        if self.through == Some(k) {
+            self.look_through(None);
+        }
+        self.cameras.remove(k);
+        if let Some(t) = self.through.filter(|&t| t > k) {
+            self.through = Some(t - 1);
+        }
+    }
+
     fn render(&mut self) {
         self.sync_lights();
+        // Navigating moves the camera looked through.
+        if let Some(k) = self.through.filter(|&k| k < self.cameras.len()) {
+            self.cameras[k].cam = self.cam;
+        }
         let cam = self.render_camera();
         self.renderer.render(&self.scene, &cam, &self.rig.lights, &self.settings, &mut self.frame);
         #[cfg(target_pointer_width = "64")]
@@ -568,6 +673,29 @@ impl App {
                 }
             }
         }
+        // Cameras, as Maya draws them: a small body and the frustum ahead,
+        // not the one looked through.
+        for (n, c) in self.cameras.iter().enumerate() {
+            if self.through == Some(n) {
+                continue;
+            }
+            let sel = self.selection == Selection::Camera(n);
+            let col = if sel { Vec3::new(1.0, 0.9, 0.2) } else { Vec3::splat(0.75) };
+            let (e, f, r, u) = (c.cam.eye(), c.cam.forward(), c.cam.right(), c.cam.up());
+            let len = (self.scene.focus_radius() * 0.08).clamp(0.3, 3.0);
+            let h = (c.cam.fov_y * 0.5).tan() * len;
+            let w = h * 16.0 / 9.0;
+            let far = [e + f * len + r * w + u * h, e + f * len - r * w + u * h, e + f * len - r * w - u * h, e + f * len + r * w - u * h];
+            for q in 0..4 {
+                raster::draw_line(&mut self.frame, &cam, e, far[q], col, false);
+                raster::draw_line(&mut self.frame, &cam, far[q], far[(q + 1) % 4], col, false);
+            }
+            // Which way is up: a small triangle on the top edge.
+            let top = e + f * len + u * h * 1.35;
+            raster::draw_line(&mut self.frame, &cam, far[0] - r * w * 0.6, top, col, false);
+            raster::draw_line(&mut self.frame, &cam, far[1] + r * w * 0.6, top, col, false);
+            raster::draw_disc(&mut self.frame, &cam, e, if sel { 5.0 } else { 3.5 } * self.render_scale.max(0.25), col, false);
+        }
         // The selection and its manipulator.
         let k = self.render_scale.max(0.25);
         if let Selection::Object(i) = self.selection {
@@ -589,6 +717,7 @@ impl App {
         match self.selection {
             Selection::Object(i) => self.scene.objects.get(i).map(|o| (o.pivot, self.tool)),
             Selection::Light(i) if self.tool == manip::Tool::Move && self.rig.show => self.rig.lights.get(i).map(|l| (l.position, self.tool)),
+            Selection::Camera(k) if self.tool == manip::Tool::Move && self.through != Some(k) => self.cameras.get(k).map(|c| (c.cam.eye(), self.tool)),
             _ => None,
         }
         .filter(|(_, t)| *t != manip::Tool::Select)
@@ -656,6 +785,12 @@ impl App {
         }
         match m.target {
             Selection::Object(i) => self.move_object(i, pivot, rotation, scale),
+            Selection::Camera(k) => {
+                if let Some(c) = self.cameras.get_mut(k) {
+                    let d = pivot - c.cam.eye();
+                    c.cam.target += d;
+                }
+            }
             Selection::Light(i) => {
                 if let Some(l) = self.rig.lights.get_mut(i) {
                     l.position = pivot;
@@ -709,6 +844,22 @@ impl App {
     /// Select what is under the pointer: a light, else a model, else
     /// nothing. Returns the light, for dragging.
     fn select_at_pointer(&mut self) -> Option<usize> {
+        // A camera's eye, drawn as a dot.
+        {
+            let cam = self.render_camera();
+            let r = 9.0 * self.render_scale.max(0.25);
+            for (k, c) in self.cameras.iter().enumerate() {
+                if self.through == Some(k) {
+                    continue;
+                }
+                if let Some((sx, sy, _)) = raster::project(&cam, self.frame.width, self.frame.height, c.cam.eye()) {
+                    if (sx - self.mouse.0).hypot(sy - self.mouse.1) <= r {
+                        self.selection = Selection::Camera(k);
+                        return None;
+                    }
+                }
+            }
+        }
         if self.rig.show {
             let cam = self.render_camera();
             if let Some(i) = self.rig.pick(&cam, self.frame.width, self.frame.height, self.mouse.0, self.mouse.1, self.render_scale) {
@@ -739,6 +890,12 @@ impl App {
                 if let Some(l) = self.rig.lights.get(i) {
                     let r = self.scene.focus_radius() * 0.15;
                     self.cam.frame(l.position, r);
+                }
+            }
+            Selection::Camera(k) => {
+                if let Some(c) = self.cameras.get(k) {
+                    let r = self.scene.focus_radius() * 0.15;
+                    self.cam.frame(c.cam.eye(), r);
                 }
             }
             // The whole scene runs to the mountains: the subject instead.

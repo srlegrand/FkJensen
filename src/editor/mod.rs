@@ -12,6 +12,7 @@
 pub mod files;
 pub mod importer;
 pub mod paint;
+mod cameras;
 mod create;
 mod edit;
 mod materials;
@@ -696,15 +697,8 @@ impl Editor {
                 }
             });
             self.create_menu(ui);
-            ui.menu_button("View", |ui| {
-                if ui.add(egui::Button::new("Frame the selection").shortcut_text("F")).clicked() {
-                    self.app.frame_selection();
-                }
-                if ui.add(egui::Button::new("Frame the subject from afar").shortcut_text("A")).clicked() {
-                    self.app.wide = true;
-                    crate::frame_camera(&mut self.app.cam, &self.app.scene, true);
-                }
-                ui.separator();
+            // Maya's Display; framing is in the viewport's View menu.
+            ui.menu_button("Display", |ui| {
                 ui.checkbox(&mut self.navigate, "Navigation buttons");
                 ui.checkbox(&mut self.app.rig.show, "Lights (L)");
                 ui.checkbox(&mut self.app.settings.wireframe, "Wireframe (G)");
@@ -774,6 +768,7 @@ impl Editor {
         let what = match self.app.selection {
             Selection::Object(i) => self.app.scene.objects.get(i).map(|o| o.name.clone()).unwrap_or_default(),
             Selection::Light(i) => format!("light {}", i + 1),
+            Selection::Camera(k) => self.app.cameras.get(k).map(|c| c.name.clone()).unwrap_or_default(),
             Selection::Nothing => "nothing selected".into(),
         };
         let tool = match self.app.tool {
@@ -789,7 +784,10 @@ impl Editor {
         egui::Area::new(egui::Id::unique("viewport menu")).order(egui::Order::Foreground).fixed_pos(rect.min + egui::vec2(6.0, 4.0)).show(&ctx, |ui| {
             egui::Frame::NONE.fill(egui::Color32::from_black_alpha(150)).corner_radius(3.0).inner_margin(egui::Margin::symmetric(4, 2)).show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    self.view_menu(ui);
+                    self.panels_menu(ui);
                     self.show_menu(ui);
+                    ui.label(egui::RichText::new(self.app.view_name()).color(egui::Color32::from_rgb(140, 200, 255)));
                     ui.label(egui::RichText::new(text).color(egui::Color32::from_gray(230)));
                 });
             });
@@ -1264,6 +1262,49 @@ mod tests {
         ed.select(Selection::Object(0));
         ed.delete_selected();
         assert_eq!(ed.app.rig.lights.len(), n - 1);
+    }
+
+    /// A camera made from the view, looked through and navigated, moves;
+    /// persp stays where it was; both are saved and opened, the view with
+    /// them.
+    #[test]
+    fn cameras_from_view_look_through_and_save() {
+        let mut ed = editor();
+        let persp = ed.app.cam;
+        ed.make(create::Make::Camera(true));
+        assert_eq!(ed.app.selection, Selection::Camera(0));
+        assert_eq!(ed.app.cameras[0].name, "camera1");
+        assert_eq!(ed.app.cameras[0].cam, persp);
+        ed.app.look_through(Some(0));
+        assert_eq!(ed.app.view_name(), "camera1");
+        ed.app.cam.orbit(0.3, 0.1);
+        ed.app.cam.dolly(2.0);
+        ed.app.render();
+        let moved = ed.app.cameras[0].cam;
+        assert_ne!(moved, persp);
+        ed.app.look_through(None);
+        assert_eq!(ed.app.cam, persp);
+        ed.make(create::Make::Camera(false));
+        assert!(ed.app.cameras[1].cam.eye().length() < 1e-4);
+        ed.copy_selected();
+        ed.paste();
+        assert_eq!(ed.app.cameras.len(), 3);
+        assert_eq!(ed.app.cameras[2].name, "camera3");
+        ed.delete_selected();
+        assert_eq!(ed.app.cameras.len(), 2);
+        ed.app.look_through(Some(0));
+        let d = std::env::temp_dir().join(format!("fkj-cam-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        ed.save(d.join("c.fjs"));
+        let mut other = editor();
+        other.open(d.join("c.fjs"));
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(other.app.cameras.len(), 2);
+        assert_eq!(other.app.view_name(), "camera1");
+        assert!(other.app.cam.eye().distance(moved.eye()) < 1e-3);
+        other.app.look_through(None);
+        assert!(other.app.cam.eye().distance(persp.eye()) < 1e-3);
     }
 
     /// At 1920 x 1080 the frame keeps its size as the window changes, is

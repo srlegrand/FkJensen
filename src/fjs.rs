@@ -55,8 +55,15 @@ pub struct SceneFile {
     /// Display value per cd/m², before the tone curve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposure: Option<f32>,
+    /// The perspective camera, Maya's persp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<CameraEntry>,
+    /// The scene's cameras.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cameras: Vec<NamedCamera>,
+    /// The camera the view looks through, by name; persp when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render: Option<RenderEntry>,
 }
@@ -225,6 +232,14 @@ pub struct CameraEntry {
     pub pitch: f32,
     /// Vertical field of view, degrees.
     pub fov: f32,
+}
+
+/// A scene camera: its name and where it is, as `CameraEntry`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct NamedCamera {
+    pub name: String,
+    #[serde(flatten)]
+    pub camera: CameraEntry,
 }
 
 /// Render settings that belong to the scene. The micropolygon spacing and

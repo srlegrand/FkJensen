@@ -710,7 +710,7 @@ with egui, on the CPU like everything else: egui's triangles are filled by
 - **Show** menu over the viewport's top left corner: the picture, the
   light count, or a visual debug view, in menus by subject.
 - **Navigation buttons** in the viewport's bottom right corner, for
-  working without a mouse (View > Navigation buttons hides them): drag on
+  working without a mouse (Display > Navigation buttons hides them): drag on
   Tumble, Track or Dolly with a touchpad, pen or finger, as Alt + left,
   middle or right drag; hold Left, Right, Up, Down, In or Out to tumble
   (60 degrees a second), track (half the view a second) or dolly; Frame
@@ -725,9 +725,10 @@ times.
 
 The shelf under the menus, as Maya's: the tools (select, move, rotate,
 scale), then polygon sphere, cube, cylinder and plane, point light,
-directional light, empty group, then import and frame; an icon each, its
-name on hover. Create holds the same: Polygon Primitives, Lights, Empty
-Group. A primitive is a metre across, standing on the ground at the
+directional light, camera, camera from the view, empty group, then
+import and frame; an icon each, its
+name on hover. Create holds the same: Polygon Primitives, Lights,
+Cameras, Empty Group. A primitive is a metre across, standing on the ground at the
 origin, mid grey with a material of its own, named sphere1, cube1 and so
 on; it is built in (`src/primitives.rs`), so a scene names it as the
 asset `built-in:sphere` and no file is written for it.
@@ -743,6 +744,21 @@ it. Edit > Unparent (Shift+P), or its row dragged onto the Lights heading,
 leaves it where it is. The outliner lists a parented light under its
 object; deleting the object deletes it, as in Maya. Scene files keep the
 parent (`docs/scene.md`).
+
+Cameras, as in Maya. Create > Cameras > Camera makes camera1 at the
+origin looking down -Z; Camera from View (also the viewport's View >
+Create Camera from View) makes it where the view is. Cameras are drawn as
+a small frustum; click the eye to select, W to move it. The viewport's
+Panels > Perspective lists persp and the cameras; View > Look Through
+Selected Camera, a double click in the outliner's Cameras or the camera's
+attributes switch the view to one, and its name shows in the viewport
+bar. Looking through a camera, tumbling, tracking, dollying and flying
+move it; persp keeps where it was. The attribute editor sets a camera's
+name, position, aim, angle of view and centre of interest. Edit's Copy,
+Paste, Duplicate and Delete work on cameras. Scene files keep the cameras
+and which one the view looks through. The menu bar's Display holds the
+navigation buttons, lights, wireframe and back-face toggles; framing is
+in the viewport's View menu.
 
 Edit, as Maya's: Copy (Ctrl+C), Paste (Ctrl+V, where it was copied),
 Duplicate (Ctrl+D), Duplicate Instanced (Ctrl+Shift+D; not built yet:

@@ -21,6 +21,7 @@ pub mod icon {
     pub const LIGHT: &str = "\u{E2DC}";
     pub const SUN: &str = "\u{E472}";
     pub const CAMERA: &str = "\u{E4DA}";
+    pub const CAMERA_VIEW: &str = "\u{E10E}";
     pub const GROUP: &str = "\u{E25A}";
     pub const IMPORT: &str = "\u{E3D4}";
     pub const FRAME: &str = "\u{E1D6}";

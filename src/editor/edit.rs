@@ -15,6 +15,7 @@ pub enum Clip {
     Objects(Vec<(Scene, (glam::Vec3, glam::Vec3, f32), Option<usize>)>),
     Light(PointLight),
     Directional(DirLight),
+    Camera(crate::SceneCamera),
 }
 
 impl Editor {
@@ -25,6 +26,7 @@ impl Editor {
             (_, Inspect::Directional(k)) => Some(Target::Directional(k)),
             (Selection::Object(i), _) if i < self.app.scene.objects.len() => Some(Target::Object(i)),
             (Selection::Light(i), _) if i < self.app.rig.lights.len() => Some(Target::Light(i)),
+            (Selection::Camera(k), _) if k < self.app.cameras.len() => Some(Target::Camera(k)),
             _ => None,
         }
     }
@@ -72,6 +74,10 @@ impl Editor {
                 self.app.settings.dir_lights[k] = DirLight::default();
                 self.inspect = Inspect::Selection;
             }
+            Some(Target::Camera(k)) => {
+                self.app.delete_camera(k);
+                self.select(Selection::Nothing);
+            }
             None => {}
         }
     }
@@ -98,6 +104,7 @@ impl Editor {
             }
             Some(Target::Light(i)) => Some(Clip::Light(self.app.rig.lights[i])),
             Some(Target::Directional(k)) => Some(Clip::Directional(self.app.settings.dir_lights[k])),
+            Some(Target::Camera(k)) => Some(Clip::Camera(self.app.cameras[k].clone())),
             None => None,
         };
     }
@@ -138,6 +145,11 @@ impl Editor {
                 }
                 None => self.say(format!("{} directional lights at most", crate::raster::MAX_DIR_LIGHTS), true),
             },
+            Some(Clip::Camera(c)) => {
+                let k = self.app.add_camera(false);
+                self.app.cameras[k].cam = c.cam;
+                self.select(Selection::Camera(k));
+            }
             None => {}
         }
     }
@@ -156,6 +168,7 @@ enum Target {
     Object(usize),
     Light(usize),
     Directional(usize),
+    Camera(usize),
 }
 
 /// A scene's copy (its texture tiles still read from where they are).

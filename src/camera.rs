@@ -6,6 +6,7 @@
 
 use glam::{Mat4, Vec3};
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OrbitCamera {
     pub target: Vec3,
     pub distance: f32,

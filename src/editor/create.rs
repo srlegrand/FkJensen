@@ -12,17 +12,21 @@ pub enum Make {
     Primitive(&'static str),
     PointLight,
     Directional,
+    /// A camera: where the view is (true), else at the origin.
+    Camera(bool),
     Group,
 }
 
 /// The shelf's buttons: what each makes, its icon and its name.
-pub const SHELF: [(Make, &str, &str); 7] = [
+pub const SHELF: [(Make, &str, &str); 9] = [
     (Make::Primitive("sphere"), icon::SPHERE, "Polygon sphere"),
     (Make::Primitive("cube"), icon::CUBE, "Polygon cube"),
     (Make::Primitive("cylinder"), icon::CYLINDER, "Polygon cylinder"),
     (Make::Primitive("plane"), icon::PLANE, "Polygon plane"),
     (Make::PointLight, icon::LIGHT, "Point light"),
     (Make::Directional, icon::SUN, "Directional light"),
+    (Make::Camera(false), icon::CAMERA, "Camera"),
+    (Make::Camera(true), icon::CAMERA_VIEW, "Camera from the view: where the view is now"),
     (Make::Group, icon::GROUP, "Empty group"),
 ];
 
@@ -54,6 +58,10 @@ impl Editor {
                 }
                 None => self.say(format!("{} directional lights at most", crate::raster::MAX_DIR_LIGHTS), true),
             },
+            Make::Camera(from_view) => {
+                let k = self.app.add_camera(from_view);
+                self.select(Selection::Camera(k));
+            }
             Make::Group => self.new_group(),
         }
     }
@@ -85,6 +93,16 @@ impl Editor {
                     ui.close();
                 }
             });
+            ui.menu_button("Cameras", |ui| {
+                if ui.button("Camera").clicked() {
+                    self.make(Make::Camera(false));
+                    ui.close();
+                }
+                if ui.button("Camera from View").clicked() {
+                    self.make(Make::Camera(true));
+                    ui.close();
+                }
+            });
             ui.separator();
             if ui.button("Empty Group").clicked() {
                 self.make(Make::Group);
@@ -97,7 +115,7 @@ impl Editor {
     pub(super) fn shelf_create(&mut self, ui: &mut egui::Ui) {
         for (k, (what, glyph, name)) in SHELF.iter().enumerate() {
             // A gap between primitives, lights and the rest.
-            if k == 4 || k == 6 {
+            if k == 4 || k == 6 || k == 8 {
                 ui.separator();
             }
             if ui.button(ic(glyph, 14.0)).on_hover_text(*name).clicked() {
