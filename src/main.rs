@@ -1603,7 +1603,7 @@ fn main() {
             match png_out {
                 // The editor drawn to a file, no window.
                 Some(out) => {
-                    if let Err(e) = editor::shot(app, size.0, size.1, &out, import) {
+                    if let Err(e) = editor::shot(app, size.0, size.1, &out, import, bench_move) {
                         eprintln!("cannot write {out}: {e}");
                         std::process::exit(1);
                     }

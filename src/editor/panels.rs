@@ -553,6 +553,10 @@ impl Editor {
                     ui.end_row();
                 };
                 row("Size", format!("{} x {}", self.app.frame.width, self.app.frame.height));
+                let t = self.times;
+                row("Editor frame", format!("{:.0} ms", t.total));
+                row("Interface, render", format!("{:.0}, {:.0} ms", t.layout, t.render));
+                row("Copy, paint, present", format!("{:.0}, {:.0}, {:.0} ms", t.compose, t.paint, t.present));
                 row("Frame rate", format!("{:.1} fps", self.app.title_fps));
                 row("Triangles", format!("{} of {}", thousands(s.tris_drawn), thousands(s.tris_in)));
                 row("Clusters", format!("{} of {}", thousands(s.clusters_drawn), thousands(s.clusters_in)));

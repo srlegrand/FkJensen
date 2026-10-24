@@ -655,6 +655,13 @@ with egui, on the CPU like everything else: egui's triangles are filled by
   (Controls, above), except Esc. Keys go to the viewport unless a text box
   is being typed in.
 
+The status bar and Render settings > Last frame give where each editor
+frame's time went: laying out the interface, rendering, copying the
+frame into the window, painting the interface and presenting it.
+`--editor --png out.png --bench-move` draws the editor to a file, then
+moves the first object five times and lets go, printing each frame's
+times.
+
 Shortcuts: Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as, Ctrl+I import,
 Ctrl+G put the selected object in a new group. A scene file dropped on the
 window opens; a model dropped on it opens the importer.

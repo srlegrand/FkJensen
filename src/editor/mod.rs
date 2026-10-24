@@ -63,6 +63,33 @@ impl FrameSize {
     }
 }
 
+/// Where an editor frame's time went, ms.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct FrameTimes {
+    /// egui laying out the interface.
+    pub layout: f32,
+    /// The renderer making the viewport's frame.
+    pub render: f32,
+    /// The frame copied and scaled into the window's picture.
+    pub compose: f32,
+    /// The interface tessellated and filled over it.
+    pub paint: f32,
+    /// The picture handed to the window (the window's own frame loop
+    /// sets it).
+    pub present: f32,
+    /// From the start of one frame to the start of the next.
+    pub total: f32,
+}
+
+impl FrameTimes {
+    pub fn line(&self) -> String {
+        format!(
+            "frame {:.0} ms: interface {:.0}, render {:.0}, copy {:.0}, paint {:.0}, present {:.0}",
+            self.total, self.layout, self.render, self.compose, self.paint, self.present
+        )
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Purpose {
     Open,
@@ -98,6 +125,9 @@ pub struct Editor {
     /// The point budget the machine's plan gave, to go back to.
     plan_budget: Option<f64>,
     pub frame_size: FrameSize,
+    /// The last frame's times, and when this frame began.
+    pub times: FrameTimes,
+    began: Option<Instant>,
 }
 
 impl Editor {
@@ -132,6 +162,8 @@ impl Editor {
             quit: false,
             plan_budget,
             frame_size: FrameSize::Hd,
+            times: FrameTimes::default(),
+            began: None,
         }
     }
 
@@ -154,8 +186,14 @@ impl Editor {
     /// One frame of `w` x `h` pixels: lay out the interface, render the
     /// viewport, draw both into `buf`.
     pub fn frame(&mut self, raw: egui::RawInput, w: usize, h: usize) -> egui::PlatformOutput {
+        let t0 = Instant::now();
+        if let Some(b) = self.began {
+            self.times.total = (t0 - b).as_secs_f32() * 1000.0;
+        }
+        self.began = Some(t0);
         let ctx = self.ctx.clone();
         let out = ctx.run_ui(raw, |ui| self.ui(ui));
+        self.times.layout = t0.elapsed().as_secs_f32() * 1000.0;
         self.painter.set_textures(&out.textures_delta);
         let ppp = out.pixels_per_point;
 
@@ -166,6 +204,7 @@ impl Editor {
             self.app.hours = (self.app.hours + self.speed * dt).rem_euclid(24.0);
             self.app.apply_daylight();
         }
+        let tr = Instant::now();
         if vw > 0 && vh > 0 {
             if self.app.output != (vw, vh) {
                 self.app.output = (vw, vh);
@@ -173,6 +212,7 @@ impl Editor {
             }
             self.app.render();
         }
+        self.times.render = tr.elapsed().as_secs_f32() * 1000.0;
         self.app.count_frame(dt);
         if self.pending_bounce.is_some() && !ctx.egui_is_using_pointer() {
             if let Some(i) = self.pending_bounce.take() {
@@ -185,10 +225,14 @@ impl Editor {
             }
         }
 
+        let tc = Instant::now();
         self.compose(w, h);
+        let tp = Instant::now();
+        self.times.compose = (tp - tc).as_secs_f32() * 1000.0;
         let prims = ctx.tessellate(out.shapes, ppp);
         self.painter.paint(&prims, ppp, &mut self.buf, w, h);
         self.painter.free_textures(&out.textures_delta);
+        self.times.paint = tp.elapsed().as_secs_f32() * 1000.0;
         out.platform_output
     }
 
@@ -574,7 +618,8 @@ impl Editor {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let s = self.app.frame.stats;
                 ui.weak(format!(
-                    "{}x{}  {} triangles drawn  {:.1} px micropolygons  cache {} MB  CPU only",
+                    "{}  |  {}x{}  {} triangles drawn  {:.1} px micropolygons  cache {} MB  CPU only",
+                    self.times.line(),
                     self.app.frame.width,
                     self.app.frame.height,
                     importer::thousands(s.tris_drawn),
@@ -668,11 +713,13 @@ impl ApplicationHandler for Runner {
                         let _ = surface.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap());
                         self.surface_size = (w, h);
                     }
+                    let t = Instant::now();
                     if let Ok(mut buf) = surface.buffer_mut() {
                         let n = buf.len().min(self.ed.buf.len());
                         buf[..n].copy_from_slice(&self.ed.buf[..n]);
                         let _ = buf.present();
                     }
+                    self.ed.times.present = t.elapsed().as_secs_f32() * 1000.0;
                 }
                 if self.ed.quit {
                     event_loop.exit();
@@ -737,7 +784,9 @@ pub fn run(app: App, scene_path: Option<PathBuf>) {
 /// Draw the editor without a window, `w` x `h`, and write it to `out`
 /// (for documentation and checks). With `import`, the importer is open on
 /// that model, shown once it has baked.
-pub fn shot(app: App, w: usize, h: usize, out: &str, import: Option<PathBuf>) -> Result<(), String> {
+/// `bench_move`: then move the first object 10 cm along X five times, as a
+/// drag would, and let go, printing each frame's times.
+pub fn shot(app: App, w: usize, h: usize, out: &str, import: Option<PathBuf>, bench_move: bool) -> Result<(), String> {
     let mut ed = Editor::new(app);
     let raw = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32))), ..Default::default() };
     if let Some(m) = import {
@@ -752,6 +801,26 @@ pub fn shot(app: App, w: usize, h: usize, out: &str, import: Option<PathBuf>) ->
     // renders.
     for _ in 0..4 {
         ed.frame(raw(), w, h);
+    }
+    if bench_move && !ed.app.scene.objects.is_empty() {
+        let line = |ed: &Editor, what: &str| {
+            let s = ed.app.frame.stats;
+            eprintln!("{what}: {} (layout and paint at {w} x {h}); renderer: visibility {:.0}, shade {:.0}, resolve {:.0}, shadows {:.0} ms", ed.times.line(), s.setup_ms + s.bin_ms + s.raster_ms, s.shade_ms, s.resolve_ms, s.shadow_ms);
+        };
+        ed.select(Selection::Object(0));
+        ed.frame(raw(), w, h);
+        line(&ed, "still");
+        for step in 1..=5 {
+            let o = ed.app.scene.objects[0].clone();
+            ed.app.move_object(0, o.pivot + glam::Vec3::new(0.1, 0.0, 0.0), o.rotation, o.scale);
+            ed.frame(raw(), w, h);
+            line(&ed, &format!("move step {step}"));
+        }
+        ed.app.object_settled(0);
+        for k in 1..=3 {
+            ed.frame(raw(), w, h);
+            line(&ed, &format!("let go, frame {k}"));
+        }
     }
     let frame = crate::raster::Frame { width: w, height: h, color: ed.buf.clone(), ..crate::raster::Frame::new(1, 1) };
     crate::save_png(&frame, out)
