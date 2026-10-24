@@ -503,13 +503,9 @@ impl App {
 
     /// Object `i` stopped moving: it is lit where it stands and bounce
     /// light is made again.
-    fn object_settled(&mut self, i: usize) {
+    fn object_settled(&mut self, _i: usize) {
         self.drag_start = None;
-        self.renderer.drag_ended();
-        let b = self.scene.object_bounds(i);
-        for r in self.scene.moving_clusters(i) {
-            self.renderer.moved(r, b, b, true);
-        }
+        self.renderer.drag_ended(self.settings.bake_over_frames);
     }
 
     /// The pointer let go of a manipulator.
@@ -1262,6 +1258,7 @@ fn main() {
     let mut sky_occlusion = true;
     let mut incremental_moves = true;
     let mut drag_preview = true;
+    let mut bake_over_frames = true;
     let mut bench_move = false;
     let mut bench_dir = false;
     let mut close = false;
@@ -1356,6 +1353,7 @@ fn main() {
             "--no-sky-occlusion" => sky_occlusion = false,
             "--relight-on-move" => incremental_moves = false,
             "--light-each-drag-step" => drag_preview = false,
+            "--bake-at-once" => bake_over_frames = false,
             "--bench-move" => bench_move = true,
             "--bench-dir" => bench_dir = true,
             "--close" => close = true,
@@ -1436,7 +1434,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--light-each-drag-step] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--moving-rate K] [--moving-detail K] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--light-each-drag-step] [--bake-at-once] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--moving-rate K] [--moving-detail K] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1526,6 +1524,7 @@ fn main() {
     app.settings.sky_occlusion = sky_occlusion;
     app.settings.incremental_moves = incremental_moves;
     app.settings.drag_preview = drag_preview;
+    app.settings.bake_over_frames = bake_over_frames;
     if let Some(p) = &plan {
         app.settings.shadows = p.shadows;
         app.settings.shadow_res = p.shadow_res;
@@ -1791,8 +1790,16 @@ fn main() {
             }
             app.object_settled(0);
             let t = Instant::now();
-            app.render();
-            eprintln!("let go: {:.1} ms (bounce light made again)", t.elapsed().as_secs_f32() * 1000.0);
+            for k in 1..=200 {
+                let tf = Instant::now();
+                app.render();
+                let s = app.frame.stats;
+                eprintln!("let go, frame {k}: {:.1} ms{}", tf.elapsed().as_secs_f32() * 1000.0, if s.baking { " (baking)" } else { "" });
+                if !s.baking {
+                    break;
+                }
+            }
+            eprintln!("baked in {:.1} ms (bounce light made again)", t.elapsed().as_secs_f32() * 1000.0);
             let move_out = out.replace(".png", "_moved.png");
             if save_png(&app.frame, &move_out).is_ok() {
                 eprintln!("wrote {move_out}");

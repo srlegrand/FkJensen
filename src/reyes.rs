@@ -378,6 +378,51 @@ struct Layer {
     points: Vec<(Vec3, u32)>,
 }
 
+/// How long each part of a bake spread over frames may take, ms.
+pub const BAKE_MS: f32 = 50.0;
+
+/// Where `render_pass` stops, for a bake spread over frames.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Stop {
+    Never,
+    /// After the shadow maps, the sky shares and bounce light's surfels.
+    AfterBounce,
+    /// After shading, until this many ms from the start of the frame.
+    Shade(f32),
+    /// After gathering bounce light for this many ms (None: all of it).
+    Gather(Option<f32>),
+    /// Resolve these rows in full, and no others; no bounce gathering.
+    Rows(usize, usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BakeStage {
+    Shadows,
+    Sky,
+    Cloud,
+    Bounce,
+    Shade,
+    /// Bounce light gathered, for up to `BAKE_GATHER_FRAMES` frames; the
+    /// rest is gathered after, as usual.
+    Gather(u32),
+    Resolve,
+}
+
+/// Most frames a bake waits for bounce light.
+const BAKE_GATHER_FRAMES: u32 = 4;
+
+/// A dragged object being lit where it was let go, a part a frame.
+struct Bake {
+    /// The last picture of the drag, shown until it is done.
+    shown: Vec<u32>,
+    stage: BakeStage,
+    /// The view it was let go in; another view finishes it at once.
+    view: (Mat4, usize, usize),
+    /// The next row to resolve, and how many at a time.
+    row: usize,
+    rows_per: usize,
+}
+
 /// An object being dragged (`Renderer::dragged`).
 struct Drag {
     clusters: Vec<std::ops::Range<usize>>,
@@ -389,6 +434,8 @@ struct Drag {
     turn: glam::Quat,
     background: Option<Background>,
     layer: Option<Layer>,
+    /// The last picture drawn while dragging.
+    shown: Vec<u32>,
 }
 
 /// Cluster `c` taken back by `back` (turning by `turn`): where it was when
@@ -449,6 +496,10 @@ pub struct Renderer {
     rate_scale: f32,
     /// The object being dragged, if any (`dragged`).
     drag: Option<Drag>,
+    /// A drag being baked over frames (`render_bake`).
+    bake: Option<Bake>,
+    /// The surfels were made outside a frame and are still to be lit.
+    relight_surfels: bool,
     /// Each sample's share of the sky, for the sky contrast it was made for.
     sky_share: Option<(SkyShare, u32)>,
     /// Each surfel's share of the sky, for the shares above.
@@ -542,6 +593,8 @@ impl Renderer {
             frame_no: 0,
             rate_scale: 1.0,
             drag: None,
+            bake: None,
+            relight_surfels: false,
             sky_share: None,
             surfel_share: Vec::new(),
         }
@@ -560,6 +613,11 @@ impl Renderer {
     /// `drag_ended` bakes it.
     pub fn dragged(&mut self, clusters: Vec<std::ops::Range<usize>>, from: (Vec3, Vec3), to: (Vec3, Vec3), back: glam::Affine3A) {
         let (_, turn, _) = back.to_scale_rotation_translation();
+        // A bake still going is overtaken by the new drag: its bounce light
+        // is made again with everything else.
+        if let Some(b) = self.bake.take() {
+            self.finish_bake_resets(b.stage);
+        }
         match &mut self.drag {
             Some(d) => {
                 d.clusters = clusters;
@@ -567,21 +625,127 @@ impl Renderer {
                 d.back = back;
                 d.turn = turn.normalize();
             }
-            None => self.drag = Some(Drag { clusters, start: from, now: to, back, turn: turn.normalize(), background: None, layer: None }),
+            None => self.drag = Some(Drag { clusters, start: from, now: to, back, turn: turn.normalize(), background: None, layer: None, shown: Vec::new() }),
         }
         self.vis_key = None;
     }
 
     /// The drag ended: the object is lit where it stands, as `moved` from
     /// where the drag began, and bounce light is made again.
-    pub fn drag_ended(&mut self) {
-        self.bounce = None;
-        if let Some(d) = self.drag.take() {
+    ///
+    /// With `over_frames` the bake is spread over the next frames, none
+    /// much over `BAKE_MS`, and the last picture of the drag stays on
+    /// screen until it is done (`render_bake`).
+    pub fn drag_ended(&mut self, over_frames: bool) {
+        let Some(d) = self.drag.take() else {
+            self.bounce = None;
+            return;
+        };
+        self.vis_key = None;
+        let share = self.sky_share.take();
+        for r in d.clusters.clone() {
+            self.moved(r, d.start, d.now, false);
+        }
+        match d.background {
+            Some(bg) if over_frames && d.shown.len() == bg.color.len() => {
+                // The sky shares are made again a frame later.
+                self.sky_share = share;
+                self.bake = Some(Bake { shown: d.shown, stage: BakeStage::Shadows, view: bg.key, row: 0, rows_per: 64 });
+            }
+            _ => self.bounce = None,
+        }
+    }
+
+    /// What a bake left at `stage` had yet to throw away, thrown away now.
+    fn finish_bake_resets(&mut self, stage: BakeStage) {
+        if stage == BakeStage::Shadows || stage == BakeStage::Sky {
+            self.sky_share = None;
+        }
+        if matches!(stage, BakeStage::Shadows | BakeStage::Sky | BakeStage::Cloud) {
+            self.bounce = None;
+        }
+    }
+
+    /// A frame of the scene, or the next part of a bake. Each part fits in
+    /// about `BAKE_MS`, except drawing the shadow maps again and making
+    /// the surfel cloud and the sky shares, a part each. The last picture
+    /// of the drag is shown until the bake has resolved every row.
+    fn render_bake(&mut self, scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &RenderSettings, frame: &mut Frame) {
+        let Some(b) = self.bake.as_ref() else {
+            self.render_pass(scene, cam, lights, settings, frame, None, Stop::Never);
+            return;
+        };
+        let (w, h) = (frame.width, frame.height);
+        if b.view != (cam.proj * cam.view, w, h) || !settings.bake_over_frames {
+            // The view changed: the rest at once.
+            let b = self.bake.take().unwrap();
+            self.finish_bake_resets(b.stage);
             self.vis_key = None;
-            for r in d.clusters {
-                self.moved(r, d.start, d.now, true);
+            self.render_pass(scene, cam, lights, settings, frame, None, Stop::Never);
+            return;
+        }
+        let t = std::time::Instant::now();
+        let stage = b.stage;
+        let mut next = stage;
+        let mut done = false;
+        match stage {
+            BakeStage::Shadows => {
+                // Shadow maps drawn again where it was and is, and what is
+                // in its shadows marked.
+                self.render_pass(scene, cam, lights, settings, frame, None, Stop::AfterBounce);
+                next = BakeStage::Sky;
+            }
+            BakeStage::Sky => {
+                self.sky_share = None;
+                self.render_pass(scene, cam, lights, settings, frame, None, Stop::AfterBounce);
+                next = BakeStage::Cloud;
+            }
+            BakeStage::Cloud => {
+                // The surfels and receivers where things are now, lit next.
+                if settings.bounce {
+                    self.bounce = Some(Bounce::new(scene));
+                    self.relight_surfels = true;
+                } else {
+                    self.bounce = None;
+                }
+                next = BakeStage::Bounce;
+            }
+            BakeStage::Bounce => {
+                self.render_pass(scene, cam, lights, settings, frame, None, Stop::AfterBounce);
+                next = BakeStage::Shade;
+            }
+            BakeStage::Shade => {
+                if self.render_pass(scene, cam, lights, settings, frame, None, Stop::Shade(BAKE_MS)) {
+                    next = BakeStage::Gather(0);
+                }
+            }
+            BakeStage::Gather(k) => {
+                let budget = settings.bounce_budget_ms.map(|ms| ms.max(BAKE_MS));
+                let all = self.render_pass(scene, cam, lights, settings, frame, None, Stop::Gather(budget));
+                next = if all || k + 1 >= BAKE_GATHER_FRAMES { BakeStage::Resolve } else { BakeStage::Gather(k + 1) };
+            }
+            BakeStage::Resolve => {
+                let (r0, n) = (b.row, b.rows_per);
+                let r1 = (r0 + n).min(h);
+                self.render_pass(scene, cam, lights, settings, frame, None, Stop::Rows(r0, r1));
+                let ms = t.elapsed().as_secs_f32() * 1000.0;
+                let b = self.bake.as_mut().unwrap();
+                b.row = r1;
+                // Rows for the next part, from how long these took.
+                b.rows_per = ((n as f32 * BAKE_MS / ms.max(1.0)) as usize).clamp(8, h.max(8));
+                done = r1 >= h;
             }
         }
+        if done {
+            // Every row resolved: the baked picture.
+            self.bake = None;
+            frame.stats.baking = false;
+            return;
+        }
+        let b = self.bake.as_mut().unwrap();
+        b.stage = next;
+        frame.color.copy_from_slice(&b.shown);
+        frame.stats.baking = true;
     }
 
     /// For tests: in which frame each cluster's bounce light was last
@@ -652,7 +816,7 @@ impl Renderer {
         if self.drag.is_some() && settings.view == View::Shaded {
             self.render_drag(scene, cam, lights, settings, frame);
         } else {
-            self.render_pass(scene, cam, lights, settings, frame, None);
+            self.render_bake(scene, cam, lights, settings, frame);
         }
     }
 
@@ -672,7 +836,7 @@ impl Renderer {
         if d.background.as_ref().is_none_or(|b| b.key != view_key) {
             // The scene without the object.
             self.vis_key = None;
-            self.render_pass(scene, cam, lights, settings, frame, Some(raster::Part::Without(&clusters)));
+            self.render_pass(scene, cam, lights, settings, frame, Some(raster::Part::Without(&clusters)), Stop::Never);
             let bg = Background { key: view_key, color: frame.color.clone(), depth: frame.depth.clone(), tri_id: frame.tri_id.clone() };
             stats = Some(frame.stats);
             let d = self.drag.as_mut().unwrap();
@@ -696,7 +860,7 @@ impl Renderer {
             // The object alone, lit as where the drag began.
             self.vis_key = None;
             let mut f = Frame::new(w, h);
-            self.render_pass(scene, cam, lights, settings, &mut f, Some(raster::Part::Only(&clusters, settings.moving_detail)));
+            self.render_pass(scene, cam, lights, settings, &mut f, Some(raster::Part::Only(&clusters, settings.moving_detail)), Stop::Never);
             let mut points = Vec::new();
             for (i, &id) in f.tri_id.iter().enumerate() {
                 if id == NO_TRI {
@@ -801,10 +965,16 @@ impl Renderer {
         frame.stats.layer_points = layer.points.len();
         frame.stats.layer_ms = t.elapsed().as_secs_f32() * 1000.0;
         frame.vis_stamp = 0;
+        let d = self.drag.as_mut().unwrap();
+        d.shown.clear();
+        d.shown.extend_from_slice(&frame.color);
     }
 
     /// One frame of the scene, or of `part` of it.
-    fn render_pass(&mut self, scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &RenderSettings, frame: &mut Frame, part: Option<raster::Part<'_>>) {
+    /// `stop` ends it early, for a bake spread over frames; returns false
+    /// when shading was left unfinished for lack of time.
+    fn render_pass(&mut self, scene: &Scene, cam: &Camera, lights: &[PointLight], settings: &RenderSettings, frame: &mut Frame, part: Option<raster::Part<'_>>, stop: Stop) -> bool {
+        let t_pass = std::time::Instant::now();
         let part = part.unwrap_or(raster::Part::All);
         let n_lights = lights.len().min(64);
         let lights = &lights[..n_lights];
@@ -1087,7 +1257,7 @@ impl Renderer {
             }
             let surfel_share = &self.surfel_share;
             // A new surfel cloud (an object moved) is lit whole.
-            let all = global_changed || new_cloud || dir_changed;
+            let all = global_changed || new_cloud || dir_changed || std::mem::take(&mut self.relight_surfels);
             if all || !spheres.is_empty() {
                 let lit = AtomicU64::new(0);
                 // The brightest change, as an intensity (cd): how far the
@@ -1125,6 +1295,9 @@ impl Renderer {
             }
         }
         frame.stats.bounce_ms = tb.elapsed().as_secs_f32() * 1000.0;
+        if stop == Stop::AfterBounce {
+            return true;
+        }
 
         // Visibility, unless the camera and the frame are as they were.
         let vk = VisKey { occlusion: settings.occlusion, tile: settings.tile, view: cam.view, proj: cam.proj, size: (frame.width, frame.height), cull: settings.cull_backfaces, wireframe: settings.wireframe, lod_px: settings.lod_px().to_bits(), moving: Self::part_key(part) };
@@ -1174,10 +1347,20 @@ impl Renderer {
         let still_rate = settings.shading_rate_px.max(0.25) * self.rate_scale;
         let moving_rate = still_rate * settings.moving_rate.max(1.0);
         let drag = self.drag.as_ref().map(|d| (&d.clusters[..], d.back, d.turn));
+        let shade_budget = match stop {
+            Stop::Shade(ms) => Some(ms),
+            _ => None,
+        };
+        let unfinished = std::sync::atomic::AtomicBool::new(false);
         if settings.view == View::Shaded {
             self.cache.par_iter_mut().enumerate().for_each(|(ci, e)| {
                 let need_tris = need[ci];
                 if need_tris == 0 {
+                    return;
+                }
+                // Out of time: the rest next frame.
+                if shade_budget.is_some_and(|ms| t_pass.elapsed().as_secs_f32() * 1000.0 > ms) {
+                    unfinished.store(true, Ordering::Relaxed);
                     return;
                 }
                 let c = &scene.clusters[ci];
@@ -1628,11 +1811,22 @@ impl Renderer {
         frame.stats.clusters_shaded = clusters_shaded.into_inner() as usize;
         frame.stats.light_evals = evals.into_inner();
         frame.stats.light_evals_all = frame.stats.points_shaded * lights.len() as u64;
+        if let Stop::Shade(_) = stop {
+            return !unfinished.into_inner();
+        }
 
         // Gather bounce light at visible receivers that need it, nearest the
         // camera first, within the time budget.
         let tg = std::time::Instant::now();
-        if settings.bounce && settings.view == View::Shaded {
+        let rows = match stop {
+            Stop::Rows(a, b) => Some(a..b),
+            _ => None,
+        };
+        let gather_budget = match stop {
+            Stop::Gather(ms) => ms,
+            _ => settings.bounce_budget_ms,
+        };
+        if settings.bounce && settings.view == View::Shaded && rows.is_none() {
             let b = self.bounce.as_mut().expect("made above");
             let bounce_reach = b.reach(cut);
             // The receivers around what is visible that are not current.
@@ -1643,7 +1837,7 @@ impl Renderer {
             todo.sort_by(|a, c| b.receivers[*a as usize].0.distance_squared(eye).total_cmp(&b.receivers[*c as usize].0.distance_squared(eye)));
             let mut done = 0;
             for batch in todo.chunks(64) {
-                if let Some(ms) = settings.bounce_budget_ms {
+                if let Some(ms) = gather_budget {
                     if tg.elapsed().as_secs_f32() * 1000.0 > ms {
                         break;
                     }
@@ -1669,6 +1863,9 @@ impl Renderer {
             frame.stats.receivers_pending = todo.len() - done;
         }
         frame.stats.gather_ms = tg.elapsed().as_secs_f32() * 1000.0;
+        if let Stop::Gather(_) = stop {
+            return frame.stats.receivers_pending == 0;
+        }
 
         // Resolve: each pixel interpolates the shaded points under it.
         let t_res = std::time::Instant::now();
@@ -1691,6 +1888,12 @@ impl Renderer {
         let setups = &frame.setups;
         let bounce = if settings.bounce { self.bounce.as_ref() } else { None };
         self.base.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+            // A bake resolves its rows in full and leaves the rest.
+            let full_resolve = match &rows {
+                Some(r) if !r.contains(&y) => return,
+                Some(_) => true,
+                None => full_resolve,
+            };
             // The bounce blend of the pixel to the left, used again by
             // every second pixel of the same cluster: bounce light changes
             // slowly, and blending is the dearest part of a pixel.
@@ -1757,6 +1960,7 @@ impl Renderer {
         frame.color.copy_from_slice(&self.base);
         frame.stats.resolve_ms = t_res.elapsed().as_secs_f32() * 1000.0;
         self.fit_budget(settings.cache_budget, frame);
+        true
     }
 
     /// Keeps the shading cache within `budget` bytes. Clusters off screen
@@ -2752,7 +2956,7 @@ mod tests {
             r.dragged(vec![first..n], from, to, ahead.inverse());
             r.render(&scene, &cam, &lights, &settings, &mut f);
             r3.dragged(vec![first..n], from, to, ahead.inverse());
-            r3.render_pass(&scene, &cam, &lights, &settings, &mut f3, None);
+            r3.render_pass(&scene, &cam, &lights, &settings, &mut f3, None, Stop::Never);
             // Where the ball is in both, the moved picture is the ball as
             // drawn in 3D; it differs only along its outline and where its
             // shadow was.
@@ -2771,11 +2975,52 @@ mod tests {
             last = f.color.clone();
         }
         // Let go.
-        r.drag_ended();
+        r.drag_ended(false);
         r.render(&scene, &cam, &lights, &settings, &mut f);
         let mut fresh = Frame::new(w, h);
         render(&scene, &cam, &lights, &settings, &mut fresh);
         assert!(worst(&f, &fresh) <= 1, "let go: {}", worst(&f, &fresh));
+    }
+
+    /// Let go and baked over frames: the drag's last picture stays until
+    /// the bake is done, which comes out as a fresh render.
+    #[test]
+    fn a_bake_over_frames_shows_the_drag_then_the_fresh_render() {
+        let (mut scene, lights) = world();
+        let (p, idx) = crate::scene::tests::uv_sphere(24);
+        let first = scene.clusters.len();
+        let ball: Vec<Vec3> = p.iter().map(|v| *v * 0.3 + Vec3::new(0.0, 0.6, 0.0)).collect();
+        scene.push_mesh(&ball, &[], &[Vec3::new(0.8, 0.3, 0.2)], &idx);
+        let n = scene.clusters.len();
+        scene.add_object("ball".into(), first..n, Vec3::new(0.0, 0.3, 0.0), Vec3::ZERO);
+        let (w, h) = (200, 112);
+        let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.6, 0.0), 3.0, 0.15);
+        let settings = RenderSettings { adaptive: false, ..RenderSettings::new(Sky::new(30.0, true)) };
+        let mut r = Renderer::new();
+        let mut f = Frame::new(w, h);
+        r.render(&scene, &cam, &lights, &settings, &mut f);
+        let start = scene.objects[0].pivot;
+        let from = scene.object_bounds(0);
+        scene.set_object(0, start + Vec3::new(0.3, 0.0, 0.0), Vec3::ZERO, 1.0);
+        let to = scene.object_bounds(0);
+        r.dragged(vec![first..n], from, to, glam::Affine3A::from_translation(-Vec3::new(0.3, 0.0, 0.0)));
+        r.render(&scene, &cam, &lights, &settings, &mut f);
+        let dragging = f.color.clone();
+        r.drag_ended(true);
+        let mut frames = 0;
+        loop {
+            r.render(&scene, &cam, &lights, &settings, &mut f);
+            frames += 1;
+            if !f.stats.baking {
+                break;
+            }
+            assert_eq!(f.color, dragging, "frame {frames} shows the drag");
+            assert!(frames < 100);
+        }
+        assert!(frames >= 4, "{frames} frames");
+        let mut fresh = Frame::new(w, h);
+        render(&scene, &cam, &lights, &settings, &mut fresh);
+        assert!(worst(&f, &fresh) <= 1, "baked: {}", worst(&f, &fresh));
     }
 
     /// A dragged cluster is shaded where the drag began.

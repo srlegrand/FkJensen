@@ -644,7 +644,12 @@ with egui, on the CPU like everything else: egui's triangles are filled by
   the rest, nearest first. When it has turned about 11 degrees or grown
   or shrunk 1.3 times on screen its picture is drawn again. The rest of
   the scene keeps its light, shadow maps and the object's shadow where it
-  was. When it is let go it is lit where it stands (baked). It is drawn with micropolygons "Moving: micropolygons"
+  was. When it is let go it is lit where it stands (baked), a part a
+  frame, the drag's last picture staying on screen meanwhile: shadow
+  maps, sky shares, the surfel cloud, its light, shading about 50 ms a
+  frame, bounce light for up to four frames, then the picture a band of
+  rows a frame. "Bake over several frames" off (`--bake-at-once`) does it
+  in one frame. It is drawn with micropolygons "Moving: micropolygons"
   times further apart (3 at start) and a level of detail allowed
   "Moving: geometry error" times the error (3 at start); 1 turns either
   off. "Light each drag step" lights every step where it is instead.

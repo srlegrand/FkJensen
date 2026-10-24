@@ -71,6 +71,8 @@ pub struct Stats {
     pub layer_captured: bool,
     /// Moving that picture and drawing it over the rest, ms.
     pub layer_ms: f32,
+    /// A let-go object is still being baked: the picture is the drag's.
+    pub baking: bool,
     /// Shading points shaded this frame (the rest came from the cache).
     pub points_shaded: u64,
     /// Shading points the frame used.
@@ -375,6 +377,9 @@ pub struct RenderSettings {
     /// the scene's light stays, until it is let go (`reyes::Renderer::dragged`).
     /// Off: every step of a drag is lit where it is.
     pub drag_preview: bool,
+    /// Bake a let-go object over several frames, each about
+    /// `reyes::BAKE_MS`, showing the drag's last picture meanwhile.
+    pub bake_over_frames: bool,
     /// While an object is being moved, its micropolygons are this many
     /// times further apart than `shading_rate_px` (1: as when still).
     pub moving_rate: f32,
@@ -399,7 +404,7 @@ impl RenderSettings {
     }
 
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: true, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true, sky_occlusion: true, dir_lights: [DirLight::default(); MAX_DIR_LIGHTS], drag_preview: true, moving_rate: MOVING_RATE, moving_detail: MOVING_DETAIL }
+        Self { cull_backfaces: true, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true, sky_occlusion: true, dir_lights: [DirLight::default(); MAX_DIR_LIGHTS], drag_preview: true, bake_over_frames: true, moving_rate: MOVING_RATE, moving_detail: MOVING_DETAIL }
     }
 }
 

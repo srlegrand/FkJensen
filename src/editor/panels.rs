@@ -460,6 +460,9 @@ impl Editor {
                 self.app.settings.drag_preview = !each;
             }
             ui.end_row();
+            ui.label("Bake over several frames");
+            ui.checkbox(&mut self.app.settings.bake_over_frames, "").on_hover_text("When a dragged object is let go, it is lit where it stands a part a frame, the drag's last picture shown meanwhile. Off: in one frame.");
+            ui.end_row();
             ui.label("Moving: micropolygons");
             ui.add(egui::Slider::new(&mut self.app.settings.moving_rate, 1.0..=8.0).logarithmic(true).prefix("x ").suffix(" apart").max_decimals(1))
                 .on_hover_text("While an object is moved, its micropolygons are this many times further apart. 1: as when still.");

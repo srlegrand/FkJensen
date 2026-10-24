@@ -817,9 +817,13 @@ pub fn shot(app: App, w: usize, h: usize, out: &str, import: Option<PathBuf>, be
             line(&ed, &format!("move step {step}"));
         }
         ed.app.object_settled(0);
-        for k in 1..=3 {
+        for k in 1..=60 {
             ed.frame(raw(), w, h);
-            line(&ed, &format!("let go, frame {k}"));
+            let baking = ed.app.frame.stats.baking;
+            line(&ed, &format!("let go, frame {k}{}", if baking { " (baking)" } else { "" }));
+            if !baking && k > 2 {
+                break;
+            }
         }
     }
     let frame = crate::raster::Frame { width: w, height: h, color: ed.buf.clone(), ..crate::raster::Frame::new(1, 1) };
