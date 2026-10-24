@@ -144,6 +144,11 @@ pub struct Editor {
     show_item: egui::Rect,
     /// What Edit > Copy took.
     clip: Option<edit::Clip>,
+    /// Edit > Parent: the light waiting for its parent to be picked, and
+    /// whether parenting keeps where it is in the world (Maya's Preserve
+    /// Position).
+    parenting: Option<usize>,
+    pub preserve_position: bool,
 }
 
 impl Editor {
@@ -181,6 +186,8 @@ impl Editor {
             show_rect: egui::Rect::NOTHING,
             show_item: egui::Rect::NOTHING,
             clip: None,
+            parenting: None,
+            preserve_position: true,
         }
     }
 
@@ -360,6 +367,14 @@ impl Editor {
                     self.duplicate();
                     return;
                 }
+                KeyCode::KeyP if self.app.shift => {
+                    self.unparent_selected();
+                    return;
+                }
+                KeyCode::KeyP => {
+                    self.start_parenting();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -384,13 +399,51 @@ impl Editor {
 
     /// When the viewport changed the selection, show it.
     fn sync_selection(&mut self) {
+        match (self.parenting, self.app.selection) {
+            (Some(l), Selection::Object(j)) => self.finish_parenting(l, j),
+            (Some(_), Selection::Nothing) => {
+                self.parenting = None;
+                self.say("parenting cancelled", false);
+            }
+            _ => {}
+        }
         if self.app.selection != self.last_selection {
             self.last_selection = self.app.selection;
             self.inspect = Inspect::Selection;
         }
     }
 
+    /// Edit > Parent on the selected light: the next object picked is its
+    /// parent.
+    pub fn start_parenting(&mut self) {
+        if let Selection::Light(i) = self.app.selection {
+            self.parenting = Some(i);
+            self.say("pick the object to parent the light to", false);
+        }
+    }
+
+    fn finish_parenting(&mut self, light: usize, object: usize) {
+        self.parenting = None;
+        self.app.parent_light(light, object, self.preserve_position);
+        let name = self.app.scene.objects.get(object).map(|o| o.name.clone()).unwrap_or_default();
+        self.say(format!("light {} parented to {name}", light + 1), false);
+        self.app.selection = Selection::Light(light);
+        self.app.rig.selected = light;
+        self.last_selection = self.app.selection;
+        self.inspect = Inspect::Selection;
+    }
+
+    pub fn unparent_selected(&mut self) {
+        if let Selection::Light(i) = self.app.selection {
+            self.app.unparent_light(i);
+        }
+    }
+
     pub fn select(&mut self, s: Selection) {
+        if let (Some(l), Selection::Object(j)) = (self.parenting, s) {
+            self.finish_parenting(l, j);
+            return;
+        }
         if let Selection::Light(i) = s {
             self.app.rig.selected = i;
         }
@@ -625,6 +678,20 @@ impl Editor {
                 ui.separator();
                 if ui.add(egui::Button::new("Group").shortcut_text("Ctrl+G")).clicked() {
                     self.group_selected();
+                    ui.close();
+                }
+                ui.separator();
+                let light = match self.app.selection {
+                    Selection::Light(i) => Some(i),
+                    _ => None,
+                };
+                if ui.add_enabled(light.is_some(), egui::Button::new("Parent").shortcut_text("P")).on_hover_text("Then pick the object to parent the light to, in the viewport or the outliner").clicked() {
+                    self.start_parenting();
+                    ui.close();
+                }
+                ui.checkbox(&mut self.preserve_position, "Parent preserves position");
+                if ui.add_enabled(light.is_some_and(|i| self.app.rig.link(i).is_some()), egui::Button::new("Unparent").shortcut_text("Shift+P")).clicked() {
+                    self.unparent_selected();
                     ui.close();
                 }
             });
@@ -1143,6 +1210,60 @@ mod tests {
         other.open(d.join("p.fjs"));
         assert!(other.app.scene.objects.iter().any(|o| o.name == "cylinder1"));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A light parented to the ball moves with it; parented keeping its
+    /// place it does not jump, without it its position becomes an offset
+    /// from the ball's pivot; saved and opened it is still parented;
+    /// deleting the ball deletes it.
+    #[test]
+    fn lights_parent_to_objects() {
+        let mut ed = editor();
+        let start = ed.app.rig.lights[0].position;
+        ed.select(Selection::Light(0));
+        ed.start_parenting();
+        ed.select(Selection::Object(0));
+        assert_eq!(ed.app.selection, Selection::Light(0));
+        assert_eq!(ed.app.rig.link(0).map(|l| l.object), Some(0));
+        ed.app.sync_lights();
+        assert!(ed.app.rig.lights[0].position.distance(start) < 1e-5, "preserved");
+        // The ball moves and turns: the light goes with it.
+        let o = ed.app.scene.objects[0].clone();
+        ed.app.move_object(0, o.pivot + glam::Vec3::new(1.0, 0.0, 0.0), glam::Vec3::new(0.0, 1.0, 0.0), 1.0);
+        ed.app.sync_lights();
+        let want = ed.app.scene.object_frame(0).transform_point3(ed.app.scene.objects.first().map(|_| glam::Affine3A::from_scale_rotation_translation(glam::Vec3::ONE, crate::scene::euler_quat(o.rotation), o.pivot).inverse().transform_point3(start)).unwrap());
+        assert!(ed.app.rig.lights[0].position.distance(want) < 1e-4);
+        // Moved by hand, it keeps its new place relative to the ball.
+        ed.app.rig.lights[0].position += glam::Vec3::Y;
+        ed.app.sync_lights();
+        let here = ed.app.rig.lights[0].position;
+        ed.app.move_object(0, ed.app.scene.objects[0].pivot + glam::Vec3::Z, ed.app.scene.objects[0].rotation, 1.0);
+        ed.app.sync_lights();
+        assert!((ed.app.rig.lights[0].position - here - glam::Vec3::Z).length() < 1e-4);
+        // Without preserving: the position is taken as an offset.
+        ed.select(Selection::Light(0));
+        ed.unparent_selected();
+        let p = ed.app.rig.lights[0].position;
+        ed.preserve_position = false;
+        ed.start_parenting();
+        ed.select(Selection::Object(0));
+        assert!(ed.app.rig.lights[0].position.distance(ed.app.scene.object_frame(0).transform_point3(p)) < 1e-4);
+        // Saved and opened.
+        let d = std::env::temp_dir().join(format!("fkj-lp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        ed.save(d.join("l.fjs"));
+        let mut other = editor();
+        other.open(d.join("l.fjs"));
+        let ball = other.app.scene.objects.iter().position(|o| o.name == "ball").unwrap();
+        assert_eq!(other.app.rig.link(0).map(|l| l.object), Some(ball));
+        assert!(other.app.rig.lights[0].position.distance(ed.app.rig.lights[0].position) < 1e-3);
+        let _ = std::fs::remove_dir_all(&d);
+        // Deleting the ball deletes its light.
+        let n = ed.app.rig.lights.len();
+        ed.select(Selection::Object(0));
+        ed.delete_selected();
+        assert_eq!(ed.app.rig.lights.len(), n - 1);
     }
 
     /// At 1920 x 1080 the frame keeps its size as the window changes, is

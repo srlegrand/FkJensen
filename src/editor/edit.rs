@@ -42,7 +42,25 @@ impl Editor {
                 self.app.drag = None;
                 self.pending_bounce = None;
                 self.app.drag_start = None;
-                let n = self.app.scene.remove_objects(&[i]);
+                let map = self.app.scene.remove_objects(&[i]);
+                let n = map.iter().filter(|&&m| m == usize::MAX).count();
+                // Lights under what went go too, as in Maya; the rest point
+                // at where their objects went.
+                let rig = &mut self.app.rig;
+                for k in (0..rig.lights.len()).rev() {
+                    if let Some(mut l) = rig.link(k) {
+                        match map.get(l.object).copied() {
+                            Some(m) if m != usize::MAX => {
+                                l.object = m;
+                                rig.set_link(k, Some(l));
+                            }
+                            _ => {
+                                rig.selected = k;
+                                rig.remove_selected();
+                            }
+                        }
+                    }
+                }
                 self.select(Selection::Nothing);
                 self.say(format!("deleted {name}{}", if n > 1 { format!(" and {} under it", n - 1) } else { String::new() }), false);
             }

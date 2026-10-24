@@ -262,6 +262,8 @@ pub struct Scene {
     pub focus: Option<(Vec3, Vec3)>,
     /// The lights stored with the scene; `R` in the viewer resets to these.
     pub lights: Vec<PointLight>,
+    /// Per stored light: the object it is parented to, if any.
+    pub light_parents: Vec<Option<usize>>,
     /// Per-triangle texture tiles, streamed (`texture.rs`); empty when the
     /// scene has only vertex colours.
     pub textures: crate::texture::Textures,
@@ -710,6 +712,10 @@ impl Scene {
         self.clusters.extend(other.clusters.iter().map(|c| Cluster { first_vertex: c.first_vertex + vbase, first_tri: c.first_tri + tbase, material_base: c.material_base + mbase as u32, ..*c }));
         self.bounds_min = self.bounds_min.min(other.bounds_min);
         self.bounds_max = self.bounds_max.max(other.bounds_max);
+        self.light_parents.resize(self.lights.len(), None);
+        let mut lp: Vec<Option<usize>> = other.light_parents.iter().map(|p| p.map(|p| p + obase)).collect();
+        lp.resize(other.lights.len(), None);
+        self.light_parents.extend(lp);
         self.lights.extend(other.lights);
         self.samples.extend(other.samples.iter().map(|s| crate::samples::Sample { cluster: s.cluster + cbase as u32, ..*s }));
     }
@@ -803,9 +809,9 @@ impl Scene {
     }
 
     /// Delete objects `which` and everything under them: their clusters,
-    /// vertices, triangles, samples and texture tiles go. Returns how many
-    /// objects went.
-    pub fn remove_objects(&mut self, which: &[usize]) -> usize {
+    /// vertices, triangles, samples and texture tiles go. Returns where
+    /// each object went (`usize::MAX`: deleted).
+    pub fn remove_objects(&mut self, which: &[usize]) -> Vec<usize> {
         let n = self.objects.len();
         let mut gone = vec![false; n];
         for &i in which.iter().filter(|&&i| i < n) {
@@ -857,7 +863,6 @@ impl Scene {
         for o in &mut objects {
             o.parent = o.parent.map(|p| object_index[p]).filter(|&p| p != usize::MAX);
         }
-        let count = n - objects.len();
         out.objects = objects;
         // Empty groups point past the clusters.
         let total = out.clusters.len();
@@ -869,8 +874,16 @@ impl Scene {
         out.lights = std::mem::take(&mut self.lights);
         out.focus = self.focus;
         out.world = std::mem::take(&mut self.world);
+        out.light_parents = std::mem::take(&mut self.light_parents).into_iter().map(|p| p.map(|p| object_index.get(p).copied().unwrap_or(usize::MAX)).filter(|&p| p != usize::MAX)).collect();
         *self = out;
-        count
+        object_index
+    }
+
+    /// Object `i`'s frame: its pivot, rotation and scale, from its local
+    /// space to the world (what lights parented to it are placed in).
+    pub fn object_frame(&self, i: usize) -> glam::Affine3A {
+        let o = &self.objects[i];
+        glam::Affine3A::from_scale_rotation_translation(Vec3::splat(o.scale), euler_quat(o.rotation), o.pivot)
     }
 
     /// The first object that is a model: clusters of its own, not the

@@ -269,7 +269,7 @@ impl App {
         let mut cam = OrbitCamera::new();
         frame_camera(&mut cam, &scene, true);
         let rig = LightRig::new(default_rig(&scene));
-        Self {
+        let mut app = Self {
             window: None,
             context: None,
             surface: None,
@@ -309,7 +309,9 @@ impl App {
             title_fps: 0.0,
             visual: None,
             hours: sun::hour_for_dusk_lux(DEFAULT_SKY_LUX),
-        }
+        };
+        app.adopt_light_parents();
+        app
     }
 
     /// Open a scene: an .fjs, an .fja on its own, or an old .fkj.
@@ -320,6 +322,7 @@ impl App {
         self.wide = true;
         frame_camera(&mut self.cam, &self.scene, self.wide);
         self.rig = LightRig::new(default_rig(&self.scene));
+        self.adopt_light_parents();
         self.drag = None;
         self.manip = None;
         self.drag_start = None;
@@ -413,7 +416,9 @@ impl App {
         use fjs::{a3, round6};
         let mut written = fjs::save_assets(&mut self.scene, path)?;
         self.scene.lights = self.rig.lights.clone();
-        let mut f = fjs::entries(&self.scene, path, &self.rig.lights);
+        let parents: Vec<Option<usize>> = (0..self.rig.lights.len()).map(|i| self.rig.link(i).map(|l| l.object)).collect();
+        self.scene.light_parents = parents.clone();
+        let mut f = fjs::entries(&self.scene, path, &self.rig.lights, &parents);
         let s = &self.settings;
         f.directional = s
             .dir_lights
@@ -472,7 +477,61 @@ impl App {
         Camera { view: self.cam.view(), proj: self.cam.proj(aspect), eye: self.cam.eye(), near: self.cam.near() }
     }
 
+    /// Parent light `i` to object `j`, as Maya's Parent: keeping where it
+    /// is in the world (`preserve`), or taking its position as an offset
+    /// in the object's frame, so it moves with the object to there.
+    fn parent_light(&mut self, i: usize, j: usize, preserve: bool) {
+        if i >= self.rig.lights.len() || j >= self.scene.objects.len() {
+            return;
+        }
+        let frame = self.scene.object_frame(j);
+        let world = self.rig.lights[i].position;
+        let local = if preserve { frame.inverse().transform_point3(world) } else { world };
+        let at = frame.transform_point3(local);
+        self.rig.lights[i].position = at;
+        self.rig.set_link(i, Some(lights::Link { object: j, local, last: at }));
+    }
+
+    /// Unparent light `i`, where it is.
+    fn unparent_light(&mut self, i: usize) {
+        self.rig.set_link(i, None);
+    }
+
+    /// Lights parented to objects follow them; a light moved by hand keeps
+    /// its new place in its object's frame.
+    fn sync_lights(&mut self) {
+        for i in 0..self.rig.lights.len() {
+            let Some(mut l) = self.rig.link(i) else { continue };
+            if l.object >= self.scene.objects.len() {
+                self.rig.set_link(i, None);
+                continue;
+            }
+            let frame = self.scene.object_frame(l.object);
+            let p = self.rig.lights[i].position;
+            if p != l.last {
+                l.local = frame.inverse().transform_point3(p);
+            }
+            let at = frame.transform_point3(l.local);
+            if at != p {
+                self.rig.lights[i].position = at;
+            }
+            l.last = at;
+            self.rig.set_link(i, Some(l));
+        }
+    }
+
+    /// The scene's stored lights' parents onto the rig, where they are.
+    fn adopt_light_parents(&mut self) {
+        let parents = self.scene.light_parents.clone();
+        for (i, p) in parents.into_iter().enumerate().take(self.rig.lights.len()) {
+            if let Some(j) = p {
+                self.parent_light(i, j, true);
+            }
+        }
+    }
+
     fn render(&mut self) {
+        self.sync_lights();
         let cam = self.render_camera();
         self.renderer.render(&self.scene, &cam, &self.rig.lights, &self.settings, &mut self.frame);
         #[cfg(target_pointer_width = "64")]

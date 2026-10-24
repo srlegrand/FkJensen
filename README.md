@@ -732,6 +732,18 @@ origin, mid grey with a material of its own, named sphere1, cube1 and so
 on; it is built in (`src/primitives.rs`), so a scene names it as the
 asset `built-in:sphere` and no file is written for it.
 
+Lights parent to objects as in Maya: select a light, Edit > Parent (P),
+then pick the object in the viewport or the outliner; or drag the light's
+row onto the object's in the outliner. "Parent preserves position" (on at
+start, in the Edit menu) keeps the light where it is in the world; off,
+its position is taken as an offset from the object's pivot, in the
+object's frame, and it goes there. A parented light moves, turns and
+scales with its object; moved by hand, it keeps its new place relative to
+it. Edit > Unparent (Shift+P), or its row dragged onto the Lights heading,
+leaves it where it is. The outliner lists a parented light under its
+object; deleting the object deletes it, as in Maya. Scene files keep the
+parent (`docs/scene.md`).
+
 Edit, as Maya's: Copy (Ctrl+C), Paste (Ctrl+V, where it was copied),
 Duplicate (Ctrl+D), Duplicate Instanced (Ctrl+Shift+D; not built yet:
 instancing is next), Delete (Del), on the selected object (with

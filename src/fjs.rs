@@ -169,10 +169,15 @@ fn one() -> f32 {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct LightEntry {
+    /// In the world, metres, whether parented or not.
     pub position: [f32; 3],
     /// Linear RGB.
     pub color: [f32; 3],
     pub lumens: f32,
+    /// The object it is parented to: an index into `objects`. It moves
+    /// with it, keeping where it is relative to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -438,6 +443,7 @@ pub fn build(f: &SceneFile, dir: &Path, search: &[PathBuf]) -> Result<Scene, Str
         scene.set_object(i, v3(o.pivot), v3(o.rotation.map(f32::to_radians)), o.scale);
     }
     scene.lights = f.lights.iter().map(|l| PointLight { position: v3(l.position), color: v3(l.color), lumens: l.lumens.clamp(crate::scene::MIN_LUMENS, crate::scene::MAX_LUMENS) }).collect();
+    scene.light_parents = f.lights.iter().map(|l| l.parent.and_then(|p| index.get(p).copied())).collect();
     scene.focus = (0..scene.objects.len()).filter(|&i| !scene.objects[i].clusters.is_empty()).map(|i| scene.vertex_bounds(i)).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
     Ok(scene)
 }
@@ -491,7 +497,7 @@ pub fn save_assets(scene: &mut Scene, scene_path: &Path) -> Result<Vec<PathBuf>,
 
 /// The scene's objects, world and lights as file entries (the rest is the
 /// app's). Assets must have been saved (`save_assets`).
-pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight]) -> SceneFile {
+pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight], light_parents: &[Option<usize>]) -> SceneFile {
     let dir = scene_path.parent().map(Path::to_path_buf).unwrap_or_default();
     // Groups before what is in them: parents first, keeping the order
     // otherwise.
@@ -547,7 +553,11 @@ pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight]) -> Scene
         fjs: VERSION,
         world,
         objects,
-        lights: lights.iter().map(|l| LightEntry { position: a3(l.position), color: a3(l.color), lumens: round6(l.lumens) }).collect(),
+        lights: lights
+            .iter()
+            .enumerate()
+            .map(|(k, l)| LightEntry { position: a3(l.position), color: a3(l.color), lumens: round6(l.lumens), parent: light_parents.get(k).copied().flatten().filter(|&p| p < n).map(|p| at[p]) })
+            .collect(),
         ..Default::default()
     }
 }
@@ -589,7 +599,7 @@ mod tests {
         let path = d.join("my scene.fjs");
         let written = save_assets(&mut s, &path).unwrap();
         assert_eq!(written, vec![d.join("ball_one.fja")]);
-        let mut f = entries(&s, &path, &[PointLight { position: Vec3::ONE, color: Vec3::ONE, lumens: 900.0 }]);
+        let mut f = entries(&s, &path, &[PointLight { position: Vec3::ONE, color: Vec3::ONE, lumens: 900.0 }], &[]);
         f.time = Some(17.5);
         write(&path, &f).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -642,7 +652,7 @@ mod tests {
         let k = s.objects[0].materials.start + 1;
         s.materials[k].roughness = 0.9;
         s.materials[k].metallic = 1.0;
-        let f = entries(&s, &path, &[]);
+        let f = entries(&s, &path, &[], &[]);
         let ball = f.objects.iter().find(|o| o.name == "ball one").unwrap();
         assert_eq!(ball.materials.len(), 1);
         assert_eq!((ball.materials[0].index, ball.materials[0].roughness, ball.materials[0].metallic, ball.materials[0].tint), (1, Some(0.9), Some(1.0), None));
@@ -679,7 +689,7 @@ mod tests {
         s.remove_objects(&[m]);
         let path = d.join("w.fjs");
         assert!(save_assets(&mut s, &path).unwrap().is_empty());
-        let f = entries(&s, &path, &[]);
+        let f = entries(&s, &path, &[], &[]);
         assert_eq!(f.world, None);
         assert_eq!(f.objects.len(), 1);
         assert_eq!(f.objects[0].asset.as_deref(), Some("built-in:ground"));
@@ -729,7 +739,7 @@ mod tests {
         let path = d.join("old.fjs");
         let written = save_assets(&mut s, &path).unwrap();
         assert!(written.contains(&d.join("old_world.fja")), "{written:?}");
-        let f = entries(&s, &path, &[]);
+        let f = entries(&s, &path, &[], &[]);
         assert_eq!(f.world.as_deref(), Some("old_world.fja"));
         let t = build(&f, &d, &[]).unwrap();
         assert_eq!(t.clusters.len(), s.clusters.len());

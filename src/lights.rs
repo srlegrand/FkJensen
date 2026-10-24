@@ -31,8 +31,20 @@ pub const PICK_RADIUS_PX: f32 = 14.0;
 
 pub struct LightRig {
     pub lights: Vec<PointLight>,
+    /// Per light: the object it is parented to, if any (`Link`).
+    pub links: Vec<Option<Link>>,
     pub selected: usize,
     pub show: bool,
+}
+
+/// A light parented to an object: where it is in the object's frame (its
+/// pivot, rotation and scale), and where it was put in the world last, to
+/// tell a move of the light from a move of the object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Link {
+    pub object: usize,
+    pub local: Vec3,
+    pub last: Vec3,
 }
 
 /// The surface a dragged light slides on.
@@ -48,7 +60,8 @@ pub enum DragPlane {
 
 impl LightRig {
     pub fn new(lights: Vec<PointLight>) -> Self {
-        Self { lights, selected: 0, show: true }
+        let links = vec![None; lights.len()];
+        Self { lights, links, selected: 0, show: true }
     }
 
     pub fn selected_mut(&mut self) -> Option<&mut PointLight> {
@@ -82,6 +95,8 @@ impl LightRig {
         }
         let color = normalise_colour(LIGHT_COLOURS[self.lights.len() % LIGHT_COLOURS.len()]);
         self.lights.push(PointLight { position, color, lumens: lumens.clamp(MIN_LUMENS, MAX_LUMENS) });
+        self.links.resize(self.lights.len() - 1, None);
+        self.links.push(None);
         self.selected = self.lights.len() - 1;
         true
     }
@@ -97,7 +112,24 @@ impl LightRig {
     pub fn remove_selected(&mut self) {
         if self.selected < self.lights.len() {
             self.lights.remove(self.selected);
+            if self.selected < self.links.len() {
+                self.links.remove(self.selected);
+            }
             self.selected = self.selected.min(self.lights.len().saturating_sub(1));
+        }
+    }
+
+    /// Light `i`'s link, if parented.
+    pub fn link(&self, i: usize) -> Option<Link> {
+        self.links.get(i).copied().flatten()
+    }
+
+    pub fn set_link(&mut self, i: usize, l: Option<Link>) {
+        if self.links.len() < self.lights.len() {
+            self.links.resize(self.lights.len(), None);
+        }
+        if let Some(x) = self.links.get_mut(i) {
+            *x = l;
         }
     }
 

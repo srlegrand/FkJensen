@@ -14,7 +14,13 @@ enum Action {
     /// Put object .0 under .1 (None: at the top).
     Parent(usize, Option<usize>),
     Frame(usize),
+    /// Parent light .0 to object .1 (None: unparent).
+    ParentLight(usize, Option<usize>),
 }
+
+/// A point light being dragged in the outliner.
+#[derive(Clone, Copy)]
+struct LightDrag(usize);
 
 fn hhmm(h: f32) -> String {
     let m = (h.rem_euclid(24.0) * 60.0).round() as u32 % (24 * 60);
@@ -66,12 +72,11 @@ impl Editor {
             if let Some(p) = objects.header_response.dnd_release_payload::<usize>() {
                 actions.push(Action::Parent(*p, None));
             }
-            egui::CollapsingHeader::new("Lights").default_open(true).show(ui, |ui| {
-                for (i, l) in self.app.rig.lights.iter().enumerate() {
-                    let sel = self.app.selection == Selection::Light(i) && self.inspect == Inspect::Selection;
-                    let r = ui.selectable_label(sel, format!("light {}   {} lm", i + 1, thousands(l.lumens.round() as usize)));
-                    if r.clicked() {
-                        actions.push(Action::Select(Selection::Light(i)));
+            let lights = egui::CollapsingHeader::new("Lights").default_open(true).show(ui, |ui| {
+                // Lights parented to an object are listed under it.
+                for i in 0..self.app.rig.lights.len() {
+                    if self.app.rig.link(i).is_none() {
+                        self.light_row(ui, i, &mut actions);
                     }
                 }
                 for (k, d) in self.app.settings.dir_lights.iter().enumerate() {
@@ -82,8 +87,11 @@ impl Editor {
                         }
                     }
                 }
-
             });
+            // A light dropped on the heading: unparented.
+            if let Some(p) = lights.header_response.dnd_release_payload::<LightDrag>() {
+                actions.push(Action::ParentLight(p.0, None));
+            }
             ui.separator();
             for (what, name) in [(Inspect::Sun, "Sun"), (Inspect::Sky, "Sky and exposure"), (Inspect::Render, "Render settings")] {
                 if ui.selectable_label(self.inspect == what, name).clicked() {
@@ -106,6 +114,11 @@ impl Editor {
                     self.select(Selection::Object(i));
                     self.app.frame_selection();
                 }
+                Action::ParentLight(l, Some(o)) => {
+                    self.app.parent_light(l, o, self.preserve_position);
+                    self.say(format!("light {} parented to {}", l + 1, self.app.scene.objects[o].name), false);
+                }
+                Action::ParentLight(l, None) => self.app.unparent_light(l),
             }
         }
     }
@@ -129,6 +142,12 @@ impl Editor {
                     actions.push(Action::Parent(*p, Some(i)));
                 }
             }
+            if r.dnd_hover_payload::<LightDrag>().is_some() {
+                ui.painter().rect_stroke(r.rect, 2.0, egui::Stroke::new(1.5, ui.visuals().selection.stroke.color), egui::StrokeKind::Inside);
+            }
+            if let Some(p) = r.dnd_release_payload::<LightDrag>() {
+                actions.push(Action::ParentLight(p.0, Some(i)));
+            }
             if r.clicked() {
                 actions.push(Action::Select(Selection::Object(i)));
             }
@@ -146,7 +165,8 @@ impl Editor {
                 }
             });
         };
-        if kids.is_empty() {
+        let lights: Vec<usize> = (0..self.app.rig.lights.len()).filter(|&l| self.app.rig.link(l).is_some_and(|k| k.object == i)).collect();
+        if kids.is_empty() && lights.is_empty() {
             row(ui);
         } else {
             let id = ui.make_persistent_id(("outliner", i));
@@ -154,8 +174,32 @@ impl Editor {
                 for k in kids {
                     self.object_row(ui, k, actions);
                 }
+                for l in lights {
+                    self.light_row(ui, l, actions);
+                }
             });
         }
+    }
+
+    /// A point light's row: click to select, drag onto an object to parent
+    /// it, onto the Lights heading to unparent it.
+    fn light_row(&self, ui: &mut egui::Ui, i: usize, actions: &mut Vec<Action>) {
+        let l = &self.app.rig.lights[i];
+        let sel = self.app.selection == Selection::Light(i) && self.inspect == Inspect::Selection;
+        let text = egui::RichText::new(format!("light {}   {} lm", i + 1, thousands(l.lumens.round() as usize)));
+        let r = ui.selectable_label(sel, text).interact(egui::Sense::drag());
+        if r.drag_started() {
+            r.dnd_set_drag_payload(LightDrag(i));
+        }
+        if r.clicked() {
+            actions.push(Action::Select(Selection::Light(i)));
+        }
+        r.context_menu(|ui| {
+            if self.app.rig.link(i).is_some() && ui.button("Unparent").clicked() {
+                actions.push(Action::ParentLight(i, None));
+                ui.close();
+            }
+        });
     }
 
     // ---------------------------------------------------------- attributes
@@ -252,6 +296,9 @@ impl Editor {
 
     fn light_attributes(&mut self, ui: &mut egui::Ui, i: usize) {
         ui.label(format!("light {}", i + 1));
+        if let Some(o) = self.app.rig.link(i).and_then(|l| self.app.scene.objects.get(l.object)) {
+            ui.weak(format!("parented to {} (Edit > Unparent, Shift+P)", o.name));
+        }
         ui.add_space(4.0);
         let speed = (self.app.scene.focus_radius() as f64 * 0.004).max(0.0005);
         let cut = raster::cut_lux(&self.app.settings.sky, self.app.settings.exposure);

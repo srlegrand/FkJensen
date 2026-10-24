@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 24/10/2026: point lights parent to objects and groups as in Maya (Edit > Parent, P, then pick; Unparent, Shift+P; outliner drag), keeping their world position or taking it as an offset; they follow their object, and go with it when it is deleted.
 - 24/10/2026: a shelf and a Create menu as Maya's: polygon sphere, cube, cylinder and plane (built in, `built-in:<name>` in a scene), point and directional lights, empty group.
 - 24/10/2026: the ground and the mountains are objects (`built-in:ground`, `built-in:mountains`), deletable like anything else; Maya's Edit menu: Copy, Paste, Duplicate, Duplicate Instanced (next), Delete, Group, with Maya's keys. Delete leaves the attribute editor.
 - 24/10/2026: the editor gets smaller and tighter: Inter at 11.5 points, small paddings, Phosphor icons in place of worded buttons, narrower panels and timeline. Where something goes and what it is called follow Maya unless it is FkJensen's own.

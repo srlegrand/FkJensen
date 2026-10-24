@@ -48,7 +48,7 @@ left out keeps the program's own value.
 | `fjs` | format version, 1 |
 | `world` | the geometry outside every object: an `.fja` path, or left out for none; `"built-in"`, from files written before the ground and mountains were objects, gives both as objects |
 | `objects` | objects and groups, in order; a group before what is in it |
-| `lights` | point lights: `position` (metres), `color` (linear RGB), `lumens` (1 to 2,000,000) |
+| `lights` | point lights: `position` (metres, in the world), `color` (linear RGB), `lumens` (1 to 2,000,000), `parent` (the object it is parented to, an index into `objects`; it keeps its place relative to it) |
 | `directional` | up to four directional lights: `on`, `azimuth` and `elevation` (degrees; azimuth clockwise from -Z), `color`, `lux` (up to 150,000) |
 | `time` | time of day, hours; sets the sun, the sky and the exposure before the fields below, which override it |
 | `sun` | `direction` (towards the sun), `color`, `brightness` (0 to 1000) |
