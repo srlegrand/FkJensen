@@ -11,6 +11,9 @@ pub struct Material {
     /// Linear RGB, multiplied with the texture.
     pub color: Vec3,
     pub texture: Option<usize>,
+    /// GGX roughness and metalness (glTF's factors; 0.5 and 0 otherwise).
+    pub roughness: f32,
+    pub metallic: f32,
 }
 
 /// A base colour texture, linear RGB, with its mip chain.

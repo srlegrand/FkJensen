@@ -160,6 +160,17 @@ pub fn bake_logged(m: &Model, o: &Options, levels: bool, log: &dyn Fn(String)) -
         let stats = lod::LodStats { tris: vec![m.tris.len()], clusters: vec![scene.clusters.len()] };
         (source.iter().map(|&s| BakeTri::of(m, s as usize)).collect(), stats)
     };
+    // Materials: the model's, its colour and texture already in the tiles
+    // and vertex colours; each triangle's from the triangle it bakes from.
+    scene.materials = if m.materials.is_empty() {
+        vec![crate::scene::Material::default()]
+    } else {
+        m.materials.iter().take(256).map(|x| crate::scene::Material { name: x.name.clone(), tint: Vec3::ONE, roughness: x.roughness, metallic: x.metallic, specular: 0.5 }.clamped()).collect()
+    };
+    if m.materials.len() > 256 {
+        log(format!("{} materials: the ones past 256 take the 256th", m.materials.len()));
+    }
+    scene.tri_mat = tris.iter().map(|t| m.tri_material.get(t.material_of as usize).copied().unwrap_or(0).min(255) as u8).collect();
     // Surface samples and what each sees of the sky past the model itself
     // (src/samples.rs, src/transfer.rs in FkJensen).
     let ts = std::time::Instant::now();
@@ -240,6 +251,38 @@ mod tests {
     use crate::fkj;
     use glam::Vec2;
 
+    /// Each triangle keeps its material through the bake and the levels
+    /// of detail, with glTF's roughness and metalness.
+    #[test]
+    fn materials_survive_the_bake() {
+        let (p, idx) = (
+            (0..=20).flat_map(|j| (0..=20).map(move |i| Vec3::new(i as f32 * 0.05, 0.0, j as f32 * -0.05))).collect::<Vec<_>>(),
+            (0..20u32).flat_map(|j| (0..20u32).flat_map(move |i| { let a = j * 21 + i; [[a, a + 1, a + 22], [a, a + 22, a + 21]] })).collect::<Vec<_>>(),
+        );
+        let mut m = Model::default();
+        m.normals = vec![Vec3::Y; p.len()];
+        m.tri_material = idx.iter().map(|t| (p[t[0] as usize].x >= 0.5) as u32).collect();
+        m.positions = p;
+        m.tris = idx;
+        m.materials.push(model::Material { name: "left".into(), color: Vec3::ONE, texture: None, roughness: 0.2, metallic: 0.0 });
+        m.materials.push(model::Material { name: "right".into(), color: Vec3::ONE, texture: None, roughness: 0.7, metallic: 1.0 });
+        let baked = bake(&m, &Options { texel: 0.01, max_level: 1 }, true);
+        let s = &baked.scene;
+        assert_eq!(s.materials.iter().map(|x| (x.name.as_str(), x.roughness, x.metallic)).collect::<Vec<_>>(), vec![("left", 0.2, 0.0), ("right", 0.7, 1.0)]);
+        assert_eq!(s.tri_mat.len(), s.triangle_count());
+        let pos = s.positions();
+        let ind = s.indices();
+        for c in &s.clusters {
+            for t in c.first_tri..c.first_tri + c.tri_count {
+                let i = t as usize * 3;
+                let x = (pos[ind[i] as usize].x + pos[ind[i + 1] as usize].x + pos[ind[i + 2] as usize].x) / 3.0;
+                if (x - 0.5).abs() > 0.15 {
+                    assert_eq!(s.material(c, t).name, if x > 0.5 { "right" } else { "left" }, "level {}", c.lod_level);
+                }
+            }
+        }
+    }
+
     /// A 1 x 1 m quad textured with a 2 x 2 checker: the baked tiles hold
     /// the checker's colours at the right points, and reading the file back
     /// through FkJensen's streaming reader gives the same tiles.
@@ -259,7 +302,7 @@ mod tests {
             }
         }
         m.textures.push(model::Texture::from_rgb8("t".into(), 64, 64, &rgb));
-        m.materials.push(model::Material { name: "m".into(), color: Vec3::ONE, texture: Some(0) });
+        m.materials.push(model::Material { name: "m".into(), color: Vec3::ONE, texture: Some(0), roughness: 0.5, metallic: 0.0 });
         let baked = bake(&m, &Options { texel: 0.001, max_level: 5 }, false);
         assert_eq!(baked.scene.clusters.len(), 1);
         let e = baked.scene.textures.entry(0);
@@ -308,7 +351,7 @@ mod tests {
         m.tris = vec![[0, 1, 2]];
         m.tri_material = vec![0];
         m.textures.push(model::Texture::from_rgb8("t".into(), 16, 16, &vec![128; 16 * 16 * 3]));
-        m.materials.push(model::Material { name: "m".into(), color: Vec3::ONE, texture: Some(0) });
+        m.materials.push(model::Material { name: "m".into(), color: Vec3::ONE, texture: Some(0), roughness: 0.5, metallic: 0.0 });
         // 128 texels: level 4 by texels; a 1 cm triangle at 2 mm: level 2.
         let t = BakeTri::of(&m, 0);
         assert_eq!(wanted_level(&m, t, &Options { texel: 0.002, max_level: 5 }, 0.0), 2);

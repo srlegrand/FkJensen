@@ -111,7 +111,7 @@ pub fn load(path: &Path, texture: Option<&Path>) -> Result<Model, String> {
         }
         None => None,
     };
-    m.materials.push(Material { name: "obj".into(), color: if tex.is_some() { Vec3::ONE } else { Vec3::splat(0.6) }, texture: tex });
+    m.materials.push(Material { name: "obj".into(), color: if tex.is_some() { Vec3::ONE } else { Vec3::splat(0.6) }, texture: tex, roughness: 0.5, metallic: 0.0 });
     Ok(m)
 }
 

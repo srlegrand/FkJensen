@@ -68,6 +68,7 @@ An object:
 | `rotation` | degrees about X, Y and Z, applied in that order (Maya's xyz); 0 when left out |
 | `scale` | uniform; 1 when left out |
 | `parent` | the group it is in, the index of an earlier entry in `objects` |
+| `materials` | how its materials differ from its asset's in this scene: each an `index` (from 0, in the asset's order), its `name` (for reading), and whichever of `tint`, `roughness`, `metallic`, `specular` differ |
 
 `pivot`, `rotation` and `scale` are absolute, from the rest the asset
 stores (`docs/format.md`): an asset made by `fkj-import` rests at the

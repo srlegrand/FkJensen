@@ -36,7 +36,7 @@ use glam::{Mat4, Vec3};
 use rayon::prelude::*;
 
 use crate::bounce::{self, Bounce};
-use crate::raster::{self, Camera, Frame, NO_TRI, NOT_VISIBLE, RenderSettings, SPECULAR, Sky, View};
+use crate::raster::{self, Camera, Frame, NO_TRI, NOT_VISIBLE, RenderSettings, Sky, View};
 use crate::scene::{PointLight, Scene};
 use crate::shadow::CubeShadow;
 use crate::sun::SunShadow;
@@ -628,6 +628,18 @@ impl Renderer {
             None => self.drag = Some(Drag { clusters, start: from, now: to, back, turn: turn.normalize(), background: None, layer: None, shown: Vec::new() }),
         }
         self.vis_key = None;
+    }
+
+    /// The materials of clusters `clusters` changed: their shading goes,
+    /// and is made again where they are seen.
+    pub fn materials_changed(&mut self, clusters: std::ops::Range<usize>) {
+        for c in clusters {
+            if let Some(e) = self.cache.get_mut(c) {
+                *e = ClusterShade::empty();
+            }
+        }
+        // The resolved picture keeps nothing of them.
+        self.base_view = None;
     }
 
     /// The drag ended: the object is lit where it stands, as `moved` from
@@ -1527,6 +1539,18 @@ impl Renderer {
                 // The points of the vertices `vbits` and grids `tbits` into
                 // a batch, normals turned to the side each was last shaded
                 // from; their places: vertices, then runs of grid points.
+                // A vertex's material: that of the first triangle using it.
+                let vmat: [u32; crate::scene::CLUSTER_VERTS] = {
+                    let mut m = [u32::MAX; crate::scene::CLUSTER_VERTS];
+                    for t in c.first_tri..c.first_tri + c.tri_count {
+                        for l in scene.tris[t as usize] {
+                            if m[l as usize] == u32::MAX {
+                                m[l as usize] = t;
+                            }
+                        }
+                    }
+                    m
+                };
                 let gather = |e: &ClusterShade, vbits: u128, tbits: u128, batch: &mut Batch, vdest: &mut Vec<usize>, gdest: &mut Vec<(usize, usize)>, dims: &mut Vec<(usize, usize)>| {
                     let mut bits = vbits;
                     while bits != 0 {
@@ -1534,7 +1558,8 @@ impl Renderer {
                         bits &= bits - 1;
                         let v = fv + u;
                         let side = if e.vback & (1u128 << u) != 0 { -1.0 } else { 1.0 };
-                        batch.push(scene.pos(c, v), scene.normal(c, v) * side, scene.color(v));
+                        let mat = scene.material(c, if vmat[u] == u32::MAX { c.first_tri } else { vmat[u] });
+                        batch.push(scene.pos(c, v), scene.normal(c, v) * side, scene.color(v), mat);
                         vdest.push(u);
                     }
                     let mut bits = tbits;
@@ -1551,6 +1576,7 @@ impl Renderer {
                         let (s0, su, sv) = d.screen_affine();
                         let (n0, n1, n2) = (scene.normal(c, i0), scene.normal(c, i1), scene.normal(c, i2));
                         let (c0, c1, c2) = (scene.color(i0), scene.color(i1), scene.color(i2));
+                        let mat = scene.material(c, c.first_tri + u as u32);
                         // Eight points of a row at a time.
                         use crate::simd::F;
                         let steps = F::from([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
@@ -1582,7 +1608,7 @@ impl Renderer {
                                         std::array::from_fn(|j| Vec3::new(r[j], g[j], bl[j]))
                                     }
                                 };
-                                batch.push8(m, [px, py, pz, nx, ny, nz], &alb);
+                                batch.push8(m, [px, py, pz, nx, ny, nz], &alb, mat);
                                 b += 8;
                             }
                         }
@@ -1926,24 +1952,29 @@ impl Renderer {
                     b[0] * s.bary[0][2] + b[1] * s.bary[1][2] + b[2] * s.bary[2][2],
                 ];
                 let e = &cache[s.cluster as usize];
-                let mut radiance = lookup(scene, c, e, s.tri, w);
+                let (diffuse, highlight) = lookup_split(scene, c, e, s.tri, w);
+                // A dragged cluster where the drag began, as shaded.
+                let ci = s.cluster as usize;
+                let held = drag.filter(|(r, _, _)| r.iter().any(|r| r.contains(&ci))).map(|(_, back, turn)| (carry(c, back, turn), back.transform_point3(eye)));
+                let (c, eye) = match &held {
+                    Some((cc, e)) => (cc, *e),
+                    None => (c, eye),
+                };
+                let [i0, i1, i2] = scene.tri(c, s.tri);
+                let p = scene.pos(c, i0) * w[0] + scene.pos(c, i1) * w[1] + scene.pos(c, i2) * w[2];
+                // The normal turned to the eye.
+                let mut n = (scene.normal(c, i0) * w[0] + scene.normal(c, i1) * w[1] + scene.normal(c, i2) * w[2]).normalize_or(Vec3::Y);
+                let to_eye = (eye - p).normalize_or(n);
+                if n.dot(to_eye) < 0.0 {
+                    n = -n;
+                }
+                let mat = scene.material(c, s.tri);
+                // What the highlight takes from diffuse, seen from here.
+                let dw = mat.diffuse_view_weight(n.dot(to_eye));
+                let mut radiance = diffuse * dw + highlight;
                 if let Some(b) = bounce {
-                    // Bounce light, from the cluster's spherical harmonics,
-                    // with the normal turned to the eye.
-                    // A dragged cluster where the drag began, as shaded.
-                    let ci = s.cluster as usize;
-                    let held = drag.filter(|(r, _, _)| r.iter().any(|r| r.contains(&ci))).map(|(_, back, turn)| (carry(c, back, turn), back.transform_point3(eye)));
-                    let (c, eye) = match &held {
-                        Some((cc, e)) => (cc, *e),
-                        None => (c, eye),
-                    };
-                    let [i0, i1, i2] = scene.tri(c, s.tri);
-                    let p = scene.pos(c, i0) * w[0] + scene.pos(c, i1) * w[1] + scene.pos(c, i2) * w[2];
-                    let mut n = (scene.normal(c, i0) * w[0] + scene.normal(c, i1) * w[1] + scene.normal(c, i2) * w[2]).normalize_or(Vec3::Y);
-                    if n.dot(eye - p) < 0.0 {
-                        n = -n;
-                    }
-                    let albedo = scene.color(i0) * w[0] + scene.color(i1) * w[1] + scene.color(i2) * w[2];
+                    // Bounce light, from the cluster's spherical harmonics.
+                    let albedo = mat.diffuse(scene.color(i0) * w[0] + scene.color(i1) * w[1] + scene.color(i2) * w[2]) * dw;
                     let sh = match last {
                         Some((lx, lc, sh)) if x % 2 == 1 && lx + 1 == x && lc == s.cluster => sh,
                         _ => {
@@ -2002,12 +2033,6 @@ impl Renderer {
     }
 }
 
-/// Radiance at a point inside triangle `tri` with weights `w` over its
-/// vertices, from the kept shading.
-fn lookup(scene: &Scene, c: &crate::scene::Cluster, e: &ClusterShade, tri: u32, w: [f32; 3]) -> Vec3 {
-    lookup_part(scene, c, e, tri, w, Part::All)
-}
-
 #[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
 /// Which part of the kept shading to read.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -2016,6 +2041,36 @@ pub enum Part {
     Highlight,
 }
 
+/// Diffuse and highlight radiance at a point inside triangle `tri` with
+/// weights `w`, from the kept shading.
+fn lookup_split(scene: &Scene, c: &crate::scene::Cluster, e: &ClusterShade, tri: u32, w: [f32; 3]) -> (Vec3, Vec3) {
+    let u = (tri - c.first_tri) as usize;
+    let state = e.state.get(u).copied().unwrap_or(UNDICED);
+    if state == UNDICED {
+        return (Vec3::ZERO, Vec3::ZERO);
+    }
+    if state == ON_VERTICES {
+        let l = scene.tris[tri as usize];
+        let (mut d, mut s) = (Vec3::ZERO, Vec3::ZERO);
+        for k in 0..3 {
+            let v = l[k] as usize;
+            d += e.vdiffuse[v] * w[k];
+            s += e.vspec[v] * w[k];
+        }
+        return (d, s);
+    }
+    let g = &e.grids[state as usize];
+    let (u, v) = g.screen_to_grid(tri_to_screen(w, g.w));
+    let (nu, nv) = (1usize << g.lu, 1usize << g.lv);
+    let (fu, fv) = (u * nu as f32, v * nv as f32);
+    let (a, b) = ((fu as usize).min(nu - 1), (fv as usize).min(nv - 1));
+    let (fu, fv) = (fu - a as f32, fv - b as f32);
+    let k = |a: usize, b: usize| g.offset as usize + a * (nv + 1) + b;
+    let mix = |arr: &[Vec3]| (arr[k(a, b)] * (1.0 - fu) + arr[k(a + 1, b)] * fu) * (1.0 - fv) + (arr[k(a, b + 1)] * (1.0 - fu) + arr[k(a + 1, b + 1)] * fu) * fv;
+    (mix(&e.diffuse), mix(&e.spec))
+}
+
+#[cfg_attr(not(target_pointer_width = "64"), allow(dead_code))]
 fn lookup_part(scene: &Scene, c: &crate::scene::Cluster, e: &ClusterShade, tri: u32, w: [f32; 3], part: Part) -> Vec3 {
     let u = (tri - c.first_tri) as usize;
     let state = e.state.get(u).copied().unwrap_or(UNDICED);
@@ -2057,9 +2112,9 @@ pub struct SunLit<'a> {
     pub shadow: Option<&'a SunShadow>,
 }
 
-/// Diffuse and highlight radiance (cd/m²) leaving a point towards `eye`,
-/// and how many lights were evaluated. `n` is already turned to the eye's
-/// side.
+/// Diffuse radiance (cd/m²) leaving a point (a surfel: it has no
+/// highlight), and how many lights were evaluated. `n` is already turned
+/// to the eye's side.
 #[allow(clippy::too_many_arguments)]
 fn shade_point(
     p: Vec3,
@@ -2073,11 +2128,10 @@ fn shade_point(
     reach: &[f32],
     shadows: &[Option<&CubeShadow>],
     suns: &[SunLit],
-) -> (Vec3, Vec3, u64) {
+) -> (Vec3, u64) {
     let inv_pi = std::f32::consts::FRAC_1_PI;
+    let _ = eye;
     let mut diffuse = albedo * sky.irradiance_from(n, ground) * inv_pi;
-    let mut spec = Vec3::ZERO;
-    let v = (eye - p).normalize_or(n);
     let mut evals = 0;
     // The sun and directional lights: everywhere, parallel, each through
     // its own map.
@@ -2091,8 +2145,6 @@ fn shade_point(
             if vis > 0.0 {
                 let e = sun.lux * (ndl * vis);
                 diffuse += e * albedo * inv_pi;
-                let h = (sun.dir + v).normalize_or(sun.dir);
-                spec += e * (pow48(n.dot(h).max(0.0)) * SPECULAR * inv_pi);
             }
         }
     }
@@ -2118,25 +2170,13 @@ fn shade_point(
         }
         let e = l.color * (l.candela() / d2 * ndl * vis);
         diffuse += e * albedo * inv_pi;
-        let h = (ldir + v).normalize_or(ldir);
-        spec += e * (pow48(n.dot(h).max(0.0)) * SPECULAR * inv_pi);
     }
-    (diffuse, spec, evals)
+    (diffuse, evals)
 }
 
 /// Lights that keep a share of their own in the shading cache.
 const HOT_LIGHTS: usize = 1;
 
-/// x to the 48th, the highlight's sharpness: five squarings and a product,
-/// not a `powf`.
-#[inline]
-fn pow48(x: f32) -> f32 {
-    let x2 = x * x;
-    let x4 = x2 * x2;
-    let x8 = x4 * x4;
-    let x16 = x8 * x8;
-    x16 * x16 * x16
-}
 
 /// Points to shade, a component per array (structure of arrays), so eight
 /// are shaded at once.
@@ -2148,9 +2188,15 @@ pub struct Batch {
     pub nx: Vec<f32>,
     pub ny: Vec<f32>,
     pub nz: Vec<f32>,
+    /// What multiplies diffuse light (`Material::diffuse`).
     pub ar: Vec<f32>,
     pub ag: Vec<f32>,
     pub ab: Vec<f32>,
+    /// Reflectance facing the eye (`Material::f0`), and roughness.
+    pub fr: Vec<f32>,
+    pub fg: Vec<f32>,
+    pub fb: Vec<f32>,
+    pub rough: Vec<f32>,
     /// Each point's share of the sky and of the ground's light
     /// (`transfer.rs`); empty: all of both.
     pub sv: Vec<f32>,
@@ -2163,9 +2209,9 @@ impl Batch {
     }
 
     /// The first `m` lanes of eight points (position and normal, a
-    /// component a lane group) with their albedos.
+    /// component a lane group) with their base colours, of material `mat`.
     #[inline]
-    pub fn push8(&mut self, m: usize, pn: [crate::simd::F; 6], albedo: &[Vec3; 8]) {
+    pub fn push8(&mut self, m: usize, pn: [crate::simd::F; 6], albedo: &[Vec3; 8], mat: &crate::scene::Material) {
         let [px, py, pz, nx, ny, nz] = pn.map(|v| v.to_array());
         self.px.extend_from_slice(&px[..m]);
         self.py.extend_from_slice(&py[..m]);
@@ -2174,23 +2220,33 @@ impl Batch {
         self.ny.extend_from_slice(&ny[..m]);
         self.nz.extend_from_slice(&nz[..m]);
         for a in &albedo[..m] {
-            self.ar.push(a.x);
-            self.ag.push(a.y);
-            self.ab.push(a.z);
+            self.surface(*a, mat);
         }
     }
 
+    /// A point of base colour `albedo` and material `mat`.
     #[inline]
-    pub fn push(&mut self, p: Vec3, n: Vec3, albedo: Vec3) {
+    pub fn push(&mut self, p: Vec3, n: Vec3, albedo: Vec3, mat: &crate::scene::Material) {
         self.px.push(p.x);
         self.py.push(p.y);
         self.pz.push(p.z);
         self.nx.push(n.x);
         self.ny.push(n.y);
         self.nz.push(n.z);
-        self.ar.push(albedo.x);
-        self.ag.push(albedo.y);
-        self.ab.push(albedo.z);
+        self.surface(albedo, mat);
+    }
+
+    #[inline]
+    fn surface(&mut self, albedo: Vec3, mat: &crate::scene::Material) {
+        let d = mat.diffuse(albedo);
+        let f = mat.f0(albedo);
+        self.ar.push(d.x);
+        self.ag.push(d.y);
+        self.ab.push(d.z);
+        self.fr.push(f.x);
+        self.fg.push(f.y);
+        self.fb.push(f.z);
+        self.rough.push(mat.roughness.clamp(0.02, 1.0));
     }
 }
 
@@ -2198,7 +2254,7 @@ impl Batch {
     /// The points `idx` of this batch, in that order.
     fn select(&self, idx: &[u32]) -> Batch {
         let pick = |v: &Vec<f32>| if v.is_empty() { Vec::new() } else { idx.iter().map(|&i| v[i as usize]).collect() };
-        Batch { px: pick(&self.px), py: pick(&self.py), pz: pick(&self.pz), nx: pick(&self.nx), ny: pick(&self.ny), nz: pick(&self.nz), ar: pick(&self.ar), ag: pick(&self.ag), ab: pick(&self.ab), sv: pick(&self.sv), gv: pick(&self.gv) }
+        Batch { px: pick(&self.px), py: pick(&self.py), pz: pick(&self.pz), nx: pick(&self.nx), ny: pick(&self.ny), nz: pick(&self.nz), ar: pick(&self.ar), ag: pick(&self.ag), ab: pick(&self.ab), fr: pick(&self.fr), fg: pick(&self.fg), fb: pick(&self.fb), rough: pick(&self.rough), sv: pick(&self.sv), gv: pick(&self.gv) }
     }
 
     fn albedo(&self, i: usize) -> Vec3 {
@@ -2415,13 +2471,9 @@ pub fn shade_batch(
     let sky_fill = sky.lux * (1.0 - 2.0 * sky_c).exp2();
     let ground_k = if ground { crate::raster::GROUND_TINT * crate::raster::GROUND_BOUNCE } else { Vec3::ZERO };
     let sky_exp = 1.0 + 6.0 * (sky_c - 0.5);
-    let pow48 = |x: f32x8| {
-        let x2 = x * x;
-        let x4 = x2 * x2;
-        let x8 = x4 * x4;
-        let x16 = x8 * x8;
-        x16 * x16 * x16
-    };
+    // The sky's light from direction with up component `y` (0 down, 1
+    // up), as its diffuse term shapes it, and the ground's.
+    let sky_shape = |up: f32x8| if sky_c <= 0.5 { one + (up - one) * (2.0 * sky_c) } else { (up.max(f32x8::splat(1e-30)).ln() * sky_exp).exp() };
     let norm = |x: f32x8, y: f32x8, z: f32x8| {
         let l2 = x * x + y * y + z * z;
         let inv = f32x8::ONE / l2.max(f32x8::splat(1e-30)).sqrt();
@@ -2441,37 +2493,81 @@ pub fn shade_batch(
         let (px, py, pz) = (ld(&b.px), ld(&b.py), ld(&b.pz));
         let (nx, ny, nz) = (ld(&b.nx), ld(&b.ny), ld(&b.nz));
         let (ar, ag, ab) = (ld(&b.ar), ld(&b.ag), ld(&b.ab));
-        // Sky, times each point's share of it.
+        let (f0r, f0g, f0b) = (ld(&b.fr), ld(&b.fg), ld(&b.fb));
+        let rough = ld(&b.rough);
+        let (vx, vy, vz, _) = norm(eye.x - px, eye.y - py, eye.z - pz);
+        let ndv = (nx * vx + ny * vy + nz * vz).max(f32x8::splat(1e-4));
+        // GGX: alpha is roughness squared.
+        let a2 = { let a = rough * rough; a * a };
+        let alpha = rough * rough;
+        // What one bounce of GGX reflects of light from the whole
+        // hemisphere (Karis's fit of the split-sum terms A and B): for the
+        // sky's highlight, and to give back what single scattering loses
+        // on rough surfaces (Kulla and Conty 2017, as Fdez-Agüera 2019).
+        let (env_a, env_b) = {
+            let r0 = rough * -1.0 + 1.0;
+            let r1 = rough * -0.0275 + 0.0425;
+            let r2 = rough * -0.572 + 1.04;
+            let r3 = rough * 0.022 - 0.04;
+            let a004 = (r0 * r0).min((ndv * (-9.28 * std::f32::consts::LN_2)).exp()) * r0 + r1;
+            (a004 * -1.04 + r2, a004 * 1.04 + r3)
+        };
+        let ess = (env_a + env_b).max(f32x8::splat(1e-3));
+        let ms = |f0: f32x8| one + f0 * (one / ess - one);
+        let (msr, msg, msb) = (ms(f0r), ms(f0g), ms(f0b));
+        // Sky, times each point's share of it: diffuse from the normal, the
+        // highlight from the mirror direction (towards the normal as it
+        // roughens), weighted as the split sum weights it.
         let (mut dr, mut dg, mut db) = (zero, zero, zero);
+        let (mut sr, mut sg, mut sb) = (zero, zero, zero);
         if sky.on {
             let up = ny * 0.5 + 0.5;
-            let mut f = if sky_c <= 0.5 { one + (up - one) * (2.0 * sky_c) } else { (up.max(f32x8::splat(1e-30)).ln() * sky_exp).exp() };
+            let mut f = sky_shape(up);
             let mut g = one - up;
-            if !b.sv.is_empty() {
-                f *= ld(&b.sv);
-                g *= ld(&b.gv);
-            }
+            let (sv, gv) = if b.sv.is_empty() { (one, one) } else { (ld(&b.sv), ld(&b.gv)) };
+            f *= sv;
+            g *= gv;
             let s = sky_fill * inv_pi;
             dr = ar * (f * (sky.tint.x * s) + g * (ground_k.x * s));
             dg = ag * (f * (sky.tint.y * s) + g * (ground_k.y * s));
             db = ab * (f * (sky.tint.z * s) + g * (ground_k.z * s));
+            let k = ndv * 2.0;
+            let (rx, ry, rz) = (nx * k - vx, ny * k - vy, nz * k - vz);
+            let t = rough * rough;
+            let (_, ry, _, _) = norm(rx + (nx - rx) * t, ry + (ny - ry) * t, rz + (nz - rz) * t);
+            let rup = ry * 0.5 + 0.5;
+            let fs = sky_shape(rup) * sv;
+            let gs = (one - rup) * gv;
+            let w = |f0: f32x8| f0 * env_a + env_b;
+            sr = (fs * (sky.tint.x * s) + gs * (ground_k.x * s)) * w(f0r) * msr;
+            sg = (fs * (sky.tint.y * s) + gs * (ground_k.y * s)) * w(f0g) * msg;
+            sb = (fs * (sky.tint.z * s) + gs * (ground_k.z * s)) * w(f0b) * msb;
         }
-        let (mut sr, mut sg, mut sb) = (zero, zero, zero);
-        let (vx, vy, vz, _) = norm(eye.x - px, eye.y - py, eye.z - pz);
         let lane = |a: f32x8| a.to_array();
         // One light: illuminance per channel `e` (already times n.l and
-        // visibility), direction to it; adds diffuse and highlight.
-        let mut add = |e: f32x8, (lx, ly, lz): (f32x8, f32x8, f32x8), col: Vec3, dr: &mut f32x8, dg: &mut f32x8, db: &mut f32x8| {
+        // visibility), n.l, direction to it; adds diffuse and highlight
+        // (GGX distribution, height-correlated Smith visibility, Schlick's
+        // Fresnel).
+        let mut add = |e: f32x8, ndl: f32x8, (lx, ly, lz): (f32x8, f32x8, f32x8), col: Vec3, dr: &mut f32x8, dg: &mut f32x8, db: &mut f32x8| {
             let (hx, hy, hz, _) = norm(lx + vx, ly + vy, lz + vz);
             let ndh = (nx * hx + ny * hy + nz * hz).max(zero);
-            let hl = pow48(ndh) * (SPECULAR * inv_pi);
+            let vdh = (vx * hx + vy * hy + vz * hz).max(zero);
+            let q = ndh * ndh * (a2 - one) + one;
+            let d = a2 / (q * q * std::f32::consts::PI).max(f32x8::splat(1e-12));
+            let ndl = ndl.max(f32x8::splat(1e-4));
+            // Height-correlated Smith, as Hammon (2017) approximates it:
+            // no square roots.
+            let two_lv = ndl * ndv * 2.0;
+            let vis = f32x8::splat(0.5) / (two_lv + (ndl + ndv - two_lv) * alpha).max(f32x8::splat(1e-12));
+            let fw = { let x = one - vdh; let x2 = x * x; x2 * x2 * x };
+            let dv = d * vis;
             let (er, eg, eb) = (e * col.x, e * col.y, e * col.z);
             *dr += er * ar * inv_pi;
             *dg += eg * ag * inv_pi;
             *db += eb * ab * inv_pi;
-            sr += er * hl;
-            sg += eg * hl;
-            sb += eb * hl;
+            sr += er * dv * (f0r + (one - f0r) * fw) * msr;
+            sg += eg * dv * (f0g + (one - f0g) * fw) * msg;
+            sb += eb * dv * (f0b + (one - f0b) * fw) * msb;
         };
         // The sun and the directional lights.
         for sun in suns {
@@ -2488,7 +2584,7 @@ pub fn shade_batch(
                 let e = ndl.max(zero) * f32x8::from(vis);
                 let dir = (f32x8::splat(sun.dir.x), f32x8::splat(sun.dir.y), f32x8::splat(sun.dir.z));
                 // The sun's lux is per channel: colour it in `add`.
-                add(e, dir, sun.lux, &mut dr, &mut dg, &mut db);
+                add(e, ndl, dir, sun.lux, &mut dr, &mut dg, &mut db);
             }
         }
         // Point lights in reach of the cluster.
@@ -2513,7 +2609,7 @@ pub fn shade_batch(
                 None => std::array::from_fn(|j| if lit & (1 << j) != 0 { 1.0 } else { 0.0 }),
             };
             let e = f32x8::splat(l.candela()) / d2 * ndl.max(zero) * f32x8::from(vis);
-            add(e, (lx, ly, lz), l.color, &mut dr, &mut dg, &mut db);
+            add(e, ndl, (lx, ly, lz), l.color, &mut dr, &mut dg, &mut db);
         }
         let (dr, dg, db, sr, sg, sb) = (lane(dr), lane(dg), lane(db), lane(sr), lane(sg), lane(sb));
         for j in 0..m {
@@ -2552,7 +2648,7 @@ pub fn shading_rate(seconds: f64) -> f64 {
                 for i in c * CHUNK..((c + 1) * CHUNK).min(n) {
                     let a = i as f32 * 0.618;
                     let nn = Vec3::new(a.sin(), (a * 1.7).cos(), (a * 0.3).sin()).normalize_or(Vec3::Y);
-                    b.push(nn * 0.5 + Vec3::new(0.0, 0.5, 0.0), nn, Vec3::splat(0.5));
+                    b.push(nn * 0.5 + Vec3::new(0.0, 0.5, 0.0), nn, Vec3::splat(0.5), &crate::scene::Material::default());
                 }
                 let mut d = vec![Vec3::ZERO; b.len()];
                 let mut sp = vec![Vec3::ZERO; b.len()];
@@ -3048,6 +3144,55 @@ mod tests {
         }
     }
 
+    /// White under an even sky (a furnace test): a white dielectric of
+    /// any roughness, seen from any angle, sends back about what reaches
+    /// it and never more; a white metal at most that.
+    #[test]
+    fn white_under_an_even_sky_conserves_energy() {
+        let sky = Sky { contrast: 0.0, ..Sky::new(100.0, true) };
+        let l = sky.irradiance_from(Vec3::Y, false).x * std::f32::consts::FRAC_1_PI;
+        for metallic in [0.0, 1.0] {
+            for rough in [0.05, 0.3, 0.6, 1.0] {
+                for deg in [0.0f32, 45.0, 75.0, 85.0] {
+                    let mat = crate::scene::Material { tint: Vec3::ONE, roughness: rough, metallic, specular: 0.5, ..Default::default() };
+                    let mut b = Batch::default();
+                    b.push(Vec3::ZERO, Vec3::Y, Vec3::ONE, &mat);
+                    let eye = Vec3::new(deg.to_radians().sin(), deg.to_radians().cos(), 0.0) * 10.0;
+                    let (mut d, mut sp) = (vec![Vec3::ZERO], vec![Vec3::ZERO]);
+                    shade_batch(&b, eye, sky, false, &[], &[], &[], &[], &[], &mut d, &mut sp, true);
+                    // Diffuse as the resolve weighs it for this view.
+                    let k = (d[0].x * mat.diffuse_view_weight(deg.to_radians().cos()) + sp[0].x) / l;
+                    let lo = if metallic > 0.5 { 0.6 } else { 0.85 };
+                    assert!(k <= 1.08 && k >= lo, "metallic {metallic}, roughness {rough}, {deg} degrees: {k} of what arrives");
+                }
+            }
+        }
+    }
+
+    /// A metal has no diffuse light, and a rougher surface spreads its
+    /// highlight wider and lower.
+    #[test]
+    fn metal_and_roughness_change_the_light() {
+        let light = [PointLight { position: Vec3::new(0.0, 2.0, 0.0), color: Vec3::ONE, lumens: 1000.0 }];
+        let shade = |mat: crate::scene::Material, eye: Vec3| {
+            let mut b = Batch::default();
+            b.push(Vec3::ZERO, Vec3::Y, Vec3::splat(0.5), &mat);
+            let (mut d, mut sp) = (vec![Vec3::ZERO], vec![Vec3::ZERO]);
+            shade_batch(&b, eye, Sky::new(0.0, false), false, &light, &[0], &[f32::INFINITY], &[None], &[], &mut d, &mut sp, true);
+            (d[0], sp[0])
+        };
+        let metal = crate::scene::Material { metallic: 1.0, ..Default::default() };
+        let (d, s) = shade(metal, Vec3::new(0.0, 3.0, 0.0));
+        assert_eq!(d, Vec3::ZERO);
+        assert!(s.x > 0.0);
+        let smooth = crate::scene::Material { roughness: 0.15, ..Default::default() };
+        let rough = crate::scene::Material { roughness: 0.8, ..Default::default() };
+        // Facing the mirror direction: the smooth one is brighter; well off
+        // it, the rough one.
+        assert!(shade(smooth.clone(), Vec3::new(0.0, 3.0, 0.0)).1.x > 4.0 * shade(rough.clone(), Vec3::new(0.0, 3.0, 0.0)).1.x);
+        assert!(shade(rough, Vec3::new(3.0, 1.0, 0.0)).1.x > shade(smooth, Vec3::new(3.0, 1.0, 0.0)).1.x);
+    }
+
     /// A card between a light and the floor darkens the floor under it.
     #[test]
     fn the_renderer_draws_shadows() {
@@ -3095,7 +3240,8 @@ mod tests {
         render(&scene, &cam, &[], &settings, &mut f);
         let px = f.color[h / 2 * w + w / 2];
         let (r, g, b) = ((px >> 16) & 255, (px >> 8) & 255, px & 255);
-        assert!(r > 40 && g < 5 && b < 5, "red from the tiles, got {r} {g} {b}");
+        // Red, with the sky's highlight (4% of it facing) on top.
+        assert!(r > 40 && g * 4 < r && b * 4 < r, "red from the tiles, got {r} {g} {b}");
         assert!(scene.textures.stats().reads >= 1);
     }
 

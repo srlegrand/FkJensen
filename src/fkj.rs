@@ -43,6 +43,7 @@ pub const TAG_TEXR: [u8; 4] = *b"TEXR";
 pub const TAG_LODS: [u8; 4] = *b"LODS";
 pub const TAG_OBJS: [u8; 4] = *b"OBJS";
 pub const TAG_SAMP: [u8; 4] = *b"SAMP";
+pub const TAG_MATS: [u8; 4] = *b"MATS";
 
 /// Extra copies of clusters `first_cluster..first_cluster + cluster_count`
 /// of the `MESH` section, each at `transform` applied to the stored
@@ -107,7 +108,8 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
     let textured = !scene.textures.is_empty();
     let objs = !scene.objects.is_empty();
     let samp = !scene.samples.is_empty();
-    head.u32(2 + !instances.is_empty() as u32 + textured as u32 + lods as u32 + objs as u32 + samp as u32);
+    let mats = !scene.materials.is_empty();
+    head.u32(2 + !instances.is_empty() as u32 + textured as u32 + lods as u32 + objs as u32 + samp as u32 + mats as u32);
     head.u32(0);
     out.write_all(&head.0)?;
 
@@ -325,6 +327,35 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
         }
         section(out, TAG_SAMP, 1, &sm.0)?;
     }
+
+    // MATS: u32 material count M, u32 cluster count C, u32 triangle count
+    // T, u32 0; per material: tint (3 f32, linear RGB), f32 roughness, f32
+    // metallic, f32 specular, u32 name bytes, the name in UTF-8 padded to
+    // 4; per cluster u32 its first material; per triangle u8 its material
+    // from its cluster's first; padded to 4.
+    if mats {
+        let t = scene.triangle_count();
+        let mut ms = W(Vec::with_capacity(16 + scene.materials.len() * 40 + scene.clusters.len() * 4 + t + 4));
+        ms.u32(scene.materials.len() as u32);
+        ms.u32(scene.clusters.len() as u32);
+        ms.u32(t as u32);
+        ms.u32(0);
+        for m in &scene.materials {
+            ms.v3(m.tint);
+            ms.f32(m.roughness);
+            ms.f32(m.metallic);
+            ms.f32(m.specular);
+            ms.u32(m.name.len() as u32);
+            ms.0.extend_from_slice(m.name.as_bytes());
+            ms.pad(4);
+        }
+        for c in &scene.clusters {
+            ms.u32(c.material_base);
+        }
+        ms.0.extend((0..t).map(|k| scene.tri_mat.get(k).copied().unwrap_or(0)));
+        ms.pad(4);
+        section(out, TAG_MATS, 1, &ms.0)?;
+    }
     Ok(())
 }
 
@@ -474,6 +505,7 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) 
     let mut lods: Option<&[u8]> = None;
     let mut objs: Option<(&[u8], u32)> = None;
     let mut samp: Option<&[u8]> = None;
+    let mut mats: Option<&[u8]> = None;
     for (tag, section_version, payload) in &list {
         match *tag {
             TAG_OBJS => objs = Some((payload, *section_version)),
@@ -483,6 +515,7 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) 
             TAG_LITE => report.skipped.push(format!("LITE version {section_version} (relative units, not lumens)")),
             TAG_INST => inst_payloads.push(payload),
             TAG_SAMP if *section_version == 1 => samp = Some(payload),
+            TAG_MATS if *section_version == 1 => mats = Some(payload),
             other => report.skipped.push(String::from_utf8_lossy(&other).into_owned()),
         }
     }
@@ -512,6 +545,9 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) 
     if let Some(b) = samp {
         read_samples(b, &mut scene, stored_clusters)?;
     }
+    if let Some(b) = mats {
+        read_materials(b, &mut scene, stored_clusters)?;
+    }
     // Instances refer to the clusters as stored, so they are expanded after
     // every MESH section has been read.
     for p in inst_payloads {
@@ -525,6 +561,136 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>) 
         scene.bounds_max = Vec3::splat(1.0);
     }
     Ok((scene, report))
+}
+
+/// Write `materials` into the file at `path` in place of the material
+/// table it has: every other section is copied as it is (texture tiles
+/// included), and which material each triangle has stays. Through a file
+/// beside it, which then replaces it.
+pub fn rewrite_materials(path: &std::path::Path, materials: &[crate::scene::Material]) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let name = path.display();
+    let err = |e: std::io::Error| format!("{name}: {e}");
+    let mut f = std::fs::File::open(path).map_err(err)?;
+    let mut head = [0u8; 16];
+    f.read_exact(&mut head).map_err(|_| format!("{name}: file is truncated"))?;
+    let count = header(&head)?;
+    // Each section: tag, where it starts (its own header) and its length
+    // with padding.
+    let mut list: Vec<([u8; 4], u64, u64)> = Vec::new();
+    let mut at = 16u64;
+    let mut buf = [0u8; 16];
+    let (mut clusters, mut tris) = (0usize, 0usize);
+    let mut old: Option<Vec<u8>> = None;
+    for _ in 0..count {
+        f.seek(SeekFrom::Start(at)).map_err(err)?;
+        f.read_exact(&mut buf).map_err(|_| format!("{name}: file is truncated"))?;
+        let tag: [u8; 4] = buf[0..4].try_into().unwrap();
+        let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let len = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let next = (at + 16 + len).div_ceil(8) * 8;
+        if tag == TAG_MESH {
+            let mut m = [0u8; 12];
+            f.read_exact(&mut m).map_err(err)?;
+            clusters = u32::from_le_bytes(m[0..4].try_into().unwrap()) as usize;
+            tris = u32::from_le_bytes(m[8..12].try_into().unwrap()) as usize;
+        }
+        if tag == TAG_MATS && version == 1 {
+            let mut p = vec![0u8; len as usize];
+            f.read_exact(&mut p).map_err(err)?;
+            old = Some(p);
+        } else {
+            list.push((tag, at, next - at));
+        }
+        at = next;
+    }
+    // Which material each cluster starts at and each triangle has: as
+    // they were, else the first.
+    let (bases, ids) = match old {
+        Some(p) => {
+            let mut r = R { b: &p, at: 0 };
+            let m = r.u32()? as usize;
+            r.at = 16;
+            for _ in 0..m {
+                r.take(24)?;
+                let len = r.u32()? as usize;
+                r.take(len)?;
+                r.at = r.at.div_ceil(4) * 4;
+            }
+            let bases: Vec<u32> = (0..clusters).map(|_| r.u32()).collect::<Result<_, _>>()?;
+            (bases, r.take(tris)?.to_vec())
+        }
+        None => (vec![0; clusters], vec![0; tris]),
+    };
+    let top = materials.len().saturating_sub(1) as u32;
+    let mut ms = W(Vec::new());
+    ms.u32(materials.len() as u32);
+    ms.u32(clusters as u32);
+    ms.u32(tris as u32);
+    ms.u32(0);
+    for m in materials {
+        ms.v3(m.tint);
+        ms.f32(m.roughness);
+        ms.f32(m.metallic);
+        ms.f32(m.specular);
+        ms.u32(m.name.len() as u32);
+        ms.0.extend_from_slice(m.name.as_bytes());
+        ms.pad(4);
+    }
+    for b in bases {
+        ms.u32(b.min(top));
+    }
+    ms.0.extend_from_slice(&ids);
+    ms.pad(4);
+    let tmp = path.with_extension("fja.part");
+    let written = (|| -> std::io::Result<()> {
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
+        out.write_all(&head[0..8])?;
+        out.write_all(&(list.len() as u32 + 1).to_le_bytes())?;
+        out.write_all(&head[12..16])?;
+        for &(_, start, len) in &list {
+            f.seek(SeekFrom::Start(start))?;
+            std::io::copy(&mut (&mut f).take(len), &mut out)?;
+        }
+        section(&mut out, TAG_MATS, 1, &ms.0)?;
+        out.flush()
+    })();
+    match written.and_then(|_| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(err(e))
+        }
+    }
+}
+
+fn read_materials(b: &[u8], scene: &mut Scene, stored_clusters: usize) -> Result<(), String> {
+    let mut r = R { b, at: 0 };
+    let m = r.u32()? as usize;
+    let c = r.u32()? as usize;
+    let t = r.u32()? as usize;
+    r.u32()?;
+    if c != stored_clusters || t != scene.triangle_count() || m > 1 << 20 {
+        return Err(format!("MATS has {c} clusters and {t} triangles, MESH {stored_clusters} and {}", scene.triangle_count()));
+    }
+    let mut materials = Vec::with_capacity(m);
+    for _ in 0..m {
+        let tint = r.v3()?;
+        let roughness = r.f32()?;
+        let metallic = r.f32()?;
+        let specular = r.f32()?;
+        let len = r.u32()? as usize;
+        let name = String::from_utf8_lossy(r.take(len)?).into_owned();
+        r.at = r.at.div_ceil(4) * 4;
+        materials.push(crate::scene::Material { name, tint, roughness, metallic, specular }.clamped());
+    }
+    for k in 0..c {
+        let base = r.u32()?;
+        scene.clusters[k].material_base = base.min(m.saturating_sub(1) as u32);
+    }
+    scene.tri_mat = r.take(t)?.to_vec();
+    scene.materials = materials;
+    Ok(())
 }
 
 fn read_mesh(b: &[u8], scene: &mut Scene) -> Result<(), String> {
@@ -772,6 +938,7 @@ fn read_objects(b: &[u8], version: u32, scene: &mut Scene, stored_clusters: usiz
         }
     }
     for i in 0..n {
+        scene.own_materials(i);
         scene.refresh_bounds(i);
     }
     Ok(())
@@ -831,6 +998,8 @@ mod tests {
         s.scatter_over(0..s.clusters.len());
         crate::transfer::compute(&mut s.samples);
         s.lights.push(PointLight { position: Vec3::new(1.0, 2.0, 3.0), color: Vec3::new(1.0, 0.5, 0.25), lumens: 800.0 });
+        s.materials = vec![crate::scene::Material { name: "skin".into(), roughness: 0.3, ..Default::default() }, crate::scene::Material { name: "chrome".into(), metallic: 1.0, roughness: 0.1, tint: Vec3::new(0.9, 0.8, 0.7), specular: 0.5 }];
+        s.tri_mat = (0..s.triangle_count()).map(|t| (t % 3 == 0) as u8).collect();
         s
     }
 
@@ -848,6 +1017,9 @@ mod tests {
         assert_eq!(a.normals(), b.normals());
         assert_eq!(a.colors(), b.colors());
         assert_eq!(a.samples.len(), b.samples.len());
+        assert_eq!(a.materials, b.materials);
+        assert_eq!(a.tri_mat, b.tri_mat);
+        assert_eq!(a.clusters.iter().map(|c| c.material_base).collect::<Vec<_>>(), b.clusters.iter().map(|c| c.material_base).collect::<Vec<_>>());
         for c in &b.clusters {
             for v in c.first_vertex..c.first_vertex + c.vertex_count {
                 assert!(b.positions()[v as usize].distance(c.centre) <= c.radius);

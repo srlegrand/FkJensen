@@ -205,6 +205,8 @@ pub fn build() -> Scene {
 
     // Until the models are added, the subject is the middle of the plane.
     scene.focus = Some((Vec3::new(-6.0, 0.0, -6.0), Vec3::new(6.0, 5.0, 6.0)));
+    // Paving, grass and rock: rough, a dull sheen at grazing angles.
+    scene.materials = vec![crate::scene::Material { name: "ground".into(), roughness: 0.85, ..Default::default() }];
     scene
 }
 

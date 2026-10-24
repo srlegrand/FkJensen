@@ -473,6 +473,34 @@ Builds on Linux x86-64 and aarch64 (Raspberry Pi), macOS and Windows. The
 window backend is winit; on Linux it uses X11 or Wayland, whichever is
 running.
 
+## Materials
+
+Every surface reflects light the same physically based way
+(`reyes::shade_batch`): a GGX highlight with height-correlated Smith
+visibility and Schlick's Fresnel, everywhere, so even a matt surface
+shines at grazing angles; diffuse gets what the highlight leaves, seen
+from where the eye is (`Material::diffuse_view_weight`); what a single
+bounce of GGX loses on rough surfaces is given back (Kulla and Conty's
+compensation, from Karis's fit of the split sum); the sky's highlight
+comes from its light in the mirror direction. White under an even sky
+sends back what reaches it, from any angle and at any roughness, and
+never more (a test).
+
+A material (`scene::Material`) has a tint (multiplied with the asset's
+own colour, its texture tiles or vertex colours), a roughness, a
+metalness and a specular reflectance for dielectrics (0.5 is 4%, most
+materials). Assets keep their materials and which triangle has which
+(`MATS`, `docs/format.md`); `fkj-import` takes them from the model. The
+ground and mountains are one rough material.
+
+In the editor, the attribute editor lists the selected object's
+materials. A change is this scene's: it is saved in the `.fjs` as what
+differs from the asset (`docs/scene.md`), and the asset stays as it is,
+so two scenes, or two objects reading the same asset, can differ. "Reset
+to the asset's" undoes one; "Push to asset" writes them into the asset's
+`.fja` (only its material section; the rest of the file is copied as it
+is), and every scene using it gets them.
+
 ## Run
 
     cargo run --release                     the built-in set
@@ -773,8 +801,10 @@ Painting the interface took about 7 ms a frame at 1920 x 1080 on the same
    under visible pixels are diced and shaded, and only those
    whose shading was not kept: radiance in cd/m² from the sky (times the
    point's share of it, from its object's sky transfer), then each
-   light in reach through its shadow map, Lambert diffuse and a small
-   Blinn-Phong highlight. Adaptive shading: every other point of a grid
+   light in reach through its shadow map, by the point's material
+   (below): GGX highlight with Smith visibility and Schlick's Fresnel on
+   every surface, the sky's highlight from the mirror direction, and
+   diffuse what the highlight leaves. Adaptive shading: every other point of a grid
    (each way) is shaded first; where the four corners of a cell differ by
    more than about 8 of 255 the points between are shaded too, and the
    rest are interpolated, their light from the corners times their own
@@ -1067,7 +1097,13 @@ Not measured yet: a Raspberry Pi.
   finish); the importer reads the formats fkj-import reads, nothing more
   (no USD, PLY, STL, ASCII FBX yet); a large model is held twice while it
   is added (the importer's copy and the scene's).
-- Materials: albedo only, per vertex or from texture tiles.
+- Materials: one value per material for each property (no roughness or
+  metalness maps); bounce light leaves surfels coloured by their vertex
+  colours, not their materials' tint or metalness; light reach is
+  still worked out from a fixed highlight, so a very smooth surface's
+  highlight can stop at the edge of a light's reach; the repository's
+  T-rex and car were imported before materials and have the default one
+  until imported again.
 - Light reach is per cluster and per point, not per pixel.
 - The shading cache holds 118 MB for that view (186 MB before even
   dicing). Only the shading cache has a budget: geometry, shadow maps

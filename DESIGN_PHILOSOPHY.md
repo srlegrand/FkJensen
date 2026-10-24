@@ -75,6 +75,7 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 
 ## Log
 
+- 24/10/2026: materials, shaded physically on every surface: GGX with Smith visibility and Schlick's Fresnel, multiple-scattering compensation, the sky's highlight, diffuse what the highlight leaves for the eye's angle; tint, roughness, metallic and specular per material, kept per triangle in the asset (`MATS`), changed per object in a scene and pushed into the asset when wanted. Replaces the one Blinn highlight; shading costs about a third more a point.
 - 24/10/2026: the Show menu (picture, light count, visual debug views) moves from the render settings to the viewport, over its top left corner.
 - 24/10/2026: navigation buttons over the editor's viewport, so the camera moves without a mouse: pads to drag on for tumble, track and dolly, buttons held to move, and the two framings.
 - 24/10/2026: scenes and assets are separate files: an `.fjs` scene (JSON) points at `.fja` assets and holds transforms, groups, lights, sun, sky, camera and render settings; an `.fja` is one object with its baked data, in its own space, in the binary format the `.fkj` scenes used. The built-in models are `.fja` and placed by their transforms. Saving writes an `.fja` only for objects that have none; old `.fkj` scenes open and save as `.fjs`.

@@ -78,6 +78,86 @@ pub struct ObjectEntry {
     /// The group it is in: an index into `objects`, of an earlier entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<usize>,
+    /// How its materials differ from its asset's, in this scene.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub materials: Vec<MaterialEntry>,
+}
+
+/// A change to one of an object's materials: only what differs from the
+/// asset.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct MaterialEntry {
+    /// Which of the asset's materials, from 0, and its name (for reading;
+    /// the index decides).
+    pub index: usize,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tint: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roughness: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metallic: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specular: Option<f32>,
+}
+
+/// Object `i`'s materials that differ from its asset's.
+pub fn material_changes(scene: &Scene, i: usize) -> Vec<MaterialEntry> {
+    let o = &scene.objects[i];
+    let close = |a: f32, b: f32| (a - b).abs() <= 1e-6;
+    o.materials
+        .clone()
+        .enumerate()
+        .filter_map(|(k, mi)| {
+            let m = &scene.materials[mi];
+            let a = o.asset_materials.get(k).cloned().unwrap_or_default();
+            let e = MaterialEntry {
+                index: k,
+                name: m.name.clone(),
+                tint: (!m.tint.abs_diff_eq(a.tint, 1e-6)).then(|| a3(m.tint)),
+                roughness: (!close(m.roughness, a.roughness)).then(|| round6(m.roughness)),
+                metallic: (!close(m.metallic, a.metallic)).then(|| round6(m.metallic)),
+                specular: (!close(m.specular, a.specular)).then(|| round6(m.specular)),
+            };
+            (e.tint.is_some() || e.roughness.is_some() || e.metallic.is_some() || e.specular.is_some()).then_some(e)
+        })
+        .collect()
+}
+
+/// Apply a scene's changes to object `i`'s materials.
+pub fn apply_material_changes(scene: &mut Scene, i: usize, changes: &[MaterialEntry]) {
+    let r = scene.objects[i].materials.clone();
+    for e in changes {
+        let Some(m) = r.clone().nth(e.index).and_then(|k| scene.materials.get_mut(k)) else { continue };
+        if let Some(t) = e.tint {
+            m.tint = v3(t);
+        }
+        if let Some(x) = e.roughness {
+            m.roughness = x;
+        }
+        if let Some(x) = e.metallic {
+            m.metallic = x;
+        }
+        if let Some(x) = e.specular {
+            m.specular = x;
+        }
+        *m = m.clone().clamped();
+    }
+}
+
+/// Write object `i`'s materials as they are now into its asset's file,
+/// which then has them; every scene using it sees them.
+pub fn push_materials(scene: &mut Scene, i: usize) -> Result<PathBuf, String> {
+    let o = &scene.objects[i];
+    let path = o.asset.clone().filter(|p| p.exists()).ok_or_else(|| format!("{} has no asset file yet: save the scene first", o.name))?;
+    let mats = scene.materials[o.materials.clone()].to_vec();
+    crate::fkj::rewrite_materials(&path, &mats)?;
+    // Every object reading that file now rests on these.
+    for ob in scene.objects.iter_mut().filter(|ob| ob.asset.as_ref() == Some(&path)) {
+        ob.asset_materials = mats.clone();
+    }
+    Ok(path)
 }
 
 fn one() -> f32 {
@@ -279,6 +359,7 @@ pub fn load_asset(path: &Path) -> Result<Scene, String> {
     let (oname, pivot, rotation, scale) = rest.unwrap_or((name.clone(), Vec3::ZERO, Vec3::ZERO, 1.0));
     s.objects = vec![Object::new(if oname.is_empty() { name } else { oname }, 0..n, pivot, rotation, scale, None)];
     s.objects[0].asset = Some(path.to_path_buf());
+    s.own_materials(0);
     s.refresh_bounds(0);
     s.lights.clear();
     s.scatter_missing_samples();
@@ -339,6 +420,7 @@ pub fn build(f: &SceneFile, dir: &Path, search: &[PathBuf]) -> Result<Scene, Str
                 let i = scene.objects.len();
                 scene.append(m);
                 scene.objects[i].parent = parent;
+                apply_material_changes(&mut scene, i, &o.materials);
                 index.push(i);
             }
             None => {
@@ -389,6 +471,8 @@ pub fn save_assets(scene: &mut Scene, scene_path: &Path) -> Result<Vec<PathBuf>,
         let p = asset_name(&scene.objects[i].name, &dir, &written);
         write_asset(scene, i, &p)?;
         scene.objects[i].asset = Some(p.clone());
+        // The asset holds its materials as they are.
+        scene.objects[i].asset_materials = scene.materials[scene.objects[i].materials.clone()].to_vec();
         written.push(p);
     }
     if scene.world == World::Unsaved || matches!(&scene.world, World::Asset(p) if !p.exists()) {
@@ -445,6 +529,7 @@ pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight]) -> Scene
                 rotation: a3(o.rotation).map(|r| round6(r.to_degrees())),
                 scale: round6(o.scale),
                 parent: o.parent.filter(|&p| p < n && at[p] < at[i]).map(|p| at[p]),
+                materials: if o.clusters.is_empty() { Vec::new() } else { material_changes(scene, i) },
             }
         })
         .collect();
@@ -528,6 +613,50 @@ mod tests {
         // Saving again writes no asset: the object has its file.
         let mut t2 = t;
         assert!(save_assets(&mut t2, &path).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A material changed in a scene is saved as a change in the .fjs and
+    /// the asset keeps its own; pushed, the asset has it and the scene
+    /// has no change left to save.
+    #[test]
+    fn material_changes_stay_in_the_scene_until_pushed() {
+        let d = tmp("mats");
+        let mut s = ball_scene();
+        // Two materials on the ball: the first half of its triangles each.
+        let r = s.objects[0].materials.clone();
+        assert_eq!(r.len(), 1);
+        s.materials.push(crate::scene::Material { name: "second".into(), ..Default::default() });
+        s.objects[0].materials = r.start..r.start + 2;
+        let n = s.triangle_count();
+        s.tri_mat = (0..n).map(|t| (t * 2 >= n) as u8).collect();
+        s.objects[0].asset_materials = s.materials[s.objects[0].materials.clone()].to_vec();
+        let path = d.join("m.fjs");
+        save_assets(&mut s, &path).unwrap();
+        // Change the second material in the scene.
+        let k = s.objects[0].materials.start + 1;
+        s.materials[k].roughness = 0.9;
+        s.materials[k].metallic = 1.0;
+        let f = entries(&s, &path, &[]);
+        let ball = f.objects.iter().find(|o| o.name == "ball one").unwrap();
+        assert_eq!(ball.materials.len(), 1);
+        assert_eq!((ball.materials[0].index, ball.materials[0].roughness, ball.materials[0].metallic, ball.materials[0].tint), (1, Some(0.9), Some(1.0), None));
+        write(&path, &f).unwrap();
+        let t = build(&read(&path).unwrap(), &d, &[]).unwrap();
+        let tb = t.objects.iter().position(|o| o.name == "ball one").unwrap();
+        let tm = &t.materials[t.objects[tb].materials.clone()];
+        assert_eq!((tm[1].roughness, tm[1].metallic), (0.9, 1.0));
+        assert_eq!(t.objects[tb].asset_materials[1].roughness, 0.5, "the asset keeps its own");
+        // Each triangle kept its material through the asset.
+        let c0 = &t.clusters[t.objects[tb].clusters.start];
+        assert_eq!(t.material(c0, c0.first_tri).name, s.material(&s.clusters[s.objects[0].clusters.start], s.clusters[s.objects[0].clusters.start].first_tri).name);
+        // Pushed: the file has it, and nothing is left to save as a change.
+        let mut t = t;
+        push_materials(&mut t, tb).unwrap();
+        let a = load_asset(&d.join("ball_one.fja")).unwrap();
+        assert_eq!((a.materials[1].roughness, a.materials[1].metallic), (0.9, 1.0));
+        assert_eq!(a.tri_mat, crate::fjs::load_asset(&d.join("ball_one.fja")).unwrap().tri_mat);
+        assert!(material_changes(&t, tb).is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 

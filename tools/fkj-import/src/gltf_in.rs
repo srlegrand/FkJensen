@@ -56,7 +56,7 @@ pub fn load(path: &Path) -> Result<Model, String> {
                         model.textures.len() - 1
                     })
                 });
-                model.materials.push(Material { name: mat.name().unwrap_or("material").to_string(), color: Vec3::new(f[0], f[1], f[2]), texture });
+                model.materials.push(Material { name: mat.name().unwrap_or("material").to_string(), color: Vec3::new(f[0], f[1], f[2]), texture, roughness: pbr.roughness_factor(), metallic: pbr.metallic_factor() });
                 (model.materials.len() - 1) as u32
             });
 

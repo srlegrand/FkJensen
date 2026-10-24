@@ -50,6 +50,8 @@ A reader skips any section whose tag it does not know, using the length.
 | `TEXR` | per-triangle texture tiles | yes, streamed from the file |
 | `LODS` | each cluster's level of detail | yes |
 | `OBJS` | objects and groups, for the editor | yes |
+| `SAMP` | surface samples and their sky transfer | yes |
+| `MATS` | materials, and which triangle has which | yes |
 | `PNTS` | points, particles | reserved |
 | `CURV` | curves, fur and hair | reserved |
 | `VOLM` | volumes | reserved |
@@ -225,6 +227,36 @@ Instances (`INST`) copy the samples of the clusters they copy, the
 transfer turned with them when the transform is a rotation and a uniform
 scale, else NaN.
 
+## MATS
+
+Materials (`scene::Material`, shaded in `reyes::shade_batch`) and which
+each triangle has. Optional; without it every triangle has the default
+material (tint white, roughness 0.5, metallic 0, specular 0.5). Section
+version 1.
+
+    u32       material count M
+    u32       cluster count C (as MESH)
+    u32       triangle count T (as MESH)
+    u32       0
+    per material
+      f32 x 3   tint, linear RGB, multiplied with the base colour
+      f32       roughness, 0 to 1 (GGX alpha is its square)
+      f32       metallic, 0 to 1
+      f32       specular: a dielectric's reflectance facing the eye, 0 to
+                1 for 0 to 8%
+      u32       name bytes
+      the name, UTF-8, padded to 4 bytes
+    C x u32   each cluster's first material
+    T x u8    each triangle's material, counted from its cluster's first
+    padded to 4 bytes
+
+The base colour itself is in the texture tiles and vertex colours, the
+imported material's colour and texture already baked in. `fkj-import`
+writes the model's materials (glTF's roughness and metalness factors;
+0.5 and 0 from FBX and OBJ), each triangle taking that of the triangle it
+was made from, at every level of detail. The editor's "Push to asset"
+rewrites this section alone, copying the rest of the file as it is.
+
 ## LITE
 
 Section version 2.
@@ -296,8 +328,9 @@ out.fkj` adds them to a file made before them.
 
 - Points, curves and volumes: tags reserved, nothing written or read.
 - Instances are expanded at load rather than drawn from one copy.
-- Materials: albedo only, per vertex or from texture tiles. No roughness,
-  metalness, normal maps, transmission.
+- Materials: tint, roughness, metallic and specular, one value each per
+  material; no maps for them, no normal maps, no transmission. At most
+  256 materials an asset (the rest take the 256th).
 - The chess set has no tiles yet: it was baked from USD with colours per
   vertex, so detail finer than the vertex spacing is lost (the board's
   squares have soft edges). `tools/fkj-import` does not read USD.

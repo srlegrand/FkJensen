@@ -360,13 +360,13 @@ pub fn load(path: &Path, tex_dirs: &[std::path::PathBuf]) -> Result<Model, Strin
                     let name = mn.props.get(1).map(|p| p.str().split('\0').next().unwrap_or("").to_string()).unwrap_or_default();
                     // With a texture, the texture is the colour: Blender
                     // writes a placeholder diffuse colour alongside it.
-                    model.materials.push(Material { name, color: if tex.is_some() { Vec3::ONE } else { color }, texture: tex });
+                    model.materials.push(Material { name, color: if tex.is_some() { Vec3::ONE } else { color }, texture: tex, roughness: 0.5, metallic: 0.0 });
                     (model.materials.len() - 1) as u32
                 });
                 local_to_global.push(g);
             }
             if local_to_global.is_empty() {
-                model.materials.push(Material { name: "default".into(), color: Vec3::splat(0.7), texture: None });
+                model.materials.push(Material { name: "default".into(), color: Vec3::splat(0.7), texture: None, roughness: 0.5, metallic: 0.0 });
                 local_to_global.push((model.materials.len() - 1) as u32);
             }
 

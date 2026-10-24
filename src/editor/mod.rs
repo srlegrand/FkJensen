@@ -12,6 +12,7 @@
 pub mod files;
 pub mod importer;
 pub mod paint;
+mod materials;
 mod navigate;
 mod panels;
 

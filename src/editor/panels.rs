@@ -224,6 +224,9 @@ impl Editor {
             self.app.move_object(i, p, r * (std::f32::consts::PI / 180.0), k);
             self.pending_bounce = Some(i);
         }
+        if !group {
+            self.material_attributes(ui, i);
+        }
         let (lo, hi) = self.app.scene.object_bounds(i);
         let s = &self.app.scene;
         egui::CollapsingHeader::new("Information").default_open(true).show(ui, |ui| {

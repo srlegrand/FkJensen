@@ -157,6 +157,9 @@ pub struct Cluster {
     /// Its object's rotation, for normals, and whether it has one.
     pub turn: glam::Quat,
     pub turned: bool,
+    /// Its triangles' materials are `Scene::materials[material_base +
+    /// Scene::tri_mat[t]]`.
+    pub material_base: u32,
 }
 
 impl Default for Cluster {
@@ -182,6 +185,7 @@ impl Default for Cluster {
             xf: glam::Affine3A::IDENTITY,
             turn: glam::Quat::IDENTITY,
             turned: false,
+            material_base: 0,
         }
     }
 }
@@ -269,6 +273,11 @@ pub struct Scene {
     pub samples: Vec<crate::samples::Sample>,
     /// Where the geometry outside every object came from, for saving.
     pub world: World,
+    /// Materials; a cluster's start at its `material_base`.
+    pub materials: Vec<Material>,
+    /// Each triangle's material, from its cluster's `material_base`; a
+    /// triangle past the end has the first.
+    pub tri_mat: Vec<u8>,
 }
 
 /// Where a scene's geometry outside every object (the ground, the
@@ -288,6 +297,79 @@ pub enum World {
 /// hold in one run), and how it has been placed. Geometry is kept in world
 /// space; moving an object rewrites its vertices. A group is an object with
 /// no clusters: moving it moves everything under it (`parent`).
+/// How a surface reflects light (`reyes::shade_batch`): energy-conserving
+/// GGX with Smith visibility and Schlick Fresnel, on every surface. The
+/// base colour is the asset's own (texture tiles or vertex colours), times
+/// `tint`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Material {
+    pub name: String,
+    /// Linear RGB, multiplied with the base colour.
+    pub tint: Vec3,
+    /// 0 (a mirror) to 1 (no highlight to speak of); GGX alpha is its
+    /// square.
+    pub roughness: f32,
+    /// 0 (a dielectric) to 1 (a metal: no diffuse, its base colour is its
+    /// reflectance).
+    pub metallic: f32,
+    /// A dielectric's reflectance facing the eye, 0 to 1 for 0 to 8%; 0.5
+    /// is 4%, most materials.
+    pub specular: f32,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Material { name: "default".into(), tint: Vec3::ONE, roughness: 0.5, metallic: 0.0, specular: 0.5 }
+    }
+}
+
+impl Material {
+    /// Reflectance facing the eye for base colour `albedo`.
+    pub fn f0(&self, albedo: Vec3) -> Vec3 {
+        Vec3::splat(0.08 * self.specular.clamp(0.0, 1.0)).lerp(albedo * self.tint, self.metallic.clamp(0.0, 1.0))
+    }
+
+    /// What multiplies the light for diffuse: base colour, tint, none for a
+    /// metal, less what the highlight takes (Schlick's Fresnel averaged
+    /// over the hemisphere, F0 + (1 - F0) / 21).
+    pub fn diffuse(&self, albedo: Vec3) -> Vec3 {
+        let f0 = 0.08 * self.specular.clamp(0.0, 1.0);
+        albedo * self.tint * ((1.0 - self.metallic.clamp(0.0, 1.0)) * (1.0 - (f0 + (1.0 - f0) / 21.0)))
+    }
+
+    /// How much of what `diffuse` lets through stays, seen at `ndv` (the
+    /// cosine between the normal and the eye): the highlight takes more at
+    /// grazing angles than on average, so diffuse is `1 - E(ndv)` of the
+    /// light, E what GGX reflects of light from the whole hemisphere
+    /// (`env_ab`), rather than `1 - F_avg`.
+    pub fn diffuse_view_weight(&self, ndv: f32) -> f32 {
+        let f0 = 0.08 * self.specular.clamp(0.0, 1.0);
+        let (a, b) = env_ab(self.roughness.clamp(0.02, 1.0), ndv.max(1e-4));
+        let favg = f0 + (1.0 - f0) / 21.0;
+        ((1.0 - (f0 * a + b)) / (1.0 - favg)).clamp(0.0, 1.5)
+    }
+
+    pub fn clamped(mut self) -> Material {
+        self.tint = self.tint.max(Vec3::ZERO);
+        self.roughness = self.roughness.clamp(0.02, 1.0);
+        self.metallic = self.metallic.clamp(0.0, 1.0);
+        self.specular = self.specular.clamp(0.0, 1.0);
+        self
+    }
+}
+
+/// Karis's fit of the split-sum terms of GGX: what it reflects of light
+/// from the whole hemisphere is `F0 * A + B`, at roughness `rough`, seen at
+/// `ndv`.
+pub fn env_ab(rough: f32, ndv: f32) -> (f32, f32) {
+    let r0 = 1.0 - rough;
+    let r1 = rough * -0.0275 + 0.0425;
+    let r2 = rough * -0.572 + 1.04;
+    let r3 = rough * 0.022 - 0.04;
+    let a004 = (r0 * r0).min((-9.28 * ndv).exp2()) * r0 + r1;
+    (a004 * -1.04 + r2, a004 * 1.04 + r3)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Object {
     pub name: String,
@@ -313,13 +395,17 @@ pub struct Object {
     pub parent: Option<usize>,
     /// The .fja asset file it was read from, if any (`fjs.rs`).
     pub asset: Option<std::path::PathBuf>,
+    /// Its materials, in `Scene::materials`, and those as its asset has
+    /// them: a scene's changes are the difference.
+    pub materials: std::ops::Range<usize>,
+    pub asset_materials: Vec<Material>,
 }
 
 impl Object {
     /// A new object of clusters `clusters` whose geometry is stored where it
     /// stands.
     pub fn new(name: String, clusters: std::ops::Range<usize>, pivot: Vec3, rotation: Vec3, scale: f32, parent: Option<usize>) -> Object {
-        Object { name, clusters, pivot, rotation, scale, lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent, asset: None }
+        Object { name, clusters, pivot, rotation, scale, lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent, asset: None, materials: 0..0, asset_materials: Vec::new() }
     }
 
     /// The eight corners of its oriented box, in the world.
@@ -594,18 +680,33 @@ impl Scene {
     pub fn append(&mut self, other: Scene) {
         let cbase = self.clusters.len();
         let obase = self.objects.len();
-        self.objects.extend(other.objects.iter().map(|o| Object { clusters: o.clusters.start + cbase..o.clusters.end + cbase, parent: o.parent.map(|p| p + obase), ..o.clone() }));
+        // Clusters without materials point at the first: give each side one
+        // before they share the table.
+        if self.materials.is_empty() && !self.clusters.is_empty() {
+            self.materials.push(Material::default());
+        }
+        let mut other = other;
+        if other.materials.is_empty() && !other.clusters.is_empty() {
+            other.materials.push(Material::default());
+        }
+        let mbase = self.materials.len();
+        self.objects.extend(other.objects.iter().map(|o| Object { clusters: o.clusters.start + cbase..o.clusters.end + cbase, parent: o.parent.map(|p| p + obase), materials: o.materials.start + mbase..o.materials.end + mbase, ..o.clone() }));
+        self.materials.extend(other.materials.iter().cloned());
         let other_clusters = other.clusters.len();
         if !other.textures.is_empty() || !self.textures.is_empty() {
             self.textures.append(&other.textures, cbase, other_clusters);
         }
         let vbase = self.qpos.len() as u32;
         let tbase = self.triangle_count() as u32;
+        if !other.tri_mat.is_empty() {
+            self.tri_mat.resize(tbase as usize, 0);
+            self.tri_mat.extend_from_slice(&other.tri_mat);
+        }
         self.qpos.extend(other.qpos);
         self.qnrm.extend(other.qnrm);
         self.qcol.extend(other.qcol);
         self.tris.extend(other.tris);
-        self.clusters.extend(other.clusters.iter().map(|c| Cluster { first_vertex: c.first_vertex + vbase, first_tri: c.first_tri + tbase, ..*c }));
+        self.clusters.extend(other.clusters.iter().map(|c| Cluster { first_vertex: c.first_vertex + vbase, first_tri: c.first_tri + tbase, material_base: c.material_base + mbase as u32, ..*c }));
         self.bounds_min = self.bounds_min.min(other.bounds_min);
         self.bounds_max = self.bounds_max.max(other.bounds_max);
         self.lights.extend(other.lights);
@@ -622,6 +723,7 @@ impl Scene {
         let still = turn.abs_diff_eq(glam::Quat::IDENTITY, 1e-7);
         let mut out = Scene::default();
         out.textures.sources = self.textures.sources.clone();
+        out.materials = self.materials.clone();
         let mut index = std::collections::HashMap::new();
         for r in ranges {
             for ci in r.clone() {
@@ -635,6 +737,9 @@ impl Scene {
                 out.qnrm.extend_from_slice(&self.qnrm[fv..fv + nv]);
                 out.qcol.extend_from_slice(&self.qcol[fv..fv + nv]);
                 out.tris.extend_from_slice(&self.tris[ft..ft + nt]);
+                if !self.tri_mat.is_empty() {
+                    out.tri_mat.extend((ft..ft + nt).map(|t| self.tri_mat.get(t).copied().unwrap_or(0)));
+                }
                 h.xf = back * c.xf;
                 if !still || c.turned {
                     h.turn = (turn * c.turn).normalize();
@@ -679,10 +784,18 @@ impl Scene {
         let back = o.xf.inverse();
         let (k3, turn, _) = o.xf.to_scale_rotation_translation();
         let mut out = self.extract(&[o.clusters.clone()], back);
+        // Its own materials only, as they are now.
+        let m = o.materials.clone();
+        out.materials = self.materials[m.clone()].to_vec();
+        for c in &mut out.clusters {
+            c.material_base = c.material_base.saturating_sub(m.start as u32);
+        }
         let n = out.clusters.len();
         let rest_rotation = quat_euler(turn.normalize().inverse() * euler_quat(o.rotation));
         let mut ob = Object::new(o.name.clone(), 0..n, back.transform_point3(o.pivot), rest_rotation, o.scale / k3.x.max(1e-12), None);
         ob.asset = None;
+        ob.materials = 0..out.materials.len();
+        ob.asset_materials = out.materials.clone();
         out.objects.push(ob);
         out.refresh_bounds(0);
         out
@@ -704,6 +817,15 @@ impl Scene {
             out.push(at..self.clusters.len());
         }
         out
+    }
+
+    /// The material of triangle `t` of cluster `c` (the default when the
+    /// scene has none for it).
+    #[inline]
+    pub fn material(&self, c: &Cluster, t: u32) -> &Material {
+        static DEFAULT: std::sync::OnceLock<Material> = std::sync::OnceLock::new();
+        let k = c.material_base as usize + self.tri_mat.get(t as usize).copied().unwrap_or(0) as usize;
+        self.materials.get(k).unwrap_or_else(|| DEFAULT.get_or_init(Material::default))
     }
 
     /// The samples lying on clusters `clusters`.
@@ -764,8 +886,47 @@ impl Scene {
     pub fn add_object(&mut self, name: String, clusters: std::ops::Range<usize>, pivot: Vec3, rotation: Vec3) -> usize {
         self.objects.push(Object::new(name, clusters, pivot, rotation, 1.0, None));
         let i = self.objects.len() - 1;
+        self.own_materials(i);
         self.refresh_bounds(i);
         i
+    }
+
+    /// Give object `i` its materials: those its clusters use, when the
+    /// scene has them, else a default one of its own.
+    pub fn own_materials(&mut self, i: usize) {
+        let range = self.objects[i].clusters.clone();
+        if range.is_empty() {
+            return;
+        }
+        let mut lo = usize::MAX;
+        let mut hi = 0;
+        for c in &self.clusters[range.clone()] {
+            let top = (c.first_tri..c.first_tri + c.tri_count).map(|t| self.tri_mat.get(t as usize).copied().unwrap_or(0) as usize).max().unwrap_or(0);
+            lo = lo.min(c.material_base as usize);
+            hi = hi.max(c.material_base as usize + top + 1);
+        }
+        let shared = self.objects.iter().enumerate().any(|(j, o)| j != i && o.materials.start < hi && lo < o.materials.end);
+        if hi <= self.materials.len() && !shared {
+            self.objects[i].materials = lo..hi;
+        } else {
+            // Material 0 stays with whatever else points at it (the
+            // ground of an old scene).
+            if self.materials.is_empty() {
+                self.materials.push(Material::default());
+            }
+            let k = self.materials.len();
+            self.materials.push(Material::default());
+            for c in &mut self.clusters[range.clone()] {
+                c.material_base = k as u32;
+            }
+            for t in self.clusters[range].iter().flat_map(|c| c.first_tri..c.first_tri + c.tri_count) {
+                if let Some(m) = self.tri_mat.get_mut(t as usize) {
+                    *m = 0;
+                }
+            }
+            self.objects[i].materials = k..k + 1;
+        }
+        self.objects[i].asset_materials = self.materials[self.objects[i].materials.clone()].to_vec();
     }
 
     /// Make an empty group at `pivot`.
