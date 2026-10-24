@@ -454,6 +454,12 @@ impl Editor {
                 refit = true;
             }
             ui.end_row();
+            ui.label("Light each drag step");
+            let mut each = !self.app.settings.drag_preview;
+            if ui.checkbox(&mut each, "").on_hover_text("Off: a dragged object takes its light with it and the rest of the scene stays lit as it was until it is let go. On: every step is lit where it is.").changed() {
+                self.app.settings.drag_preview = !each;
+            }
+            ui.end_row();
             ui.label("Moving: micropolygons");
             ui.add(egui::Slider::new(&mut self.app.settings.moving_rate, 1.0..=8.0).logarithmic(true).prefix("x ").suffix(" apart").max_decimals(1))
                 .on_hover_text("While an object is moved, its micropolygons are this many times further apart. 1: as when still.");

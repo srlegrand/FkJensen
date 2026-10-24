@@ -521,8 +521,9 @@ With the T-rex and the car, 1280 x 720, everything on: 2,523 MB
   times, as a drag would, times each frame, lets go, and writes
   `<out>_moved.png`. `--relight-on-move` throws away every shadow map and
   all shading when an object moves instead, to compare. Each step gives
-  the triangles drawn and the points shaded, so `--moving-rate 1
-  --moving-detail 1` shows what drawing the moving model coarser saves.
+  the triangles drawn and the points shaded, writes the last step as
+  `<out>_dragging.png`, and `--light-each-drag-step` compares with
+  lighting every step.
 
 The window title shows the frame rate, the selected light's lumens,
 position and reach, the sky, whether visibility was kept from the last
@@ -635,12 +636,17 @@ with egui, on the CPU like everything else: egui's triangles are filled by
   as large as fits in the viewport with bars round it; Custom takes a
   width and height; Viewport pixels follows the viewport, times the
   resolution percentage, as the plain window does.
-- **While an object moves** (manipulator or attribute editor), it is
-  drawn with micropolygons "Moving: micropolygons" times further apart
-  (3 at start) and a level of detail allowed "Moving: geometry error"
-  times the error (3 at start); it is drawn in full once it is let go.
-  1 turns either off. `--moving-rate K`, `--moving-detail K` set them
-  for the plain window and `--bench-move`.
+- **While an object is dragged** (manipulator or attribute editor), it
+  moves in 2.5D as a model does in ZBrush while sculpting: its shading
+  goes with it, lit as where the drag began, and the rest of the scene
+  keeps its light, shadow maps and its shadow where it was; only the
+  pixels round it are made again. When it is let go it is lit where it
+  stands (baked). It is drawn with micropolygons "Moving: micropolygons"
+  times further apart (3 at start) and a level of detail allowed
+  "Moving: geometry error" times the error (3 at start); 1 turns either
+  off. "Light each drag step" lights every step where it is instead.
+  `--moving-rate K`, `--moving-detail K` and `--light-each-drag-step`
+  set them for the plain window and `--bench-move`.
 - **Timeline** along the bottom: the day from 0 to 24 h, night shaded,
   the time a red mark. Click or drag to set it; Play runs the day at 1 or
   10 minutes, or 1 or 3 hours, a second. The time sets the sun, the sky and

@@ -227,6 +227,9 @@ struct App {
     /// large as fits inside it; None: the frame follows the output
     /// (`render_scale`).
     frame_size: Option<(usize, usize)>,
+    /// The object being dragged and its pivot, rotation and scale when
+    /// the drag began.
+    drag_start: Option<(usize, Vec3, Vec3, f32)>,
     /// Shading points a window frame may take, from the machine's plan:
     /// the micropolygon spacing and render scale follow it as the window
     /// is resized. None once either is set by hand.
@@ -282,6 +285,7 @@ impl App {
             quit: false,
             output: (0, 0),
             frame_size: None,
+            drag_start: None,
             point_budget: None,
             renderer: reyes::Renderer::new(),
             wide: true,
@@ -475,20 +479,33 @@ impl App {
     /// Place object `i` (and what is under it), telling the renderer where
     /// it was and where it is, so only what that changes is redone.
     fn move_object(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: f32) {
+        if self.drag_start.is_none_or(|d| d.0 != i) {
+            let o = &self.scene.objects[i];
+            self.drag_start = Some((i, o.pivot, o.rotation, o.scale));
+        }
         let from = self.scene.object_bounds(i);
         self.scene.set_object(i, pivot, rotation, scale);
         let to = self.scene.object_bounds(i);
-        let moving = self.scene.moving_clusters(i);
-        for r in &moving {
-            self.renderer.moved(r.clone(), from, to, false);
+        if !self.settings.drag_preview {
+            for r in self.scene.moving_clusters(i) {
+                self.renderer.moved(r, from, to, false);
+            }
+            return;
         }
-        // Drawn and shaded coarser until it settles.
-        self.renderer.set_moving(moving);
+        // Dragged: its light goes with it until it is let go.
+        let o = &self.scene.objects[i];
+        let Some((_, p0, r0, k0)) = self.drag_start else { return };
+        let start = (p0, r0, k0);
+        let q = scene::euler_quat(o.rotation) * scene::euler_quat(start.1).inverse();
+        let ahead = glam::Affine3A::from_translation(o.pivot) * glam::Affine3A::from_scale_rotation_translation(Vec3::splat(o.scale / start.2), q, Vec3::ZERO) * glam::Affine3A::from_translation(-start.0);
+        self.renderer.dragged(self.scene.moving_clusters(i), from, to, ahead.inverse());
     }
 
-    /// Object `i` stopped moving: bounce light is made again.
+    /// Object `i` stopped moving: it is lit where it stands and bounce
+    /// light is made again.
     fn object_settled(&mut self, i: usize) {
-        self.renderer.set_moving(Vec::new());
+        self.drag_start = None;
+        self.renderer.drag_ended();
         let b = self.scene.object_bounds(i);
         for r in self.scene.moving_clusters(i) {
             self.renderer.moved(r, b, b, true);
@@ -1244,6 +1261,7 @@ fn main() {
     let mut adaptive = true;
     let mut sky_occlusion = true;
     let mut incremental_moves = true;
+    let mut drag_preview = true;
     let mut bench_move = false;
     let mut bench_dir = false;
     let mut close = false;
@@ -1337,6 +1355,7 @@ fn main() {
             "--no-adaptive" => adaptive = false,
             "--no-sky-occlusion" => sky_occlusion = false,
             "--relight-on-move" => incremental_moves = false,
+            "--light-each-drag-step" => drag_preview = false,
             "--bench-move" => bench_move = true,
             "--bench-dir" => bench_dir = true,
             "--close" => close = true,
@@ -1417,7 +1436,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--moving-rate K] [--moving-detail K] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--light-each-drag-step] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--moving-rate K] [--moving-detail K] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1506,6 +1525,7 @@ fn main() {
     app.settings.adaptive = adaptive;
     app.settings.sky_occlusion = sky_occlusion;
     app.settings.incremental_moves = incremental_moves;
+    app.settings.drag_preview = drag_preview;
     if let Some(p) = &plan {
         app.settings.shadows = p.shadows;
         app.settings.shadow_res = p.shadow_res;
@@ -1749,7 +1769,7 @@ fn main() {
                 app.render();
                 let s = app.frame.stats;
                 eprintln!(
-                    "move step {step}: {:.1} ms: shadows {:.1} ms ({} maps drawn again in part or whole, {} triangles), {} clusters lit again, visibility {:.1} ms ({} triangles drawn), shade {:.1} ms ({} points shaded of {} used), gather {:.1} ms, resolve {:.1} ms",
+                    "move step {step}: {:.1} ms: shadows {:.1} ms ({} maps drawn again in part or whole, {} triangles), {} clusters lit again, visibility {:.1} ms ({} triangles drawn), shade {:.1} ms ({} points shaded of {} used), gather {:.1} ms, resolve {:.1} ms{}",
                     t.elapsed().as_secs_f32() * 1000.0,
                     s.shadow_ms,
                     s.shadow_maps_built,
@@ -1761,8 +1781,13 @@ fn main() {
                     s.points_shaded,
                     s.points_used,
                     s.gather_ms,
-                    s.resolve_ms
+                    s.resolve_ms,
+                    if s.full_resolve { "" } else { " (round the model only)" }
                 );
+            }
+            let drag_out = out.replace(".png", "_dragging.png");
+            if save_png(&app.frame, &drag_out).is_ok() {
+                eprintln!("wrote {drag_out}");
             }
             app.object_settled(0);
             let t = Instant::now();

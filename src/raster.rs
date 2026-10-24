@@ -365,6 +365,10 @@ pub struct RenderSettings {
     /// Directional lights: parallel light like the sun's, but only on the
     /// scene, not the sky.
     pub dir_lights: [DirLight; MAX_DIR_LIGHTS],
+    /// While an object is dragged its light goes with it, and the rest of
+    /// the scene's light stays, until it is let go (`reyes::Renderer::dragged`).
+    /// Off: every step of a drag is lit where it is.
+    pub drag_preview: bool,
     /// While an object is being moved, its micropolygons are this many
     /// times further apart than `shading_rate_px` (1: as when still).
     pub moving_rate: f32,
@@ -389,7 +393,7 @@ impl RenderSettings {
     }
 
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: true, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true, sky_occlusion: true, dir_lights: [DirLight::default(); MAX_DIR_LIGHTS], moving_rate: MOVING_RATE, moving_detail: MOVING_DETAIL }
+        Self { cull_backfaces: true, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true, sky_occlusion: true, dir_lights: [DirLight::default(); MAX_DIR_LIGHTS], drag_preview: true, moving_rate: MOVING_RATE, moving_detail: MOVING_DETAIL }
     }
 }
 
