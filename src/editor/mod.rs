@@ -36,6 +36,8 @@ pub enum Inspect {
     /// The selected object or light.
     Selection,
     Sun,
+    /// A directional light (an index into `RenderSettings::dir_lights`).
+    Directional(usize),
     Sky,
     Render,
 }

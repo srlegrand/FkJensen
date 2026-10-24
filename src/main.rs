@@ -10,6 +10,7 @@
 //!   fkjensen --light x,y,z[,lumens]    replace the scene's lights (repeatable)
 //!   fkjensen --time 12:00              time of day: sun, sky and exposure (opens at dusk)
 //!   fkjensen --sun B                   sun brightness, 0 to 1000 (1000: white at full)
+//!   fkjensen --dir AZ,EL,LUX           add a directional light: azimuth and elevation in degrees, illuminance in lux (up to 4)
 //!   fkjensen --light-contrast C        0 flat overcast, 0.5 default, 1 overhead only
 //!   fkjensen --sky-contrast C          the visible sky's gradient and sun glow, 0 to 1
 //!   fkjensen --sky LUX                 sky illuminance, 0 for no sky
@@ -1228,6 +1229,7 @@ fn main() {
     let mut visual_debug = false;
     let mut hours: Option<f32> = None;
     let mut sun_brightness: Option<f32> = None;
+    let mut dir_lights: Vec<raster::DirLight> = Vec::new();
     let mut light_contrast: Option<f32> = None;
     let mut sky_contrast: Option<f32> = None;
     let mut debug_view: Option<String> = None;
@@ -1264,6 +1266,15 @@ fn main() {
             "--sun" => {
                 i += 1;
                 sun_brightness = args.get(i).and_then(|s| s.parse::<f32>().ok());
+            }
+            "--dir" => {
+                i += 1;
+                let v: Vec<f32> = args.get(i).map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
+                if v.len() != 3 {
+                    eprintln!("--dir takes azimuth,elevation,lux");
+                    std::process::exit(2);
+                }
+                dir_lights.push(raster::DirLight { on: true, dir: raster::DirLight::towards(v[0], v[1]), color: Vec3::ONE, lux: v[2].clamp(0.0, raster::DIR_MAX_LUX) });
             }
             "--light-contrast" => {
                 i += 1;
@@ -1358,7 +1369,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fkj] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1413,6 +1424,9 @@ fn main() {
     if let Some(h) = hours {
         app.hours = h;
         app.apply_daylight();
+    }
+    for (k, d) in dir_lights.into_iter().take(raster::MAX_DIR_LIGHTS).enumerate() {
+        app.settings.dir_lights[k] = d;
     }
     if let Some(b) = sun_brightness {
         app.settings.sun.brightness = b.clamp(0.0, raster::SUN_MAX);

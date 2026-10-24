@@ -26,8 +26,8 @@ its 28 K-triangle version.
 
 ## Light
 
-Three kinds of light: point lights and the sky in physical units, and the
-sun.
+Four kinds of light: point lights, directional lights and the sky in
+physical units, and the sun.
 
 **Point lights.** A point light is a position, a colour and a luminous flux
 in lumens. There is no falloff radius: the light gives lumens / 4π candela,
@@ -45,6 +45,17 @@ current exposure; it is not in lumens. Its shadows come from an
 orthographic shadow map in three cascades round the subject (about 1.6
 times its radius, 600 m, 25 km), each 4 times the point lights' texels a
 side, up to 2048, read with the same 3 x 3 filter (`src/sun.rs`).
+
+**Directional lights.** Up to four, each parallel light with parallel
+shadows like the sun's (the same cascaded map), but on the scene only: the
+sky, the backdrop and the exposure do not follow them, so one can be a
+moon, a key from a direction the sun never takes, or a second sun. Each is
+a direction (azimuth from -Z, the way the camera starts, turning towards
++X; elevation above the horizon), a colour and an illuminance in lux, up
+to 150,000 (a little over full summer sun). `--dir AZ,EL,LUX` adds one;
+in the editor, "+ directional" under Lights. Changing one shades
+everything again, as the sun does. Not saved with the scene, as the sun
+and the sky are not.
 
 **Time of day.** One value, in hours, sets the sun's direction (east at 6,
 south at noon at 60 degrees, west at 18) and colour, the sky's light and
@@ -461,6 +472,8 @@ Headless, for tests and screenshots (no window, no display needed):
   lumens are given); repeatable. Positions in metres.
 - `--time HH:MM` sets the time of day (`--time 12:00`, `--time 18.5`).
 - `--sun B` sets the sun's brightness, 0 to 1000 (600 at start).
+- `--dir AZ,EL,LUX` adds a directional light (up to four): azimuth and
+  elevation in degrees, illuminance in lux.
 - `--light-contrast C` and `--sky-contrast C`, 0 to 1 (0.5 at start).
 - `--sky LUX` sets the sky, 0 for none, and the exposure to match, after the time of day.
 - `--exposure E` sets the display value per cd/m².
@@ -588,8 +601,8 @@ with egui, on the CPU like everything else: egui's triangles are filled by
   Quit), Edit (group, new empty group, add, delete or reset lights),
   View (frame, lights, wireframe, back-face culling), and the select, move,
   rotate and scale tools.
-- **Outliner** on the left: the objects and their groups, the lights, the
-  sun, the sky and exposure, the render settings. Click to select, double
+- **Outliner** on the left: the objects and their groups, the point and
+  directional lights, the sun, the sky and exposure, the render settings. Click to select, double
   click to frame, drag an object onto another to put it under it, onto
   "Objects" to take it out. A group moves, turns and scales everything
   under it about its pivot.
@@ -1002,7 +1015,7 @@ Not measured yet: a Raspberry Pi.
   shading against 1.3 M and 260 to 277 ms at two pixels (3.7 M and 545 to
   569 ms before this change).
 - `tools/fkj-import` does not read USD (`docs/format.md`).
-- Light rigs and the sky setting are not saved.
+- Light rigs, directional lights and the sky setting are not saved.
 - Text overlay: the numbers are in the window title.
 - Framebuffer output: no vsync and no double buffering, so a frame can
   tear while it is written; dropping a file to open it needs a window.

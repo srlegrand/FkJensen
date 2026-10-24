@@ -74,10 +74,29 @@ impl Editor {
                         actions.push(Action::Select(Selection::Light(i)));
                     }
                 }
-                if ui.small_button("+ light").clicked() {
-                    actions.push(Action::Inspect(Inspect::Selection));
-                    self.add_light();
+                for (k, d) in self.app.settings.dir_lights.iter().enumerate() {
+                    if d.on {
+                        let r = ui.selectable_label(self.inspect == Inspect::Directional(k), format!("directional {}   {} lux", k + 1, thousands(d.lux.round() as usize)));
+                        if r.clicked() {
+                            actions.push(Action::Inspect(Inspect::Directional(k)));
+                        }
+                    }
                 }
+                ui.horizontal(|ui| {
+                    if ui.small_button("+ light").clicked() {
+                        actions.push(Action::Inspect(Inspect::Selection));
+                        self.add_light();
+                    }
+                    if ui.small_button("+ directional").clicked() {
+                        match self.app.settings.dir_lights.iter().position(|d| !d.on) {
+                            Some(k) => {
+                                self.app.settings.dir_lights[k] = raster::DirLight { on: true, ..Default::default() };
+                                actions.push(Action::Inspect(Inspect::Directional(k)));
+                            }
+                            None => self.say(format!("{} directional lights at most", raster::MAX_DIR_LIGHTS), true),
+                        }
+                    }
+                });
             });
             ui.separator();
             for (what, name) in [(Inspect::Sun, "Sun"), (Inspect::Sky, "Sky and exposure"), (Inspect::Render, "Render settings")] {
@@ -163,6 +182,7 @@ impl Editor {
             (Inspect::Selection, Selection::Object(i)) if i < self.app.scene.objects.len() => self.object_attributes(ui, i),
             (Inspect::Selection, Selection::Light(i)) if i < self.app.rig.lights.len() => self.light_attributes(ui, i),
             (Inspect::Sun, _) => self.sun_attributes(ui),
+            (Inspect::Directional(k), _) if k < raster::MAX_DIR_LIGHTS => self.directional_attributes(ui, k),
             (Inspect::Sky, _) => self.sky_attributes(ui),
             (Inspect::Render, _) => self.render_attributes(ui),
             _ => {
@@ -280,6 +300,52 @@ impl Editor {
         ui.add_space(6.0);
         if ui.button("Delete the light").clicked() {
             self.delete_light();
+        }
+    }
+
+    fn directional_attributes(&mut self, ui: &mut egui::Ui, k: usize) {
+        ui.label(format!("directional {}", k + 1));
+        ui.add_space(4.0);
+        let d = &mut self.app.settings.dir_lights[k];
+        let (mut az, mut el) = raster::DirLight::angles(d.dir);
+        egui::Grid::new("directional").num_columns(2).show(ui, |ui| {
+            ui.label("On");
+            ui.checkbox(&mut d.on, "");
+            ui.end_row();
+            ui.label("Illuminance");
+            ui.add(egui::Slider::new(&mut d.lux, 0.1..=raster::DIR_MAX_LUX).logarithmic(true).suffix(" lux").max_decimals(1));
+            ui.end_row();
+            ui.label("Azimuth");
+            let a = ui.add(egui::Slider::new(&mut az, 0.0..=360.0).suffix("°").max_decimals(1));
+            ui.end_row();
+            ui.label("Elevation");
+            let e = ui.add(egui::Slider::new(&mut el, -10.0..=90.0).suffix("°").max_decimals(1));
+            ui.end_row();
+            if a.changed() || e.changed() {
+                d.dir = raster::DirLight::towards(az, el);
+            }
+            ui.label("Colour");
+            let mut c = d.color.to_array();
+            if egui::color_picker::color_edit_button_rgb(ui, &mut c).changed() {
+                d.color = lights::normalise_colour(Vec3::from_array(c));
+            }
+            ui.end_row();
+        });
+        ui.horizontal_wrapped(|ui| {
+            for c in LIGHT_COLOURS {
+                let n = lights::normalise_colour(c);
+                let show = (n / n.max_element()).min(Vec3::ONE);
+                let col = egui::Color32::from_rgb((show.x * 255.0) as u8, (show.y * 255.0) as u8, (show.z * 255.0) as u8);
+                if ui.add(egui::Button::new("").fill(col).min_size(egui::vec2(22.0, 16.0))).clicked() {
+                    d.color = n;
+                }
+            }
+        });
+        ui.weak("Parallel light and shadows like the sun's, on the scene only: the sky and the exposure do not follow it. Azimuth 0 looks the way the camera starts, towards -Z.");
+        ui.add_space(6.0);
+        if ui.button("Delete the light").clicked() {
+            self.app.settings.dir_lights[k].on = false;
+            self.inspect = Inspect::Selection;
         }
     }
 

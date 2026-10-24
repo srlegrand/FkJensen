@@ -362,11 +362,13 @@ pub struct Renderer {
     /// only it keeps a share of its own in the shading cache, so memory
     /// grows by one share a point.
     hot: Vec<usize>,
-    prev_global: Option<(Sky, raster::Sun, f32, bool, bool, bool, usize, bool, bool)>,
+    prev_global: Option<(Sky, raster::Sun, f32, bool, bool, bool, usize, bool, bool, [raster::DirLight; raster::MAX_DIR_LIGHTS])>,
     /// The sun's shadow map, and what it was built for (direction, texels,
     /// scene).
     sun_shadow: Option<SunShadow>,
     sun_key: Option<(Vec3, usize, (usize, usize, usize))>,
+    /// Each directional light's shadow map, and what it was built for.
+    dir_shadows: Vec<Option<(SunShadow, (Vec3, usize, (usize, usize, usize)))>>,
     prev_backdrop: Option<raster::Backdrop>,
     /// The surfel cloud and the bounce light at each receiver.
     bounce: Option<Bounce>,
@@ -461,6 +463,7 @@ impl Renderer {
             prev_global: None,
             sun_shadow: None,
             sun_key: None,
+            dir_shadows: (0..raster::MAX_DIR_LIGHTS).map(|_| None).collect(),
             prev_backdrop: None,
             bounce: None,
             vis_key: None,
@@ -550,7 +553,7 @@ impl Renderer {
         let reach: Vec<f32> = lights.iter().map(|l| if settings.light_reach { raster::light_reach(l, cut) } else { f32::INFINITY }).collect();
 
         // What changed since the last frame decides what is thrown away.
-        let global = (settings.sky, settings.sun, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.bounce, settings.shadow_res, settings.adaptive, settings.sky_occlusion);
+        let global = (settings.sky, settings.sun, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.bounce, settings.shadow_res, settings.adaptive, settings.sky_occlusion, settings.dir_lights);
         // Without incremental moves (to compare), a move relights all.
         let global_changed = self.prev_global != Some(global) || self.prev_lights.len() != lights.len() || (!settings.incremental_moves && !self.moves.is_empty());
         // Spheres (old and new position, with reach) of lights that changed,
@@ -602,11 +605,14 @@ impl Renderer {
         if !moves.is_empty() && global_changed {
             // Everything is made again anyway; the sun's map too.
             self.sun_key = None;
+            self.dir_shadows.iter_mut().for_each(|d| *d = None);
         }
         if !moves.is_empty() && !global_changed {
             let spheres_m: Vec<(Vec3, f32)> = moves.iter().map(|(lo, hi)| ((*lo + *hi) * 0.5, (*hi - *lo).length() * 0.5)).collect();
-            let sun_dir = settings.sun.dir;
             let sun_up = settings.shadows && settings.sun.up();
+            // Directions of parallel light: the sun's and the directional
+            // lights'.
+            let parallel: Vec<Vec3> = (sun_up.then_some(settings.sun.dir)).into_iter().chain(settings.dir_lights.iter().filter(|d| d.lights() && settings.shadows).map(|d| d.dir)).collect();
             for (i, l) in lights.iter().enumerate() {
                 let touched: Vec<(Vec3, Vec3)> = moves.iter().zip(&spheres_m).filter(|(_, (c, r))| c.distance(l.position) <= r + reach[i]).map(|(b, _)| *b).collect();
                 if touched.is_empty() {
@@ -623,6 +629,10 @@ impl Renderer {
                     frame.stats.shadow_tris += m.redraw(scene, &moves);
                     frame.stats.shadow_maps_built += 1;
                 }
+            }
+            for (m, _) in self.dir_shadows.iter_mut().flatten() {
+                frame.stats.shadow_tris += m.redraw(scene, &moves);
+                frame.stats.shadow_maps_built += 1;
             }
             // Who is in a moved box's shadow, before or after.
             let in_shadow = |c: &crate::scene::Cluster| -> bool {
@@ -648,11 +658,11 @@ impl Renderer {
                         let spread = (rb / db).min(1.0).asin() + (c.radius / dc).min(1.0).asin();
                         ang.clamp(-1.0, 1.0).acos() <= spread
                     });
-                    let from_sun = sun_up && {
+                    let from_sun = parallel.iter().any(|&d| {
                         let q = c.centre - b;
-                        let along = q.dot(sun_dir);
-                        along <= rb + c.radius && (q - sun_dir * along).length() <= rb + c.radius
-                    };
+                        let along = q.dot(d);
+                        along <= rb + c.radius && (q - d * along).length() <= rb + c.radius
+                    });
                     from_light || from_sun
                 })
             };
@@ -698,13 +708,37 @@ impl Renderer {
                 self.sun_key = Some(key);
             }
         }
+        // Each directional light's map, as the sun's.
+        if settings.shadows {
+            let res = (settings.shadow_res * 4).clamp(256, 2048);
+            let focus = (scene.focus_centre(), scene.focus_radius());
+            for (i, d) in settings.dir_lights.iter().enumerate() {
+                if !d.lights() {
+                    self.dir_shadows[i] = None;
+                    continue;
+                }
+                let k = (d.dir, res, key);
+                if self.dir_shadows[i].as_ref().is_none_or(|(_, kk)| *kk != k) {
+                    let m = SunShadow::build(scene, d.dir, focus.0, &[focus.1 * 1.6, 600.0, 25_000.0], res);
+                    frame.stats.shadow_maps_built += 1;
+                    frame.stats.shadow_tris += m.tris;
+                    self.dir_shadows[i] = Some((m, k));
+                }
+            }
+        }
         frame.stats.shadow_ms = ts.elapsed().as_secs_f32() * 1000.0;
-        let sun = SunLit {
+        // Parallel lights: the sun, then the directional lights.
+        let mut suns = vec![SunLit {
             lux: settings.sun.lux(settings.exposure),
             dir: settings.sun.dir,
             shadow: if settings.shadows && settings.sun.up() { self.sun_shadow.as_ref() } else { None },
-        };
-        let sun = &sun;
+        }];
+        for (i, d) in settings.dir_lights.iter().enumerate() {
+            if d.lights() {
+                suns.push(SunLit { lux: d.color * d.lux, dir: d.dir, shadow: if settings.shadows { self.dir_shadows[i].as_ref().map(|s| &s.0) } else { None } });
+            }
+        }
+        let sun = &suns[..];
 
         // Bounce: light the surfels again where light changed, then throw
         // away the receivers that bounce could reach from there.
@@ -1038,8 +1072,7 @@ impl Renderer {
                 };
                 // One light's share for every point of a batch.
                 let dark = Sky { on: false, ..sky };
-                let no_sun = SunLit { lux: Vec3::ZERO, dir: sun.dir, shadow: None };
-                let share_of = |batch: &Batch, l: usize, d: &mut [Vec3], s: &mut [Vec3]| -> u64 { shade_batch(batch, eye, dark, false, lights, &[l], &reach, &shadows, &no_sun, d, s, true) };
+                let share_of = |batch: &Batch, l: usize, d: &mut [Vec3], s: &mut [Vec3]| -> u64 { shade_batch(batch, eye, dark, false, lights, &[l], &reach, &shadows, &[], d, s, true) };
 
                 // In full: the sky and the sun, then each light's share.
                 if vtodo != 0 || ttodo != 0 {
@@ -1479,15 +1512,19 @@ fn shade_point(
     in_reach: &[usize],
     reach: &[f32],
     shadows: &[Option<&CubeShadow>],
-    sun: &SunLit,
+    suns: &[SunLit],
 ) -> (Vec3, Vec3, u64) {
     let inv_pi = std::f32::consts::FRAC_1_PI;
     let mut diffuse = albedo * sky.irradiance_from(n, ground) * inv_pi;
     let mut spec = Vec3::ZERO;
     let v = (eye - p).normalize_or(n);
     let mut evals = 0;
-    // The sun: everywhere, parallel, through its own map.
-    if sun.lux != Vec3::ZERO {
+    // The sun and directional lights: everywhere, parallel, each through
+    // its own map.
+    for sun in suns {
+        if sun.lux == Vec3::ZERO {
+            continue;
+        }
         let ndl = n.dot(sun.dir);
         if ndl > 0.0 {
             let vis = sun.shadow.map(|m| m.lit(p, n)).unwrap_or(1.0);
@@ -1802,7 +1839,7 @@ pub fn shade_batch(
     in_reach: &[usize],
     reach: &[f32],
     shadows: &[Option<&CubeShadow>],
-    sun: &SunLit,
+    suns: &[SunLit],
     diffuse: &mut [Vec3],
     spec: &mut [Vec3],
     with_diffuse: bool,
@@ -1876,8 +1913,11 @@ pub fn shade_batch(
             sg += eg * hl;
             sb += eb * hl;
         };
-        // The sun.
-        if sun.lux != Vec3::ZERO {
+        // The sun and the directional lights.
+        for sun in suns {
+            if sun.lux == Vec3::ZERO {
+                continue;
+            }
             let ndl = nx * sun.dir.x + ny * sun.dir.y + nz * sun.dir.z;
             let facing = ndl.simd_gt(zero).to_bitmask() & ((1u32 << m) - 1);
             if facing != 0 {
@@ -1956,7 +1996,7 @@ pub fn shading_rate(seconds: f64) -> f64 {
                 }
                 let mut d = vec![Vec3::ZERO; b.len()];
                 let mut sp = vec![Vec3::ZERO; b.len()];
-                shade_batch(&b, eye, sky, true, &lights, &in_reach, &reach, &shadows, &SunLit { lux: Vec3::ZERO, dir: Vec3::Y, shadow: None }, &mut d, &mut sp, true);
+                shade_batch(&b, eye, sky, true, &lights, &in_reach, &reach, &shadows, &[], &mut d, &mut sp, true);
                 d.iter().zip(&sp).map(|(d, s)| d.x + s.y).sum::<f32>()
             })
             .sum();
@@ -2469,5 +2509,51 @@ mod tests {
         // ball: 0.75 of the light, about 0.88 in 8-bit sRGB.
         assert!(near.0 / near.1 < 0.93, "by the ball: {near:?}");
         assert!((far.0 / far.1 - 1.0).abs() < 0.02, "far: {far:?}");
+    }
+
+    /// A directional light lights a floor and a card casts its shadow;
+    /// the backdrop (sky) is the same with it or without.
+    #[test]
+    fn a_directional_light_lights_the_scene_not_the_sky() {
+        let mut scene = Scene::new();
+        let quad = |c: Vec3, h: f32| [c + Vec3::new(-h, 0.0, h), c + Vec3::new(h, 0.0, h), c + Vec3::new(h, 0.0, -h), c + Vec3::new(-h, 0.0, -h)];
+        scene.push_mesh(&quad(Vec3::ZERO, 3.0), &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
+        scene.push_mesh(&quad(Vec3::new(0.0, 0.6, 0.0), 0.3), &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
+        let (w, h) = (160, 120);
+        let cam = cam_at(0.0, w, h, Vec3::ZERO, 4.0, 0.5);
+        let off = RenderSettings { bounce: false, cull_backfaces: false, ..RenderSettings::new(Sky::new(30.0, true)) };
+        let mut lit = RenderSettings { ..off };
+        lit.dir_lights[0] = raster::DirLight { on: true, dir: Vec3::Y, color: Vec3::ONE, lux: 300.0 };
+        let (mut a, mut b) = (Frame::new(w, h), Frame::new(w, h));
+        render(&scene, &cam, &[], &off, &mut a);
+        render(&scene, &cam, &[], &lit, &mut b);
+        let (mut brighter, mut shaded, mut sky_same) = (0, 0, true);
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if a.tri_id[i] == NO_TRI {
+                    sky_same &= a.color[i] == b.color[i];
+                    continue;
+                }
+                let Some((p, _)) = raster::unproject(&b, &scene, x, y) else { continue };
+                if p.y > 0.01 {
+                    continue;
+                }
+                let (va, vb) = (a.color[i] & 255, b.color[i] & 255);
+                if p.x.abs() < 0.2 && p.z.abs() < 0.2 {
+                    // Under the card: its shadow, straight down.
+                    if vb <= va + 2 {
+                        shaded += 1;
+                    }
+                } else if p.x.abs() > 1.0 && vb > va + 20 {
+                    brighter += 1;
+                }
+            }
+        }
+        assert!(sky_same, "the backdrop does not change");
+        assert!(brighter > 100, "{brighter} pixels lit");
+        assert!(shaded > 10, "{shaded} pixels in the card's shadow");
+        let (az, el) = raster::DirLight::angles(raster::DirLight::towards(123.0, 37.0));
+        assert!((az - 123.0).abs() < 1e-3 && (el - 37.0).abs() < 1e-3);
     }
 }

@@ -195,6 +195,54 @@ impl Default for Backdrop {
     }
 }
 
+/// Most directional lights.
+pub const MAX_DIR_LIGHTS: usize = 4;
+
+/// A directional light: infinitely far, parallel light and parallel
+/// shadows, as the sun, but it lights the scene only: the sky, the backdrop
+/// and the exposure do not follow it. Its strength is its illuminance in
+/// lux on a surface facing it, a physical unit as a point light's lumens.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DirLight {
+    pub on: bool,
+    /// Unit direction towards the light.
+    pub dir: Vec3,
+    /// Linear RGB, luminance 1 (`lights::normalise_colour`).
+    pub color: Vec3,
+    pub lux: f32,
+}
+
+/// Brightest a directional light may be: a little over full summer sun.
+pub const DIR_MAX_LUX: f32 = 150_000.0;
+
+impl Default for DirLight {
+    fn default() -> Self {
+        DirLight { on: false, dir: DirLight::towards(210.0, 40.0), color: Vec3::ONE, lux: 2_000.0 }
+    }
+}
+
+impl DirLight {
+    /// Unit direction towards a light at `azimuth` degrees (0 at -Z, the
+    /// way the camera looks, turning towards +X) and `elevation` degrees
+    /// above the horizon.
+    pub fn towards(azimuth: f32, elevation: f32) -> Vec3 {
+        let (a, e) = (azimuth.to_radians(), elevation.to_radians());
+        Vec3::new(a.sin() * e.cos(), e.sin(), -a.cos() * e.cos()).normalize()
+    }
+
+    /// Azimuth and elevation of `dir`, degrees.
+    pub fn angles(dir: Vec3) -> (f32, f32) {
+        let e = dir.y.clamp(-1.0, 1.0).asin().to_degrees();
+        let a = dir.x.atan2(-dir.z).to_degrees().rem_euclid(360.0);
+        (a, e)
+    }
+
+    /// Whether it lights anything.
+    pub fn lights(&self) -> bool {
+        self.on && self.lux > 0.0
+    }
+}
+
 /// The sun: infinitely far, parallel light and parallel shadows, the same
 /// on everything in the scene. Its brightness is 0 to 1000: 0 is none, 1000
 /// lights a white surface facing it to full white at the current exposure.
@@ -314,6 +362,9 @@ pub struct RenderSettings {
     /// precomputed at its surface samples (`transfer.rs`). Off only to
     /// compare.
     pub sky_occlusion: bool,
+    /// Directional lights: parallel light like the sun's, but only on the
+    /// scene, not the sky.
+    pub dir_lights: [DirLight; MAX_DIR_LIGHTS],
 }
 
 /// Shading cache budget when the machine's plan does not set one.
@@ -327,7 +378,7 @@ impl RenderSettings {
     }
 
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: true, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true, sky_occlusion: true }
+        Self { cull_backfaces: true, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true, sky_occlusion: true, dir_lights: [DirLight::default(); MAX_DIR_LIGHTS] }
     }
 }
 
