@@ -485,7 +485,7 @@ mod tests {
         let centre = Vec3::new(0.5, 0.0, -0.5);
         let mut m = SunShadow::build(&s, dir, centre, &[5.0, 50.0], 512);
         let from = s.object_bounds(o);
-        s.set_object(o, Vec3::new(2.0, 0.5, 1.0), Vec3::new(0.0, 0.7, 0.0), 1.3);
+        s.set_object(o, Vec3::new(2.0, 0.5, 1.0), Vec3::new(0.0, 0.7, 0.0), glam::Vec3::splat(1.3));
         let to = s.object_bounds(o);
         m.redraw(&s, &[from, to]);
         let fresh = SunShadow::build(&s, dir, centre, &[5.0, 50.0], 512);

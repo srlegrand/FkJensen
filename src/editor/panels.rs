@@ -10,6 +10,8 @@ use crate::{raster, scene, Selection};
 /// What a row of the outliner asked for, done once the tree is drawn.
 enum Action {
     Select(Selection),
+    /// Ctrl click (toggle) or Shift click (range) on an object.
+    SelectMore(usize, bool),
     Inspect(Inspect),
     /// Put object .0 under .1 (None: at the top).
     Parent(usize, Option<usize>),
@@ -103,13 +105,15 @@ impl Editor {
         for a in actions {
             match a {
                 Action::Select(s) => self.select(s),
+                Action::SelectMore(i, range) => self.select_more(i, range),
                 Action::Inspect(i) => self.inspect = i,
                 Action::Parent(child, parent) => {
-                    // Keep where it is in the world: only the hierarchy
-                    // changes.
-                    if !self.app.scene.set_parent(child, parent) {
-                        self.say("an object cannot go under itself", true);
-                    }
+                    // Keep where they are in the world: only the hierarchy
+                    // changes. A selected row dragged takes the selection
+                    // with it.
+                    let sel = self.selected_objects();
+                    let which = if sel.contains(&child) { sel } else { vec![child] };
+                    self.parent_objects(&which, parent);
                 }
                 Action::Frame(i) => {
                     self.select(Selection::Object(i));
@@ -128,7 +132,7 @@ impl Editor {
         let scene = &self.app.scene;
         let o = &scene.objects[i];
         let kids = scene.children(Some(i));
-        let sel = self.app.selection == Selection::Object(i) && self.inspect == Inspect::Selection;
+        let sel = self.inspect == Inspect::Selection && (self.app.selection == Selection::Object(i) || (matches!(self.app.selection, Selection::Object(_)) && self.app.extra.contains(&i)));
         let instances = scene.instances_of(i).len();
         let text = if o.clusters.is_empty() {
             egui::RichText::new(&o.name).italics()
@@ -159,7 +163,8 @@ impl Editor {
                 actions.push(Action::ParentLight(p.0, Some(i)));
             }
             if r.clicked() {
-                actions.push(Action::Select(Selection::Object(i)));
+                let m = ui.input(|inp| inp.modifiers);
+                actions.push(if m.command { Action::SelectMore(i, false) } else if m.shift { Action::SelectMore(i, true) } else { Action::Select(Selection::Object(i)) });
             }
             if r.double_clicked() {
                 actions.push(Action::Frame(i));
@@ -260,12 +265,16 @@ impl Editor {
                 }
                 ui.end_row();
                 ui.label("Scale");
-                let r = ui.add(super::style::num(&mut k).speed(0.005).range(0.001..=1000.0).max_decimals(3));
-                self.field_rects.push(("scale", r.rect));
-                changed |= r.changed();
+                for (a, v) in [&mut k.x, &mut k.y, &mut k.z].into_iter().enumerate() {
+                    let r = ui.add(super::style::num(v).speed(0.005).range(0.001..=1000.0).max_decimals(3));
+                    if a == 0 {
+                        self.field_rects.push(("scale", r.rect));
+                    }
+                    changed |= r.changed();
+                }
                 ui.end_row();
             });
-            ui.weak("Rotates X, then Y, then Z. Scales the same on every axis, so the texture tiles stay valid.");
+            ui.weak("Scales along its own axes, then rotates X, then Y, then Z.");
         });
         if changed {
             self.app.move_object(i, p, r * (std::f32::consts::PI / 180.0), k);

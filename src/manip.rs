@@ -1,10 +1,11 @@
 //! Manipulators, as in Maya: Q select, W move, E rotate, R scale.
 //!
-//! Move has an arrow per axis (X red, Y green, Z blue) and a square at the
-//! centre that moves in the plane facing the eye. Rotate is a ring about
-//! each axis, in the same colours. Scale is a cube at the centre and an
-//! arrow per axis, all scaling the same on every axis (so texture tiles
-//! stay valid). Handles are a fixed size on screen; axes are the world's.
+//! Move has an arrow per axis (X red, Y green, Z blue), a cone at its tip,
+//! and a square at the centre that moves in the plane facing the eye.
+//! Rotate is a ring about each axis, in the same colours. Scale has a
+//! line per axis of the object's own ending in a block, scaling that axis,
+//! and a block at the centre scaling all three alike. Handles are a fixed
+//! size on screen; move and rotate use the world's axes.
 
 use glam::Vec3;
 
@@ -97,7 +98,7 @@ pub fn ring_faces_eye(cam: &Camera, pivot: Vec3, k: usize) -> bool {
 }
 
 /// The handle under pixel `m`, if any.
-pub fn pick(cam: &Camera, frame: &Frame, tool: Tool, pivot: Vec3, m: glam::Vec2, px: f32) -> Option<Handle> {
+pub fn pick(cam: &Camera, frame: &Frame, tool: Tool, pivot: Vec3, axes: [Vec3; 3], m: glam::Vec2, px: f32) -> Option<Handle> {
     let len = handle_length(cam, frame.height, pivot);
     let c = screen(cam, frame, pivot)?;
     let near = PICK_PX * px;
@@ -108,7 +109,7 @@ pub fn pick(cam: &Camera, frame: &Frame, tool: Tool, pivot: Vec3, m: glam::Vec2,
                 return Some(Handle::Centre);
             }
             let mut best: Option<(f32, usize)> = None;
-            for (k, a) in AXES.iter().enumerate() {
+            for (k, a) in axes.iter().enumerate() {
                 let Some(e) = screen(cam, frame, pivot + *a * len) else { continue };
                 let d = seg_dist(m, c, e);
                 if d <= near && best.is_none_or(|(bd, _)| d < bd) {
@@ -132,22 +133,24 @@ pub fn pick(cam: &Camera, frame: &Frame, tool: Tool, pivot: Vec3, m: glam::Vec2,
 }
 
 /// Draw the tool's handles at `pivot`, `hot` highlighted.
-pub fn draw(frame: &mut Frame, cam: &Camera, tool: Tool, pivot: Vec3, hot: Option<Handle>, px: f32) {
+pub fn draw(frame: &mut Frame, cam: &Camera, tool: Tool, pivot: Vec3, axes: [Vec3; 3], hot: Option<Handle>, px: f32) {
     let len = handle_length(cam, frame.height, pivot);
     match tool {
         Tool::Select => {}
         Tool::Move | Tool::Scale => {
-            for (k, a) in AXES.iter().enumerate() {
+            for (k, a) in axes.iter().enumerate() {
                 let col = if hot == Some(Handle::Axis(k)) { HOT } else { axis_colour(k) };
                 let tip = pivot + *a * len;
-                thick_line(frame, cam, pivot, tip, col);
                 if tool == Tool::Move {
-                    raster::draw_disc(frame, cam, tip, 4.5 * px, col, false);
+                    // A line, and a cone at the tip.
+                    thick_line(frame, cam, pivot, pivot + *a * len * 0.86, col);
+                    arrow_head(frame, cam, pivot, tip, 7.0 * px, col);
                 } else {
-                    square(frame, cam, tip, 4.0 * px, col, false);
+                    thick_line(frame, cam, pivot, tip, col);
+                    square(frame, cam, tip, 5.0 * px, col, false);
                 }
             }
-            let col = if hot == Some(Handle::Centre) { HOT } else { Vec3::splat(0.9) };
+            let col = if hot == Some(Handle::Centre) { HOT } else if tool == Tool::Move { Vec3::new(0.95, 0.9, 0.3) } else { Vec3::splat(0.85) };
             square(frame, cam, pivot, 6.0 * px, col, tool == Tool::Move);
         }
         Tool::Rotate => {
@@ -176,6 +179,34 @@ fn thick_line(frame: &mut Frame, cam: &Camera, a: Vec3, b: Vec3, col: Vec3) {
         let y = (pa.1 + d.y * t) as i32 + n.1;
         if x >= 0 && y >= 0 && (x as usize) < frame.width && (y as usize) < frame.height {
             frame.color[y as usize * frame.width + x as usize] = packed;
+        }
+    }
+}
+
+/// A filled cone seen from the side: a triangle on screen with its point at
+/// `tip`, `width` pixels across its base, along the line from `from`.
+fn arrow_head(frame: &mut Frame, cam: &Camera, from: Vec3, tip: Vec3, width: f32, col: Vec3) {
+    let (Some(a), Some(t)) = (raster::project(cam, frame.width, frame.height, from), raster::project(cam, frame.width, frame.height, tip)) else { return };
+    let (a, t) = (glam::Vec2::new(a.0, a.1), glam::Vec2::new(t.0, t.1));
+    let d = (t - a).normalize_or(glam::Vec2::X);
+    let n = glam::Vec2::new(-d.y, d.x);
+    let base = t - d * width * 2.2;
+    let (p0, p1, p2) = (t, base + n * width, base - n * width);
+    let packed = raster::pack(col);
+    let lo = p0.min(p1).min(p2).floor().max(glam::Vec2::ZERO);
+    let hi = p0.max(p1).max(p2).ceil().min(glam::Vec2::new(frame.width as f32 - 1.0, frame.height as f32 - 1.0));
+    let edge = |p: glam::Vec2, q: glam::Vec2, r: glam::Vec2| (q - p).perp_dot(r - p);
+    let area = edge(p0, p1, p2);
+    if area.abs() < 1e-6 || lo.x > hi.x || lo.y > hi.y {
+        return;
+    }
+    for y in lo.y as usize..=hi.y as usize {
+        for x in lo.x as usize..=hi.x as usize {
+            let p = glam::Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+            let (w0, w1, w2) = (edge(p1, p2, p) / area, edge(p2, p0, p) / area, edge(p0, p1, p) / area);
+            if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                frame.color[y * frame.width + x] = packed;
+            }
         }
     }
 }
@@ -254,16 +285,16 @@ mod tests {
             glam::Vec2::new(x, y)
         };
         for k in 0..3 {
-            assert_eq!(pick(&c, &f, Tool::Move, p, at(p + AXES[k] * len * 0.7), 1.0), Some(Handle::Axis(k)));
+            assert_eq!(pick(&c, &f, Tool::Move, p, AXES, at(p + AXES[k] * len * 0.7), 1.0), Some(Handle::Axis(k)));
         }
-        assert_eq!(pick(&c, &f, Tool::Move, p, at(p), 1.0), Some(Handle::Centre));
+        assert_eq!(pick(&c, &f, Tool::Move, p, AXES, at(p), 1.0), Some(Handle::Centre));
         // Each ring away from where the rings cross.
         let d = std::f32::consts::FRAC_1_SQRT_2 * len;
-        assert_eq!(pick(&c, &f, Tool::Rotate, p, at(p + Vec3::new(0.0, d, d)), 1.0), Some(Handle::Ring(0)));
-        assert_eq!(pick(&c, &f, Tool::Rotate, p, at(p + Vec3::new(d, 0.0, d)), 1.0), Some(Handle::Ring(1)));
-        assert_eq!(pick(&c, &f, Tool::Rotate, p, at(p + Vec3::new(d, d, 0.0)), 1.0), Some(Handle::Ring(2)));
-        assert_eq!(pick(&c, &f, Tool::Move, p, at(p) + glam::Vec2::new(200.0, 150.0), 1.0), None);
-        assert_eq!(pick(&c, &f, Tool::Select, p, at(p), 1.0), None);
+        assert_eq!(pick(&c, &f, Tool::Rotate, p, AXES, at(p + Vec3::new(0.0, d, d)), 1.0), Some(Handle::Ring(0)));
+        assert_eq!(pick(&c, &f, Tool::Rotate, p, AXES, at(p + Vec3::new(d, 0.0, d)), 1.0), Some(Handle::Ring(1)));
+        assert_eq!(pick(&c, &f, Tool::Rotate, p, AXES, at(p + Vec3::new(d, d, 0.0)), 1.0), Some(Handle::Ring(2)));
+        assert_eq!(pick(&c, &f, Tool::Move, p, AXES, at(p) + glam::Vec2::new(200.0, 150.0), 1.0), None);
+        assert_eq!(pick(&c, &f, Tool::Select, p, AXES, at(p), 1.0), None);
         // About 90 pixels long on screen.
         let l = at(p).distance(at(p + Vec3::Y * len));
         assert!((70.0..=100.0).contains(&l), "{l}");

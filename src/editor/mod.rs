@@ -425,6 +425,14 @@ impl Editor {
     /// Edit > Parent on the selected light: the next object picked is its
     /// parent.
     pub fn start_parenting(&mut self) {
+        // Objects, as Maya's P: the others under the last picked.
+        let objs = self.selected_objects();
+        if objs.len() >= 2 {
+            let (lead, rest) = objs.split_last().unwrap();
+            let rest = rest.to_vec();
+            self.parent_objects(&rest, Some(*lead));
+            return;
+        }
         if let Selection::Light(i) = self.app.selection {
             self.parenting = Some(i);
             self.say("pick the object to parent the light to", false);
@@ -443,6 +451,11 @@ impl Editor {
     }
 
     pub fn unparent_selected(&mut self) {
+        let objs = self.selected_objects();
+        if !objs.is_empty() {
+            self.parent_objects(&objs, None);
+            return;
+        }
         if let Selection::Light(i) = self.app.selection {
             self.app.unparent_light(i);
         }
@@ -456,9 +469,89 @@ impl Editor {
         if let Selection::Light(i) = s {
             self.app.rig.selected = i;
         }
+        self.app.extra.clear();
         self.app.selection = s;
         self.last_selection = s;
         self.inspect = Inspect::Selection;
+    }
+
+    /// The objects selected, the lead (the last picked) last.
+    pub fn selected_objects(&self) -> Vec<usize> {
+        let n = self.app.scene.objects.len();
+        let lead = match self.app.selection {
+            Selection::Object(i) if i < n && self.inspect == Inspect::Selection => Some(i),
+            _ => None,
+        };
+        let mut out: Vec<usize> = Vec::new();
+        for &j in &self.app.extra {
+            if j < n && Some(j) != lead && !out.contains(&j) {
+                out.push(j);
+            }
+        }
+        out.extend(lead);
+        out
+    }
+
+    /// Add object `i` to the selection, or take it out if it is in it
+    /// (Ctrl click); with `range`, every object in the outliner from the
+    /// lead to it (Shift click). It becomes the lead.
+    pub fn select_more(&mut self, i: usize, range: bool) {
+        let mut now = self.selected_objects();
+        if range {
+            let order = self.outliner_order();
+            let from = now.last().and_then(|l| order.iter().position(|&o| o == *l));
+            let to = order.iter().position(|&o| o == i);
+            if let (Some(a), Some(b)) = (from, to) {
+                for &o in &order[a.min(b)..=a.max(b)] {
+                    if !now.contains(&o) {
+                        now.push(o);
+                    }
+                }
+            }
+            now.retain(|&o| o != i);
+            now.push(i);
+        } else if let Some(k) = now.iter().position(|&o| o == i) {
+            now.remove(k);
+        } else {
+            now.push(i);
+        }
+        match now.pop() {
+            Some(lead) => {
+                self.select(Selection::Object(lead));
+                self.app.extra = now;
+            }
+            None => self.select(Selection::Nothing),
+        }
+    }
+
+    /// The objects in the outliner's order: each group, then what is in it.
+    pub fn outliner_order(&self) -> Vec<usize> {
+        let s = &self.app.scene;
+        let mut out = Vec::new();
+        let mut todo: Vec<usize> = s.children(None).into_iter().rev().collect();
+        while let Some(i) = todo.pop() {
+            out.push(i);
+            todo.extend(s.children(Some(i)).into_iter().rev());
+        }
+        out
+    }
+
+    /// Put objects `which` under `parent` (None: at the top), keeping
+    /// where they are: those that would go under themselves are left.
+    pub fn parent_objects(&mut self, which: &[usize], parent: Option<usize>) {
+        let mut refused = 0;
+        for &c in which {
+            if Some(c) == parent || !self.app.scene.set_parent(c, parent) {
+                refused += 1;
+            }
+        }
+        let n = which.len() - refused;
+        let to = parent.map(|p| self.app.scene.objects[p].name.clone());
+        match (n, to) {
+            (0, _) => self.say("an object cannot go under itself", true),
+            (n, Some(p)) => self.say(format!("{n} object{} under {p}", if n > 1 { "s" } else { "" }), false),
+            (n, None) => self.say(format!("{n} object{} out of {}", if n > 1 { "s" } else { "" }, if n > 1 { "their groups" } else { "its group" }), false),
+        }
     }
 
     // --------------------------------------------------------------- files
@@ -551,17 +644,23 @@ impl Editor {
     }
 
     /// Put the selected object in a new group at its pivot.
+    /// Group, as Maya's Ctrl+G: the selected objects under a new group at
+    /// the middle of their pivots, in the lead's group.
     pub fn group_selected(&mut self) {
-        let Selection::Object(i) = self.app.selection else {
+        let objs = self.selected_objects();
+        let Some(&lead) = objs.last() else {
             self.say("select an object to group", true);
             return;
         };
-        let pivot = self.app.scene.objects[i].pivot;
-        let parent = self.app.scene.objects[i].parent;
-        let name = format!("{}_group", self.app.scene.objects[i].name);
+        let s = &self.app.scene;
+        let pivot = objs.iter().map(|&i| s.objects[i].pivot).sum::<glam::Vec3>() / objs.len() as f32;
+        let parent = s.objects[lead].parent;
+        let name = if objs.len() == 1 { format!("{}_group", s.objects[lead].name) } else { format!("group{}", s.objects.iter().filter(|o| o.clusters.is_empty()).count() + 1) };
         let g = self.app.scene.add_group(name, pivot);
-        self.app.scene.set_parent(g, parent);
-        self.app.scene.set_parent(i, Some(g));
+        self.app.scene.set_parent(g, parent.filter(|p| !objs.contains(p)));
+        for &i in &objs {
+            self.app.scene.set_parent(i, Some(g));
+        }
         self.select(Selection::Object(g));
     }
 
@@ -698,12 +797,13 @@ impl Editor {
                     Selection::Light(i) => Some(i),
                     _ => None,
                 };
-                if ui.add_enabled(light.is_some(), egui::Button::new("Parent").shortcut_text("P")).on_hover_text("Then pick the object to parent the light to, in the viewport or the outliner").clicked() {
+                let objs = self.selected_objects();
+                if ui.add_enabled(light.is_some() || objs.len() >= 2, egui::Button::new("Parent").shortcut_text("P")).on_hover_text("Objects: the others under the last picked. A light: then pick the object to parent it to").clicked() {
                     self.start_parenting();
                     ui.close();
                 }
                 ui.checkbox(&mut self.preserve_position, "Parent preserves position");
-                if ui.add_enabled(light.is_some_and(|i| self.app.rig.link(i).is_some()), egui::Button::new("Unparent").shortcut_text("Shift+P")).clicked() {
+                if ui.add_enabled(light.is_some_and(|i| self.app.rig.link(i).is_some()) || objs.iter().any(|&i| self.app.scene.objects[i].parent.is_some()), egui::Button::new("Unparent").shortcut_text("Shift+P")).clicked() {
                     self.unparent_selected();
                     ui.close();
                 }
@@ -1033,6 +1133,48 @@ mod tests {
         egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32))), ..Default::default() }
     }
 
+    /// Several objects selected (Ctrl and Shift clicks in the outliner):
+    /// P puts the others under the last picked, Ctrl+G groups them all,
+    /// Shift+P takes them out, Delete deletes them all.
+    #[test]
+    fn several_objects_parent_group_and_delete_together() {
+        let mut ed = editor();
+        let mut cubes = Vec::new();
+        for _ in 0..3 {
+            ed.make(create::Make::Primitive("cube"));
+            let Selection::Object(i) = ed.app.selection else { panic!() };
+            cubes.push(i);
+        }
+        ed.make(create::Make::Group);
+        let Selection::Object(g) = ed.app.selection else { panic!() };
+        ed.select(Selection::Object(cubes[0]));
+        ed.select_more(cubes[2], true);
+        assert_eq!(ed.selected_objects(), cubes, "a Shift click takes the range");
+        ed.select_more(cubes[1], false);
+        assert_eq!(ed.selected_objects(), vec![cubes[0], cubes[2]], "a Ctrl click takes one out");
+        ed.select_more(cubes[1], false);
+        ed.select_more(g, false);
+        ed.start_parenting();
+        for &c in &cubes {
+            assert_eq!(ed.app.scene.objects[c].parent, Some(g));
+        }
+        ed.select(Selection::Object(cubes[0]));
+        ed.select_more(cubes[1], false);
+        ed.unparent_selected();
+        assert_eq!(ed.app.scene.objects[cubes[0]].parent, None);
+        assert_eq!(ed.app.scene.objects[cubes[2]].parent, Some(g));
+        ed.group_selected();
+        let Selection::Object(h) = ed.app.selection else { panic!() };
+        assert!(ed.app.scene.is_group(h));
+        assert_eq!(ed.app.scene.children(Some(h)), vec![cubes[0], cubes[1]]);
+        let n = ed.app.scene.objects.len();
+        ed.select(Selection::Object(cubes[0]));
+        ed.select_more(cubes[2], false);
+        ed.delete_selected();
+        assert_eq!(ed.app.scene.objects.len(), n - 2);
+        assert!(ed.app.scene.objects.iter().filter(|o| o.name.starts_with("cube")).count() == 1);
+    }
+
     /// Typing into the scale field: nothing changes until Enter, a bad
     /// entry ("0.01. ") leaves the value as it was, a good one is taken.
     #[test]
@@ -1057,7 +1199,7 @@ mod tests {
             ed.frame(egui::RawInput { events: vec![key(egui::Key::A)].into_iter().map(|e| match e { egui::Event::Key { key, .. } => egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND }, e => e }).collect(), ..raw(w, h) }, w, h);
             for ch in text.chars() {
                 ed.frame(egui::RawInput { events: vec![egui::Event::Text(ch.to_string())], ..raw(w, h) }, w, h);
-                assert_eq!(ed.app.scene.objects[i].scale, 1.0, "nothing changes while typing ({text:?})");
+                assert_eq!(ed.app.scene.objects[i].scale, glam::Vec3::ONE, "nothing changes while typing ({text:?})");
             }
             ed.frame(egui::RawInput { events: vec![key(egui::Key::Enter)], ..raw(w, h) }, w, h);
             for _ in 0..2 {
@@ -1065,9 +1207,9 @@ mod tests {
             }
         };
         type_in(&mut ed, "0.01. ");
-        assert_eq!(ed.app.scene.objects[i].scale, 1.0, "a bad entry leaves it");
+        assert_eq!(ed.app.scene.objects[i].scale, glam::Vec3::ONE, "a bad entry leaves it");
         type_in(&mut ed, "2.5");
-        assert!((ed.app.scene.objects[i].scale - 2.5).abs() < 1e-6, "{}", ed.app.scene.objects[i].scale);
+        assert!((ed.app.scene.objects[i].scale - glam::Vec3::new(2.5, 1.0, 1.0)).abs().max_element() < 1e-6, "{}", ed.app.scene.objects[i].scale);
     }
 
     /// The layout puts the viewport between the panels, the frame is sized
@@ -1228,7 +1370,7 @@ mod tests {
             assert_eq!(ed.app.scene.objects[i].name, format!("{n}1"));
             let (lo, hi) = ed.app.scene.object_bounds(i);
             assert!(lo.y.abs() < 1e-3 && (hi.x - lo.x - 1.0).abs() < 0.05, "{n}: {lo} {hi}");
-            ed.app.scene.set_object(i, glam::Vec3::new(k as f32 * 1.5 - 2.25, 0.0, 2.0), glam::Vec3::ZERO, 1.0);
+            ed.app.scene.set_object(i, glam::Vec3::new(k as f32 * 1.5 - 2.25, 0.0, 2.0), glam::Vec3::ZERO, glam::Vec3::splat(1.0));
         }
         ed.make(create::Make::Primitive("cube"));
         assert!(ed.app.scene.objects.iter().any(|o| o.name == "cube2"));
@@ -1276,7 +1418,7 @@ mod tests {
         assert!(ed.app.rig.lights[0].position.distance(start) < 1e-5, "preserved");
         // The ball moves and turns: the light goes with it.
         let o = ed.app.scene.objects[0].clone();
-        ed.app.move_object(0, o.pivot + glam::Vec3::new(1.0, 0.0, 0.0), glam::Vec3::new(0.0, 1.0, 0.0), 1.0);
+        ed.app.move_object(0, o.pivot + glam::Vec3::new(1.0, 0.0, 0.0), glam::Vec3::new(0.0, 1.0, 0.0), glam::Vec3::splat(1.0));
         ed.app.sync_lights();
         let want = ed.app.scene.object_frame(0).transform_point3(ed.app.scene.objects.first().map(|_| glam::Affine3A::from_scale_rotation_translation(glam::Vec3::ONE, crate::scene::euler_quat(o.rotation), o.pivot).inverse().transform_point3(start)).unwrap());
         assert!(ed.app.rig.lights[0].position.distance(want) < 1e-4);
@@ -1284,7 +1426,7 @@ mod tests {
         ed.app.rig.lights[0].position += glam::Vec3::Y;
         ed.app.sync_lights();
         let here = ed.app.rig.lights[0].position;
-        ed.app.move_object(0, ed.app.scene.objects[0].pivot + glam::Vec3::Z, ed.app.scene.objects[0].rotation, 1.0);
+        ed.app.move_object(0, ed.app.scene.objects[0].pivot + glam::Vec3::Z, ed.app.scene.objects[0].rotation, glam::Vec3::splat(1.0));
         ed.app.sync_lights();
         assert!((ed.app.rig.lights[0].position - here - glam::Vec3::Z).length() < 1e-4);
         // Without preserving: the position is taken as an offset.
@@ -1332,7 +1474,7 @@ mod tests {
         assert_eq!((ed.app.scene.qpos.len(), ed.app.scene.tris.len()), (verts, tris), "nothing stored again");
         assert_eq!(ed.app.scene.instances_of(a), vec![a, b, c]);
         for (k, &i) in [a, b, c].iter().enumerate() {
-            ed.app.scene.set_object(i, glam::Vec3::new(k as f32 * 1.5 - 1.5, 0.0, 2.0), glam::Vec3::new(0.0, k as f32, 0.0), 1.0 + k as f32 * 0.2);
+            ed.app.scene.set_object(i, glam::Vec3::new(k as f32 * 1.5 - 1.5, 0.0, 2.0), glam::Vec3::new(0.0, k as f32, 0.0), glam::Vec3::splat(1.0 + k as f32 * 0.2));
         }
         ed.app.cam.look_from(glam::Vec3::new(0.0, 3.0, 7.0), glam::Vec3::new(0.0, 0.3, 2.0));
         let seen = |ed: &mut Editor, objs: &[usize]| -> Vec<usize> {
@@ -1374,7 +1516,7 @@ mod tests {
         let c2 = other.app.scene.objects.iter().position(|o| o.name == "sphere3").unwrap();
         assert_eq!(other.app.scene.instances_of(b2), vec![b2, c2]);
         assert!(other.app.scene.objects[c2].pivot.distance(ed.app.scene.objects[c].pivot) < 1e-4);
-        assert!((other.app.scene.objects[c2].scale - 1.4).abs() < 1e-4);
+        assert!((other.app.scene.objects[c2].scale - glam::Vec3::splat(1.4)).abs().max_element() < 1e-4);
         assert_eq!(other.app.scene.qpos.len(), ed.app.scene.qpos.len());
     }
 
@@ -1461,7 +1603,7 @@ mod tests {
         let Selection::Object(g) = ed.app.selection else { panic!() };
         assert_eq!(ed.app.scene.objects[0].parent, Some(g));
         let before = ed.app.scene.objects[0].pivot;
-        ed.app.scene.set_object(g, glam::Vec3::new(1.0, 0.0, 0.0), glam::Vec3::ZERO, 1.0);
+        ed.app.scene.set_object(g, glam::Vec3::new(1.0, 0.0, 0.0), glam::Vec3::ZERO, glam::Vec3::splat(1.0));
         assert!((ed.app.scene.objects[0].pivot - before - glam::Vec3::X).length() < 1e-5);
         ed.app.hours = 15.25;
         ed.app.apply_daylight();

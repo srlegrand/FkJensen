@@ -80,8 +80,10 @@ pub struct ObjectEntry {
     /// Degrees about X, Y and Z, applied in that order (Maya's xyz).
     #[serde(default)]
     pub rotation: [f32; 3],
-    #[serde(default = "one")]
-    pub scale: f32,
+    /// Along its own axes, before the rotation; one number when the same on
+    /// every axis.
+    #[serde(default)]
+    pub scale: ScaleEntry,
     /// The group it is in: an index into `objects`, of an earlier entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<usize>,
@@ -175,8 +177,31 @@ pub fn push_materials(scene: &mut Scene, i: usize) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn one() -> f32 {
-    1.0
+/// A scale: one number when it is the same on every axis, else three.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(untagged)]
+pub enum ScaleEntry {
+    Uniform(f32),
+    Axes([f32; 3]),
+}
+
+impl ScaleEntry {
+    pub fn v(self) -> Vec3 {
+        match self {
+            ScaleEntry::Uniform(k) => Vec3::splat(k),
+            ScaleEntry::Axes(a) => v3(a),
+        }
+    }
+
+    pub fn of(s: Vec3) -> ScaleEntry {
+        if crate::scene::uniform(s) { ScaleEntry::Uniform(round6(s.x)) } else { ScaleEntry::Axes(a3(s)) }
+    }
+}
+
+impl Default for ScaleEntry {
+    fn default() -> Self {
+        ScaleEntry::Uniform(1.0)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -384,7 +409,7 @@ pub fn load_asset(path: &Path) -> Result<Scene, String> {
     let n = s.clusters.len();
     let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let rest = s.objects.iter().find(|o| o.clusters == (0..n)).map(|o| (o.name.clone(), o.pivot, o.rotation, o.scale));
-    let (oname, pivot, rotation, scale) = rest.unwrap_or((name.clone(), Vec3::ZERO, Vec3::ZERO, 1.0));
+    let (oname, pivot, rotation, scale) = rest.unwrap_or((name.clone(), Vec3::ZERO, Vec3::ZERO, Vec3::ONE));
     s.objects = vec![Object::new(if oname.is_empty() { name } else { oname }, 0..n, pivot, rotation, scale, None)];
     s.objects[0].asset = Some(path.to_path_buf());
     s.own_materials(0);
@@ -467,7 +492,7 @@ pub fn build(f: &SceneFile, dir: &Path, search: &[PathBuf]) -> Result<Scene, Str
     // Groups come before what is in them, so placing in order moves each
     // object last as itself: where the file says.
     for (o, &i) in f.objects.iter().zip(&index) {
-        scene.set_object(i, v3(o.pivot), v3(o.rotation.map(f32::to_radians)), o.scale);
+        scene.set_object(i, v3(o.pivot), v3(o.rotation.map(f32::to_radians)), o.scale.v());
     }
     scene.lights = f.lights.iter().map(|l| PointLight { position: v3(l.position), color: v3(l.color), lumens: l.lumens.clamp(crate::scene::MIN_LUMENS, crate::scene::MAX_LUMENS) }).collect();
     scene.light_parents = f.lights.iter().map(|l| l.parent.and_then(|p| index.get(p).copied())).collect();
@@ -583,7 +608,7 @@ pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight], light_pa
                     asset: None,
                     pivot: a3(o.pivot),
                     rotation: a3(o.rotation).map(|r| round6(r.to_degrees())),
-                    scale: round6(o.scale),
+                    scale: ScaleEntry::of(o.scale),
                     parent: o.parent.filter(|&p| p < n && at[p] < at[i]).map(|p| at[p]),
                     materials: Vec::new(),
                     instance_of: Some(at[j]),
@@ -598,7 +623,7 @@ pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight], light_pa
                 },
                 pivot: a3(o.pivot),
                 rotation: a3(o.rotation).map(|r| round6(r.to_degrees())),
-                scale: round6(o.scale),
+                scale: ScaleEntry::of(o.scale),
                 parent: o.parent.filter(|&p| p < n && at[p] < at[i]).map(|p| at[p]),
                 materials: if o.clusters.is_empty() { Vec::new() } else { material_changes(scene, i) },
                 instance_of: None,
@@ -644,8 +669,8 @@ mod tests {
         s.scatter_missing_samples();
         let g = s.add_group("group".into(), Vec3::new(1.0, 0.0, 0.0));
         s.objects[0].parent = Some(g);
-        s.set_object(0, Vec3::new(2.0, 0.3, -1.0), Vec3::new(0.2, 0.9, -0.1), 1.5);
-        s.set_object(g, Vec3::new(1.5, 0.0, 0.5), Vec3::new(0.0, 0.4, 0.0), 1.0);
+        s.set_object(0, Vec3::new(2.0, 0.3, -1.0), Vec3::new(0.2, 0.9, -0.1), Vec3::new(1.5, 0.8, 1.2));
+        s.set_object(g, Vec3::new(1.5, 0.0, 0.5), Vec3::new(0.0, 0.4, 0.0), glam::Vec3::splat(1.0));
         s
     }
 
@@ -672,7 +697,7 @@ mod tests {
         let t = build(&g, &d, &[]).unwrap();
         assert_eq!(t.objects.len(), 2);
         let (a, b) = (&s.objects[0], t.objects.iter().find(|o| o.name == "ball one").unwrap());
-        assert!(a.pivot.distance(b.pivot) < 1e-4 && (a.scale - b.scale).abs() < 1e-5);
+        assert!(a.pivot.distance(b.pivot) < 1e-4 && (a.scale - b.scale).abs().max_element() < 1e-5);
         for (ca, cb) in s.clusters[a.clusters.clone()].iter().zip(&t.clusters[b.clusters.clone()]) {
             for (va, vb) in (ca.first_vertex..ca.first_vertex + ca.vertex_count).zip(cb.first_vertex..cb.first_vertex + cb.vertex_count) {
                 assert!(s.pos(ca, va as usize).distance(t.pos(cb, vb as usize)) < 1e-3);
@@ -788,7 +813,7 @@ mod tests {
     #[test]
     fn a_minimal_scene_parses() {
         let f = parse(r#"{ "fjs": 1, "world": "built-in", "objects": [ { "name": "g", "pivot": [0, 0, 0] } ] }"#).unwrap();
-        assert_eq!(f.objects[0].scale, 1.0);
+        assert_eq!(f.objects[0].scale.v(), Vec3::ONE);
         assert!(f.camera.is_none() && f.render.is_none());
         assert!(parse(r#"{ "fjs": 9 }"#).is_err());
         assert!(parse(r#"{ "fjs": 1, "objects": [ { "name": "a", "pivot": [0,0,0], "parent": 0 } ] }"#).is_err());

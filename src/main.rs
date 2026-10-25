@@ -194,7 +194,9 @@ struct ManipDrag {
     pivot: Vec3,
     /// Euler angles, radians.
     rotation: Vec3,
-    scale: f32,
+    scale: Vec3,
+    /// The handles' axes: the world's, or the object's own for scale.
+    axes: [Vec3; 3],
     /// Where the pointer took the handle: along the axis, on the plane, the
     /// angle on the ground plane, or the pointer's x.
     grab: Vec3,
@@ -228,6 +230,9 @@ struct App {
     /// The manipulator shown (Q W E R) and what it acts on.
     tool: manip::Tool,
     selection: Selection,
+    /// Other objects selected with it (the outliner's Ctrl and Shift
+    /// clicks); `selection` is the last one picked, as Maya's lead.
+    extra: Vec<usize>,
     manip: Option<ManipDrag>,
     /// The handle under the pointer.
     hot: Option<manip::Handle>,
@@ -242,7 +247,7 @@ struct App {
     frame_size: Option<(usize, usize)>,
     /// The object being dragged and its pivot, rotation and scale when
     /// the drag began.
-    drag_start: Option<(usize, Vec3, Vec3, f32)>,
+    drag_start: Option<(usize, Vec3, Vec3, Vec3)>,
     /// What the machine's plan allows of shadows, bounce light and shadow
     /// map texels, over what a scene file asks.
     caps: (bool, bool, usize),
@@ -301,6 +306,7 @@ impl App {
             drag: None,
             tool: manip::Tool::Move,
             selection: Selection::Nothing,
+            extra: Vec::new(),
             manip: None,
             hot: None,
             alt: false,
@@ -348,6 +354,7 @@ impl App {
         self.manip = None;
         self.drag_start = None;
         self.selection = Selection::Nothing;
+        self.extra.clear();
         if let Some(f) = file {
             self.apply_file(&f);
         }
@@ -700,15 +707,21 @@ impl App {
         let k = self.render_scale.max(0.25);
         if let Selection::Object(i) = self.selection {
             // Each box turns with its object; a group shows those under it.
-            for j in std::iter::once(i).chain(self.scene.descendants(i)) {
-                if !self.scene.objects[j].clusters.is_empty() {
-                    manip::draw_corners(&mut self.frame, &cam, &self.scene.objects[j].corners(), Vec3::new(0.35, 0.95, 0.55));
+            // The others selected with it are drawn paler.
+            let others: Vec<usize> = self.extra.iter().copied().filter(|&j| j != i && j < self.scene.objects.len()).collect();
+            for (lead, k) in std::iter::once((true, i)).chain(others.into_iter().map(|k| (false, k))) {
+                let col = if lead { Vec3::new(0.35, 0.95, 0.55) } else { Vec3::new(0.25, 0.6, 0.4) };
+                for j in std::iter::once(k).chain(self.scene.descendants(k)) {
+                    if !self.scene.objects[j].clusters.is_empty() {
+                        manip::draw_corners(&mut self.frame, &cam, &self.scene.objects[j].corners(), col);
+                    }
                 }
             }
         }
         if let Some((pivot, tool)) = self.gizmo() {
             let hot = self.manip.as_ref().map(|m| m.handle).or(self.hot);
-            manip::draw(&mut self.frame, &cam, tool, pivot, hot, k);
+            let axes = self.gizmo_axes();
+            manip::draw(&mut self.frame, &cam, tool, pivot, axes, hot, k);
         }
     }
 
@@ -723,11 +736,23 @@ impl App {
         .filter(|(_, t)| *t != manip::Tool::Select)
     }
 
+    /// The manipulator's axes: the world's, or for scale the selected
+    /// object's own (Maya scales along an object's axes).
+    fn gizmo_axes(&self) -> [Vec3; 3] {
+        match (self.selection, self.tool) {
+            (Selection::Object(i), manip::Tool::Scale) if i < self.scene.objects.len() => {
+                let q = scene::euler_quat(self.scene.objects[i].rotation);
+                manip::AXES.map(|a| q * a)
+            }
+            _ => manip::AXES,
+        }
+    }
+
     /// The handle under the pointer, if any.
     fn pick_handle(&self) -> Option<manip::Handle> {
         let (pivot, tool) = self.gizmo()?;
         let cam = self.render_camera();
-        manip::pick(&cam, &self.frame, tool, pivot, glam::Vec2::new(self.mouse.0, self.mouse.1), self.render_scale.max(0.25))
+        manip::pick(&cam, &self.frame, tool, pivot, self.gizmo_axes(), glam::Vec2::new(self.mouse.0, self.mouse.1), self.render_scale.max(0.25))
     }
 
     fn start_manip(&mut self, handle: manip::Handle) {
@@ -737,10 +762,11 @@ impl App {
         let (x, y) = self.mouse;
         let (rotation, scale) = match self.selection {
             Selection::Object(i) => (self.scene.objects[i].rotation, self.scene.objects[i].scale),
-            _ => (Vec3::ZERO, 1.0),
+            _ => (Vec3::ZERO, Vec3::ONE),
         };
+        let axes = self.gizmo_axes();
         let grab = match (tool, handle) {
-            (_, manip::Handle::Axis(k)) => Vec3::splat(manip::along_axis(&cam, &self.frame, x, y, pivot, manip::AXES[k]).unwrap_or(0.0)),
+            (_, manip::Handle::Axis(k)) => Vec3::splat(manip::along_axis(&cam, &self.frame, x, y, pivot, axes[k]).unwrap_or(0.0)),
             (manip::Tool::Move, manip::Handle::Centre) => manip::on_plane(&cam, &self.frame, x, y, pivot, (pivot - cam.eye).normalize_or(Vec3::Z)).unwrap_or(pivot),
             (_, manip::Handle::Ring(k)) => {
                 // x: the angle taken; y: 1 when followed in the ring's plane.
@@ -749,7 +775,7 @@ impl App {
             }
             _ => Vec3::splat(x),
         };
-        self.manip = Some(ManipDrag { target: self.selection, tool, handle, pivot, rotation, scale, grab, len });
+        self.manip = Some(ManipDrag { target: self.selection, tool, handle, pivot, rotation, scale, axes, grab, len });
     }
 
     fn update_manip(&mut self) {
@@ -776,8 +802,9 @@ impl App {
                 }
             }
             (manip::Tool::Scale, manip::Handle::Axis(k)) => {
-                if let Some(t) = manip::along_axis(&cam, &self.frame, x, y, m.pivot, manip::AXES[k]) {
-                    scale = m.scale * (1.0 + (t - m.grab.x) / m.len).max(0.01);
+                // One axis of the object's own, as Maya's scale handles.
+                if let Some(t) = manip::along_axis(&cam, &self.frame, x, y, m.pivot, m.axes[k]) {
+                    scale[k] = m.scale[k] * (1.0 + (t - m.grab.x) / m.len).max(0.01);
                 }
             }
             (manip::Tool::Scale, _) => scale = m.scale * ((x - m.grab.x) / (120.0 * self.render_scale.max(0.25))).exp(),
@@ -802,7 +829,7 @@ impl App {
 
     /// Place object `i` (and what is under it), telling the renderer where
     /// it was and where it is, so only what that changes is redone.
-    fn move_object(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: f32) {
+    fn move_object(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: Vec3) {
         if self.drag_start.is_none_or(|d| d.0 != i) {
             let o = &self.scene.objects[i];
             self.drag_start = Some((i, o.pivot, o.rotation, o.scale));
@@ -819,9 +846,7 @@ impl App {
         // Dragged: its light goes with it until it is let go.
         let o = &self.scene.objects[i];
         let Some((_, p0, r0, k0)) = self.drag_start else { return };
-        let start = (p0, r0, k0);
-        let q = scene::euler_quat(o.rotation) * scene::euler_quat(start.1).inverse();
-        let ahead = glam::Affine3A::from_translation(o.pivot) * glam::Affine3A::from_scale_rotation_translation(Vec3::splat(o.scale / start.2), q, Vec3::ZERO) * glam::Affine3A::from_translation(-start.0);
+        let ahead = o.frame() * scene::frame_of(p0, r0, k0).inverse();
         self.renderer.dragged(self.scene.moving_clusters(i), from, to, ahead.inverse());
     }
 
@@ -844,6 +869,7 @@ impl App {
     /// Select what is under the pointer: a light, else a model, else
     /// nothing. Returns the light, for dragging.
     fn select_at_pointer(&mut self) -> Option<usize> {
+        self.extra.clear();
         // A camera's eye, drawn as a dot.
         {
             let cam = self.render_camera();
@@ -1573,7 +1599,7 @@ fn add_models(scene: &mut Scene, highres: bool) -> Option<(Vec3, Vec3)> {
             Ok(m) => {
                 let i = scene.objects.len();
                 scene.append(m);
-                scene.set_object(i, at, Vec3::new(0.0, yaw.to_radians(), 0.0), 1.0);
+                scene.set_object(i, at, Vec3::new(0.0, yaw.to_radians(), 0.0), Vec3::ONE);
                 let (lo, hi) = scene.vertex_bounds(i);
                 bounds = Some(match bounds {
                     Some((a, b)) => (a.min(lo), b.max(hi)),
@@ -2427,7 +2453,7 @@ mod tests {
         let turned = scene::euler_quat(r) * Vec3::X;
         assert!(turned.distance(Vec3::NEG_Z) < 0.1, "{r} turns X to {turned}");
         // The Z ring tips it over: X goes up.
-        app.scene.set_object(0, Vec3::ZERO, Vec3::ZERO, 1.0);
+        app.scene.set_object(0, Vec3::ZERO, Vec3::ZERO, glam::Vec3::splat(1.0));
         app.render();
         let ringz = |a: f32| Vec3::new(a.cos(), a.sin(), 0.0) * len;
         let (rx, ry) = screen_of(&app, ringz(-q45));
@@ -2448,7 +2474,21 @@ mod tests {
         app.on_cursor(cx + 120.0, cy);
         app.on_button(0, false);
         let k = app.scene.objects[0].scale;
-        assert!((k - std::f32::consts::E).abs() < 0.1, "{k}");
+        assert!((k - Vec3::splat(std::f32::consts::E)).abs().max_element() < 0.1, "{k}");
+        // A scale handle scales its axis only, the object's own: turned a
+        // quarter about Y, its X handle points down -Z.
+        app.scene.set_object(0, Vec3::ZERO, Vec3::new(0.0, std::f32::consts::FRAC_PI_2, 0.0), Vec3::ONE);
+        app.render();
+        let len = manip::handle_length(&app.render_camera(), app.frame.height, Vec3::ZERO);
+        let (hx, hy) = screen_of(&app, Vec3::NEG_Z * len * 0.6);
+        app.on_cursor(hx, hy);
+        assert_eq!(app.hot, Some(manip::Handle::Axis(0)));
+        app.on_button(0, true);
+        let (ex, ey) = screen_of(&app, Vec3::NEG_Z * len * 1.2);
+        app.on_cursor(ex, ey);
+        app.on_button(0, false);
+        let k = app.scene.objects[0].scale;
+        assert!(k.x > 1.5 && (k.y - 1.0).abs() < 1e-5 && (k.z - 1.0).abs() < 1e-5, "{k}");
         // Alt + left drag tumbles and keeps the selection.
         let yaw_cam = app.cam.yaw;
         app.key(KeyCode::AltLeft, true);

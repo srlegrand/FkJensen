@@ -209,7 +209,7 @@ Each level has its own texture tiles in `TEXR`. Clusters without `LODS`
 
 What the editor selects and moves (`Scene::objects`): runs of clusters
 with a pivot, and groups. Optional; a reader without it draws the same
-geometry. Section version 2.
+geometry. Section version 3.
 
     u32       object count
     u32       0
@@ -221,12 +221,13 @@ geometry. Section version 2.
       f32 x 3   pivot, metres: the point it turns and scales about
       f32 x 3   rotation since first placed, radians about X, Y and Z,
                 applied in that order
-      f32       uniform scale since first placed
+      f32 x 3   scale along the object's own axes (before the rotation)
       u8 x n    the name, UTF-8, padded with zeros to 4 bytes
 
 Geometry is stored where the objects stand; the rotation and scale are
 kept so the editor shows them. Version 1 (23/10/2026) held one f32, the
-turn about Y, in place of the rotation; it is still read. A group with nothing under it is its pivot. A
+turn about Y, in place of the rotation; version 2 (24/10/2026) one f32,
+a uniform scale; both are still read. A group with nothing under it is its pivot. A
 parent chain that loops is cut at the object that closes it.
 
 ## SAMP

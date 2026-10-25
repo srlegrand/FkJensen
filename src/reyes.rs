@@ -441,9 +441,10 @@ struct Drag {
 /// Cluster `c` taken back by `back` (turning by `turn`): where it was when
 /// a drag began.
 fn carry(c: &crate::scene::Cluster, back: glam::Affine3A, turn: glam::Quat) -> crate::scene::Cluster {
-    let k = back.matrix3.x_axis.length();
+    let (k, _, nback) = crate::scene::linear_parts(&back);
     let mut h = *c;
     h.xf = back * c.xf;
+    h.nmat = nback * if c.turned { c.nmat } else { glam::Mat3::IDENTITY };
     h.turn = (turn * c.turn).normalize();
     h.turned = true;
     h.centre = back.transform_point3(c.centre);
@@ -612,7 +613,7 @@ impl Renderer {
     /// moves the object's picture with it over the rest (`render_drag`).
     /// `drag_ended` bakes it.
     pub fn dragged(&mut self, clusters: Vec<std::ops::Range<usize>>, from: (Vec3, Vec3), to: (Vec3, Vec3), back: glam::Affine3A) {
-        let (_, turn, _) = back.to_scale_rotation_translation();
+        let (_, turn, _) = crate::scene::linear_parts(&back);
         // A bake still going is overtaken by the new drag: its bounce light
         // is made again with everything else.
         if let Some(b) = self.bake.take() {
@@ -3001,7 +3002,7 @@ mod tests {
         r.render(&scene, &cam, &lights, &settings, &mut f);
         let before = f.color.clone();
         let from = scene.object_bounds(ob);
-        scene.set_object(ob, Vec3::new(0.6, 0.3, 0.2), Vec3::new(0.4, 0.5, -0.3), 1.4);
+        scene.set_object(ob, Vec3::new(0.6, 0.3, 0.2), Vec3::new(0.4, 0.5, -0.3), glam::Vec3::splat(1.4));
         let to = scene.object_bounds(ob);
         r.moved(scene.objects[ob].clusters.clone(), from, to, true);
         r.render(&scene, &cam, &lights, &settings, &mut f);
@@ -3046,7 +3047,7 @@ mod tests {
             // The last step turns past what the picture can follow.
             let yaw = if step < 4 { 0.03 * step as f32 } else { 0.6 };
             let (pivot, turn) = (start.pivot + Vec3::new(0.04 * step as f32, 0.0, 0.0), Vec3::new(0.0, yaw, 0.0));
-            scene.set_object(ob, pivot, turn, 1.0);
+            scene.set_object(ob, pivot, turn, glam::Vec3::splat(1.0));
             let to = scene.object_bounds(ob);
             let ahead = glam::Affine3A::from_translation(pivot) * glam::Affine3A::from_rotation_translation(crate::scene::euler_quat(turn), Vec3::ZERO) * glam::Affine3A::from_translation(-start.pivot);
             r.dragged(vec![first..n], from, to, ahead.inverse());
@@ -3097,7 +3098,7 @@ mod tests {
         r.render(&scene, &cam, &lights, &settings, &mut f);
         let start = scene.objects[ob].pivot;
         let from = scene.object_bounds(ob);
-        scene.set_object(ob, start + Vec3::new(0.3, 0.0, 0.0), Vec3::ZERO, 1.0);
+        scene.set_object(ob, start + Vec3::new(0.3, 0.0, 0.0), Vec3::ZERO, glam::Vec3::splat(1.0));
         let to = scene.object_bounds(ob);
         r.dragged(vec![first..n], from, to, glam::Affine3A::from_translation(-Vec3::new(0.3, 0.0, 0.0)));
         r.render(&scene, &cam, &lights, &settings, &mut f);
@@ -3129,7 +3130,7 @@ mod tests {
         scene.add_object("ball".into(), 0..n, Vec3::ZERO, Vec3::ZERO);
         let before = scene.clusters.clone();
         let (pivot, turn, k) = (Vec3::new(1.0, 2.0, -0.5), Vec3::new(0.3, 1.1, -0.4), 1.7);
-        scene.set_object(0, pivot, turn, k);
+        scene.set_object(0, pivot, turn, Vec3::splat(k));
         let q = crate::scene::euler_quat(turn);
         let ahead = glam::Affine3A::from_translation(pivot) * glam::Affine3A::from_scale_rotation_translation(Vec3::splat(k), q, Vec3::ZERO);
         let back = ahead.inverse();

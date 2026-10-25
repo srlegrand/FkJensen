@@ -640,10 +640,16 @@ selects the light and starts dragging it. A rig holds 64 lights at most.
 Selecting and moving work as in Maya. Clicking a model selects it (its
 box, turned and scaled with it, its manipulator at its pivot, the middle
 of its base): W shows
-arrows along X, Y and Z and a square that moves it facing the camera, E a
-ring about each axis (world axes), R a uniform scale (a model scales the
-same on every axis, and a turn never mirrors it, so its texture tiles stay
-valid). A ring follows the pointer in its own plane, or round the pivot
+arrows along X, Y and Z, each with a cone at its tip, and a square that
+moves it facing the camera; E a ring about each axis (world axes); R a
+line along each of the object's own axes ending in a block, which
+scales that axis alone, and a block at the centre that scales all three
+alike, as Maya's. Scale is along the object's own axes, before its turn
+(Maya's order); normals take the inverse transpose, so a stretched
+sphere shades as one. A scale is never negative, so nothing is mirrored
+and texture tiles stay valid. A group scaled differently along its axes
+gives what is under it the same ratios along their own axes (Maya would
+shear them). A ring follows the pointer in its own plane, or round the pivot
 on screen when it is seen nearly edge on. Q hides the manipulator. A light selected with the move
 manipulator gets the arrows too. Each object has a transform, from its
 geometry as stored to where it stands: moving it changes the transform
@@ -677,11 +683,17 @@ with egui, on the CPU like everything else: egui's triangles are filled by
 - **Outliner** on the left: the objects and their groups, the point and
   directional lights, the sun, the sky and exposure, the render settings. Click to select, double
   click to frame, drag an object onto another to put it under it, onto
-  "Objects" to take it out. A group moves, turns and scales everything
+  "Objects" to take it out. Ctrl click adds or takes out one object,
+  Shift click takes every object between the last picked and the one
+  clicked, as Maya's outliner. With several selected: dragging one of
+  them takes them all; P puts the others under the last picked; Ctrl+G
+  groups them under a new group at the middle of their pivots; Shift+P
+  takes them out of their groups; Delete deletes them all. The
+  manipulator moves the last picked only. A group moves, turns and scales everything
   under it about its pivot.
 - **Attribute editor** on the right, for what is selected: an object's
   name, translate, rotate about X, Y and Z (degrees, X first, then Y,
-  then Z, as Maya's xyz order), uniform scale, triangles,
+  then Z, as Maya's xyz order), scale along X, Y and Z, triangles,
   levels of detail and size; a light's position, lumens and colour; the
   sun's time and brightness; the sky's illuminance, both contrasts and the
   exposure; the render settings (micropolygon spacing, frame size,

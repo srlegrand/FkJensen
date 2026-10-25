@@ -339,11 +339,11 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
             o.u32(ob.name.len() as u32);
             o.v3(ob.pivot);
             o.v3(ob.rotation);
-            o.f32(ob.scale);
+            o.v3(ob.scale);
             o.0.extend_from_slice(ob.name.as_bytes());
             o.pad(4);
         }
-        section(out, TAG_OBJS, 2, &o.0)?;
+        section(out, TAG_OBJS, 3, &o.0)?;
     }
 
     // SAMP: u32 sample count, u32 0; per sample, 60 bytes: position (3
@@ -997,14 +997,15 @@ fn read_objects(b: &[u8], version: u32, scene: &mut Scene, stored_clusters: usiz
         let len = r.u32()? as usize;
         let pivot = r.v3()?;
         let rotation = if version >= 2 { r.v3()? } else { Vec3::new(0.0, r.f32()?, 0.0) };
-        let scale = r.f32()?;
+        let scale = if version >= 3 { r.v3()? } else { Vec3::splat(r.f32()?) };
+        let scale = Vec3::select(scale.cmpgt(Vec3::ZERO), scale, Vec3::ONE);
         let name = String::from_utf8_lossy(r.take(len)?).into_owned();
         r.at = r.at.div_ceil(4) * 4;
         if first + count > stored_clusters || parent > n {
             return Err("OBJS refers past the stored clusters or objects".into());
         }
         let clusters = if count == 0 { scene.clusters.len()..scene.clusters.len() } else { first..first + count };
-        objects.push(crate::scene::Object::new(name, clusters, pivot, rotation, if scale > 0.0 { scale } else { 1.0 }, parent.checked_sub(1)));
+        objects.push(crate::scene::Object::new(name, clusters, pivot, rotation, scale, parent.checked_sub(1)));
     }
     scene.objects = objects;
     // A parent chain that loops (a damaged file) is cut at the top.
@@ -1194,14 +1195,14 @@ mod tests {
         let mut s = sample();
         let n = s.clusters.len();
         let a = s.add_object("bishop".into(), 0..n, Vec3::new(0.5, 0.0, 0.0), Vec3::new(0.1, 0.3, -0.2));
-        s.objects[a].scale = 1.5;
+        s.objects[a].scale = Vec3::new(1.5, 2.0, 0.5);
         let g = s.add_group("pieces".into(), Vec3::ONE);
         s.set_parent(a, Some(g));
         let (back, report) = read(&write(&s, &[])).unwrap();
         assert!(report.skipped.is_empty());
         assert_eq!(back.objects.len(), 2);
         let (oa, og) = (&back.objects[a], &back.objects[g]);
-        assert_eq!((oa.name.as_str(), oa.clusters.clone(), oa.parent, oa.rotation, oa.scale), ("bishop", 0..n, Some(g), Vec3::new(0.1, 0.3, -0.2), 1.5));
+        assert_eq!((oa.name.as_str(), oa.clusters.clone(), oa.parent, oa.rotation, oa.scale), ("bishop", 0..n, Some(g), Vec3::new(0.1, 0.3, -0.2), Vec3::new(1.5, 2.0, 0.5)));
         assert_eq!((og.name.as_str(), og.clusters.is_empty(), og.parent, og.pivot), ("pieces", true, None, Vec3::ONE));
         assert!(oa.hi.x > oa.lo.x);
     }
@@ -1224,7 +1225,7 @@ mod tests {
         w.0.extend_from_slice(b"rook");
         read_objects(&w.0, 1, &mut s, n).unwrap();
         let o = &s.objects[0];
-        assert_eq!((o.name.as_str(), o.rotation, o.scale, o.pivot), ("rook", Vec3::new(0.0, 0.5, 0.0), 2.0, Vec3::ONE));
+        assert_eq!((o.name.as_str(), o.rotation, o.scale, o.pivot), ("rook", Vec3::new(0.0, 0.5, 0.0), Vec3::splat(2.0), Vec3::ONE));
     }
 
     #[test]

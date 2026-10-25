@@ -12,7 +12,7 @@ pub enum Clip {
     /// An object and what is under it, as they were: each a scene of one
     /// object at rest, with where it stood and the copy it is in (an index
     /// into the list, before it).
-    Objects(Vec<(Scene, (glam::Vec3, glam::Vec3, f32), Option<usize>)>),
+    Objects(Vec<(Scene, (glam::Vec3, glam::Vec3, glam::Vec3), Option<usize>)>),
     Light(PointLight),
     Directional(DirLight),
     Camera(crate::SceneCamera),
@@ -39,12 +39,15 @@ impl Editor {
     pub fn delete_selected(&mut self) {
         match self.edit_target() {
             Some(Target::Object(i)) => {
-                let name = self.app.scene.objects[i].name.clone();
+                let all = self.selected_objects();
+                let all = if all.contains(&i) { all } else { vec![i] };
+                let name = if all.len() > 1 { format!("{} objects", all.len()) } else { self.app.scene.objects[i].name.clone() };
                 self.app.manip = None;
                 self.app.drag = None;
                 self.pending_bounce = None;
                 self.app.drag_start = None;
-                let map = self.app.scene.remove_objects(&[i]);
+                self.app.extra.clear();
+                let map = self.app.scene.remove_objects(&all);
                 let n = map.iter().filter(|&&m| m == usize::MAX).count();
                 // Lights under what went go too, as in Maya; the rest point
                 // at where their objects went.
@@ -64,7 +67,8 @@ impl Editor {
                     }
                 }
                 self.select(Selection::Nothing);
-                self.say(format!("deleted {name}{}", if n > 1 { format!(" and {} under it", n - 1) } else { String::new() }), false);
+                let under = n.saturating_sub(all.len());
+                self.say(format!("deleted {name}{}", if under > 0 { format!(" and {under} under {}", if all.len() > 1 { "them" } else { "it" }) } else { String::new() }), false);
             }
             Some(Target::Light(i)) => {
                 self.app.selection = Selection::Light(i);

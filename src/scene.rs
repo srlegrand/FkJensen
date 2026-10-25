@@ -154,9 +154,13 @@ pub struct Cluster {
     /// transform (`Object::xf`). Moving an object changes this, not its
     /// vertices.
     pub xf: glam::Affine3A,
-    /// Its object's rotation, for normals, and whether it has one.
+    /// Its object's rotation (for its normal cone and samples), whether it
+    /// has one, and the matrix its normals take (the inverse transpose of
+    /// its object's transform since stored: a scale that differs by axis
+    /// bends normals, a rotation and a uniform scale only turn them).
     pub turn: glam::Quat,
     pub turned: bool,
+    pub nmat: glam::Mat3,
     /// Its triangles' materials are `Scene::materials[material_base +
     /// Scene::tri_mat[t]]`.
     pub material_base: u32,
@@ -185,6 +189,7 @@ impl Default for Cluster {
             xf: glam::Affine3A::IDENTITY,
             turn: glam::Quat::IDENTITY,
             turned: false,
+            nmat: glam::Mat3::IDENTITY,
             material_base: 0,
         }
     }
@@ -198,6 +203,7 @@ impl Cluster {
         self.xf = glam::Affine3A::from_scale_rotation_translation(step, glam::Quat::IDENTITY, lo);
         self.turn = glam::Quat::IDENTITY;
         self.turned = false;
+        self.nmat = glam::Mat3::IDENTITY;
     }
 
     /// Whether its vertices are where they are stored (no object transform).
@@ -383,10 +389,14 @@ pub struct Object {
     /// The point it turns and scales about: the middle of its base when
     /// placed.
     pub pivot: Vec3,
-    /// Rotation since placed, radians about X, Y and Z, applied in that
-    /// order (Maya's xyz), and uniform scale since placed.
+    /// Rotation, radians about X, Y and Z, applied in that order (Maya's
+    /// xyz), and scale along its own axes (before the rotation, as Maya
+    /// does).
     pub rotation: Vec3,
-    pub scale: f32,
+    pub scale: Vec3,
+    /// Pivot, rotation and scale its geometry is stored at (where `xf` is
+    /// the identity): an asset's own.
+    pub rest: (Vec3, Vec3, Vec3),
     /// Bounds of its finest level's vertices, in the world (round its
     /// oriented box).
     pub lo: Vec3,
@@ -413,8 +423,18 @@ pub struct Object {
 impl Object {
     /// A new object of clusters `clusters` whose geometry is stored where it
     /// stands.
-    pub fn new(name: String, clusters: std::ops::Range<usize>, pivot: Vec3, rotation: Vec3, scale: f32, parent: Option<usize>) -> Object {
-        Object { name, clusters, pivot, rotation, scale, lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent, asset: None, materials: 0..0, asset_materials: Vec::new(), environment: false }
+    pub fn new(name: String, clusters: std::ops::Range<usize>, pivot: Vec3, rotation: Vec3, scale: Vec3, parent: Option<usize>) -> Object {
+        Object { name, clusters, pivot, rotation, scale, rest: (pivot, rotation, scale), lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent, asset: None, materials: 0..0, asset_materials: Vec::new(), environment: false }
+    }
+
+    /// Its frame: scale along its axes, then rotation, then the pivot.
+    pub fn frame(&self) -> glam::Affine3A {
+        frame_of(self.pivot, self.rotation, self.scale)
+    }
+
+    /// Whether its scale is the same on every axis.
+    pub fn uniform(&self) -> bool {
+        uniform(self.scale)
     }
 
     /// The eight corners of its oriented box, in the world.
@@ -422,6 +442,34 @@ impl Object {
         let (a, b) = (self.box_lo, self.box_hi);
         std::array::from_fn(|i| self.xf.transform_point3(Vec3::new(if i & 1 == 0 { a.x } else { b.x }, if i & 2 == 0 { a.y } else { b.y }, if i & 4 == 0 { a.z } else { b.z })))
     }
+}
+
+/// Scale `s` along the axes, then rotation `r` (Euler angles, radians),
+/// then a move to `pivot`: an object's frame, as Maya's transform.
+pub fn frame_of(pivot: Vec3, r: Vec3, s: Vec3) -> glam::Affine3A {
+    glam::Affine3A::from_scale_rotation_translation(s, euler_quat(r), pivot)
+}
+
+/// Whether a scale is the same on every axis.
+pub fn uniform(s: Vec3) -> bool {
+    (s.x - s.y).abs() <= 1e-6 * s.x.abs().max(1e-12) && (s.x - s.z).abs() <= 1e-6 * s.x.abs().max(1e-12)
+}
+
+/// Of an affine map: the largest length it stretches by, its rotation
+/// (nearest, from its axes), and the matrix normals take (inverse
+/// transpose, unnormalised).
+pub fn linear_parts(a: &glam::Affine3A) -> (f32, glam::Quat, glam::Mat3) {
+    let m = glam::Mat3::from(a.matrix3);
+    let k = m.x_axis.length().max(m.y_axis.length()).max(m.z_axis.length());
+    let r = glam::Mat3::from_cols(m.x_axis.normalize_or(Vec3::X), m.y_axis.normalize_or(Vec3::Y), m.z_axis.normalize_or(Vec3::Z));
+    let q = glam::Quat::from_mat3(&r).normalize();
+    let n = if m.determinant().abs() > 1e-30 { m.inverse().transpose() } else { glam::Mat3::from_quat(q) };
+    (k, q, n)
+}
+
+/// How an affine map scales areas, about: its determinant to the 2/3.
+pub fn area_scale(a: &glam::Affine3A) -> f32 {
+    glam::Mat3::from(a.matrix3).determinant().abs().powf(2.0 / 3.0)
 }
 
 /// The rotation of Euler angles `r` (radians), X first, then Y, then Z.
@@ -480,7 +528,7 @@ impl Scene {
     #[inline]
     pub fn normal(&self, c: &Cluster, v: usize) -> Vec3 {
         let n = oct_decode(self.qnrm[v]);
-        if c.turned { c.turn * n } else { n }
+        if c.turned { (c.nmat * n).normalize_or(n) } else { n }
     }
 
     /// Linear RGB albedo.
@@ -577,10 +625,10 @@ impl Scene {
     pub fn map_vertices(&mut self, range: std::ops::Range<usize>, f: impl Fn(Vec3) -> Vec3 + Sync, q: Option<glam::Quat>) {
         use rayon::prelude::*;
         // Normals of turned clusters take their turn too.
-        let turns: Vec<(std::ops::Range<usize>, glam::Quat)> = self.clusters[range.clone()]
+        let turns: Vec<(std::ops::Range<usize>, glam::Mat3)> = self.clusters[range.clone()]
             .iter()
             .filter(|c| c.turned || q.is_some())
-            .map(|c| (c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize, q.unwrap_or(glam::Quat::IDENTITY) * c.turn))
+            .map(|c| (c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize, glam::Mat3::from_quat(q.unwrap_or(glam::Quat::IDENTITY)) * if c.turned { c.nmat } else { glam::Mat3::IDENTITY }))
             .collect();
         let (Some(first), Some(last)) = (self.clusters.get(range.start).copied(), range.end.checked_sub(1).and_then(|e| self.clusters.get(e)).copied()) else { return };
         let fv = first.first_vertex as usize;
@@ -608,7 +656,8 @@ impl Scene {
         let _ = (fv, end);
         for (r, t) in turns {
             for n in &mut self.qnrm[r] {
-                *n = oct_encode(t * oct_decode(*n));
+                let m = oct_decode(*n);
+                *n = oct_encode((t * m).normalize_or(m));
             }
         }
     }
@@ -745,10 +794,8 @@ impl Scene {
     /// `back`: their vertices, triangles, levels of detail, texture tiles
     /// (still read from where they are) and samples. No objects or lights.
     pub fn extract(&self, ranges: &[std::ops::Range<usize>], back: glam::Affine3A) -> Scene {
-        let (k3, turn, _) = back.to_scale_rotation_translation();
-        let k = k3.x;
-        let turn = turn.normalize();
-        let still = turn.abs_diff_eq(glam::Quat::IDENTITY, 1e-7);
+        let (k, turn, nback) = linear_parts(&back);
+        let still = turn.abs_diff_eq(glam::Quat::IDENTITY, 1e-7) && nback.abs_diff_eq(glam::Mat3::from_quat(turn) * k, 1e-6);
         let mut out = Scene::default();
         out.textures.sources = self.textures.sources.clone();
         out.textures.alpha_sources = self.textures.alpha_sources.clone();
@@ -784,6 +831,7 @@ impl Scene {
                 h.xf = back * c.xf;
                 if !still || c.turned {
                     h.turn = (turn * c.turn).normalize();
+                    h.nmat = nback * if c.turned { c.nmat } else { glam::Mat3::IDENTITY };
                     h.turned = true;
                 }
                 h.centre = back.transform_point3(c.centre);
@@ -795,7 +843,7 @@ impl Scene {
                 out.textures.entries.push(self.textures.entry(ci));
             }
             for s in &self.samples[self.samples_in(r.clone())] {
-                out.samples.push(crate::samples::Sample { position: back.transform_point3(s.position), normal: turn * s.normal, area: s.area * k * k, cluster: index[&s.cluster], sky: turned_sky(&s.sky, turn, k) });
+                out.samples.push(crate::samples::Sample { position: back.transform_point3(s.position), normal: (nback * s.normal).normalize_or(s.normal), area: s.area * area_scale(&back), cluster: index[&s.cluster], sky: turned_sky(&s.sky, turn, k) });
             }
         }
         if out.textures.entries.iter().all(|e| e.level == 0) {
@@ -823,7 +871,6 @@ impl Scene {
     pub fn extract_object(&self, i: usize) -> Scene {
         let o = &self.objects[i];
         let back = o.xf.inverse();
-        let (k3, turn, _) = o.xf.to_scale_rotation_translation();
         let mut out = self.extract(&[o.clusters.clone()], back);
         // Its own materials only, as they are now.
         let m = o.materials.clone();
@@ -832,8 +879,8 @@ impl Scene {
             c.material_base = c.material_base.saturating_sub(m.start as u32);
         }
         let n = out.clusters.len();
-        let rest_rotation = quat_euler(turn.normalize().inverse() * euler_quat(o.rotation));
-        let mut ob = Object::new(o.name.clone(), 0..n, back.transform_point3(o.pivot), rest_rotation, o.scale / k3.x.max(1e-12), None);
+        let (p, r, s) = o.rest;
+        let mut ob = Object::new(o.name.clone(), 0..n, p, r, s, None);
         ob.asset = None;
         ob.materials = 0..out.materials.len();
         ob.asset_materials = out.materials.clone();
@@ -969,7 +1016,7 @@ impl Scene {
     /// space to the world (what lights parented to it are placed in).
     pub fn object_frame(&self, i: usize) -> glam::Affine3A {
         let o = &self.objects[i];
-        glam::Affine3A::from_scale_rotation_translation(Vec3::splat(o.scale), euler_quat(o.rotation), o.pivot)
+        o.frame()
     }
 
     /// The first object that is a model: clusters of its own, not the
@@ -1067,7 +1114,7 @@ impl Scene {
     /// Make clusters `clusters` an object turning about `pivot`, already
     /// turned by `rotation` (Euler angles, radians).
     pub fn add_object(&mut self, name: String, clusters: std::ops::Range<usize>, pivot: Vec3, rotation: Vec3) -> usize {
-        self.objects.push(Object::new(name, clusters, pivot, rotation, 1.0, None));
+        self.objects.push(Object::new(name, clusters, pivot, rotation, Vec3::ONE, None));
         let i = self.objects.len() - 1;
         self.own_materials(i);
         self.refresh_bounds(i);
@@ -1115,7 +1162,7 @@ impl Scene {
     /// Make an empty group at `pivot`.
     pub fn add_group(&mut self, name: String, pivot: Vec3) -> usize {
         let n = self.clusters.len();
-        self.objects.push(Object::new(name, n..n, pivot, Vec3::ZERO, 1.0, None));
+        self.objects.push(Object::new(name, n..n, pivot, Vec3::ZERO, Vec3::ONE, None));
         self.objects.len() - 1
     }
 
@@ -1243,28 +1290,30 @@ impl Scene {
     /// with it. A rotation and a uniform scale keep each triangle's corners
     /// in order (no mirroring), so its texture tile stays valid. Everything
     /// under it moves with it, about its pivot.
-    pub fn set_object(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: f32) {
+    pub fn set_object(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: Vec3) {
         let o = self.objects[i].clone();
-        let scale = scale.max(1e-4);
-        let k = scale / o.scale;
-        if pivot == o.pivot && rotation == o.rotation && k == 1.0 {
+        let scale = scale.max(Vec3::splat(1e-4));
+        if pivot == o.pivot && rotation == o.rotation && scale == o.scale {
             return;
         }
+        // What the move does to the world: the new frame after the old one
+        // undone.
+        let d = frame_of(pivot, rotation, scale) * o.frame().inverse();
         let q = euler_quat(rotation) * euler_quat(o.rotation).inverse();
-        let map = |p: Vec3| q * ((p - o.pivot) * k) + pivot;
+        let ratio = scale / o.scale;
         for j in self.descendants(i) {
-            let d = self.objects[j].clone();
-            self.place_one(j, map(d.pivot), quat_euler(q * euler_quat(d.rotation)), d.scale * k);
+            let c = self.objects[j].clone();
+            // Under a scale that differs by axis a child keeps its own
+            // axes and takes the ratio along them (Maya would shear it).
+            self.place_one(j, d.transform_point3(c.pivot), quat_euler(q * euler_quat(c.rotation)), c.scale * ratio);
         }
         self.place_one(i, pivot, rotation, scale);
     }
 
     /// `set_object` for object `i` alone.
-    fn place_one(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: f32) {
+    fn place_one(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: Vec3) {
         let o = self.objects[i].clone();
-        let k = scale / o.scale;
         let q = euler_quat(rotation) * euler_quat(o.rotation).inverse();
-        let map = |p: Vec3| q * ((p - o.pivot) * k) + pivot;
         if o.clusters.is_empty() {
             let ob = &mut self.objects[i];
             ob.pivot = pivot;
@@ -1275,27 +1324,38 @@ impl Scene {
         }
         // The vertices stay as stored; the object's transform and its
         // clusters' bounds move.
-        let d = glam::Affine3A::from_translation(pivot) * glam::Affine3A::from_scale_rotation_translation(Vec3::splat(k), q, Vec3::ZERO) * glam::Affine3A::from_translation(-o.pivot);
+        let d = frame_of(pivot, rotation, scale) * o.frame().inverse();
+        let (k, _, nd) = linear_parts(&d);
+        let even = uniform(scale) && uniform(o.scale);
+        let map = |p: Vec3| d.transform_point3(p);
         {
             use rayon::prelude::*;
             self.clusters[o.clusters.clone()].par_iter_mut().for_each(|c| {
                 c.xf = d * c.xf;
+                c.nmat = nd * if c.turned { c.nmat } else { glam::Mat3::IDENTITY };
                 c.turn = (q * c.turn).normalize();
                 c.turned = true;
                 c.centre = map(c.centre);
                 // A hair wider: the bounds move by arithmetic, not by
                 // measuring the vertices again.
                 c.radius = c.radius * k * (1.0 + 1e-5) + 1e-6;
-                c.cone_axis = q * c.cone_axis;
+                if even {
+                    c.cone_axis = q * c.cone_axis;
+                } else {
+                    // Normals bent by a scale that differs by axis: no cone
+                    // to cull with.
+                    c.cone_cos = -1.0;
+                }
                 c.move_lod(map, k);
             });
         }
         self.objects[i].xf = d * o.xf;
         let r = self.samples_in(o.clusters.clone());
+        let a = area_scale(&d);
         for s in &mut self.samples[r] {
             s.position = map(s.position);
-            s.normal = q * s.normal;
-            s.area *= k * k;
+            s.normal = (nd * s.normal).normalize_or(s.normal);
+            s.area *= a;
             s.sky = turned_sky(&s.sky, q, k);
         }
         let ob = &mut self.objects[i];
@@ -1621,7 +1681,7 @@ pub mod tests {
         assert_eq!(h, crate::samples::MIN_SPACING);
         let on_sphere = |s: &Scene, c: Vec3, r: f32| s.samples.iter().all(|x| (x.position.distance(c) - r).abs() < 0.01 && x.normal.dot((x.position - c).normalize()) > 0.95);
         assert!(on_sphere(&s, Vec3::ZERO, 1.0));
-        s.set_object(o, Vec3::new(3.0, 1.0, 0.0), Vec3::new(0.4, 0.0, 0.2), 2.0);
+        s.set_object(o, Vec3::new(3.0, 1.0, 0.0), Vec3::new(0.4, 0.0, 0.2), glam::Vec3::splat(2.0));
         assert!(on_sphere(&s, Vec3::new(3.0, 1.0, 0.0), 2.0));
         assert!((s.samples.iter().map(|x| x.area).sum::<f32>() - 16.0 * std::f32::consts::PI).abs() < 0.5);
         let mut other = Scene::new();
@@ -1648,7 +1708,7 @@ pub mod tests {
         let (stored, before, normals) = (s.qpos.clone(), s.positions(), s.normals());
         let q = euler_quat(Vec3::new(0.3, 0.9, -0.4));
         let to = Vec3::new(1.0, 2.0, 3.0);
-        s.set_object(o, to, Vec3::new(0.3, 0.9, -0.4), 1.5);
+        s.set_object(o, to, Vec3::new(0.3, 0.9, -0.4), glam::Vec3::splat(1.5));
         assert_eq!(s.qpos, stored, "vertices are not rewritten");
         for ((a, b), (na, nb)) in before.iter().zip(s.positions()).zip(normals.iter().zip(s.normals())) {
             assert!((q * (*a * 1.5) + to).distance(b) < 1e-4);
@@ -1685,8 +1745,8 @@ pub mod tests {
         let o = s.add_object("ball".into(), 0..s.clusters.len(), Vec3::ZERO, Vec3::ZERO);
         let before = s.positions();
         for _ in 0..20 {
-            s.set_object(o, Vec3::new(3.0, 1.0, -2.0), Vec3::new(0.3, 1.1, -0.7), 1.7);
-            s.set_object(o, Vec3::ZERO, Vec3::ZERO, 1.0);
+            s.set_object(o, Vec3::new(3.0, 1.0, -2.0), Vec3::new(0.3, 1.1, -0.7), glam::Vec3::splat(1.7));
+            s.set_object(o, Vec3::ZERO, Vec3::ZERO, glam::Vec3::splat(1.0));
         }
         let step = s.clusters.iter().map(|c| c.qstep.length()).fold(0.0, f32::max);
         for (a, b) in before.iter().zip(s.positions()) {
@@ -1732,6 +1792,43 @@ pub mod tests {
     /// Moving, turning and scaling an object moves its vertices, normals
     /// and clusters together, keeps its triangles' shapes, and leaves the
     /// rest of the scene where it was.
+    /// A scale that differs by axis stretches the object along its own
+    /// axes (after its turn), its normals bent as a stretched surface's
+    /// are, and its clusters' spheres still hold their vertices.
+    #[test]
+    fn objects_scale_along_their_own_axes() {
+        let (p, idx) = uv_sphere(32);
+        let mut s = Scene::new();
+        let lifted: Vec<Vec3> = p.iter().map(|v| *v + Vec3::Y).collect();
+        s.push_mesh(&lifted, &[], &[], &idx);
+        let n = s.clusters.len();
+        s.add_object("ball".into(), 0..n, Vec3::ZERO, Vec3::ZERO);
+        let before = s.positions().clone();
+        let normals = s.normals();
+        let (yaw, k, to) = (std::f32::consts::FRAC_PI_2, Vec3::new(3.0, 1.0, 0.5), Vec3::new(2.0, 0.0, 1.0));
+        s.set_object(0, to, Vec3::new(0.0, yaw, 0.0), k);
+        let f = frame_of(to, Vec3::new(0.0, yaw, 0.0), k);
+        let nm = glam::Mat3::from(f.matrix3).inverse().transpose();
+        let after = s.positions();
+        for c in &s.clusters {
+            for v in c.first_vertex as usize..(c.first_vertex + c.vertex_count) as usize {
+                assert!(after[v].distance(f.transform_point3(before[v])) < 1e-3);
+                // Normals take the inverse transpose.
+                let want = (nm * normals[v]).normalize();
+                assert!(s.normal(c, v).distance(want) < 1e-3, "{} {want}", s.normal(c, v));
+                assert!(after[v].distance(c.centre) <= c.radius + 1e-3);
+            }
+        }
+        // Turned a quarter about Y, its X axis runs along -Z: 6 m long there.
+        let (lo, hi) = s.vertex_bounds(0);
+        assert!((hi.z - lo.z - 6.0).abs() < 0.05 && (hi.x - lo.x - 1.0).abs() < 0.05, "{lo} {hi}");
+        // And back: where it began.
+        s.set_object(0, Vec3::ZERO, Vec3::ZERO, Vec3::ONE);
+        for (a, b) in s.positions().iter().zip(&before) {
+            assert!(a.distance(*b) < 1e-3);
+        }
+    }
+
     #[test]
     fn objects_move_turn_and_scale() {
         let (p, idx) = uv_sphere(32);
@@ -1744,7 +1841,7 @@ pub mod tests {
         s.add_object("ball".into(), first..s.clusters.len(), Vec3::ZERO, Vec3::ZERO);
         let before = s.positions().clone();
         let (yaw, k, to) = (0.7f32, 2.0f32, Vec3::new(3.0, 0.0, -2.0));
-        s.set_object(0, to, Vec3::new(0.0, yaw, 0.0), k);
+        s.set_object(0, to, Vec3::new(0.0, yaw, 0.0), Vec3::splat(k));
         let q = glam::Quat::from_rotation_y(yaw);
         let vbase = s.clusters[first].first_vertex as usize;
         for v in vbase..s.positions().len() {
@@ -1758,7 +1855,7 @@ pub mod tests {
             }
         }
         // And back, from the absolute placement.
-        s.set_object(0, Vec3::ZERO, Vec3::ZERO, 1.0);
+        s.set_object(0, Vec3::ZERO, Vec3::ZERO, glam::Vec3::splat(1.0));
         for v in vbase..s.positions().len() {
             assert!(s.positions()[v].distance(before[v]) < 1e-4);
         }
@@ -1787,17 +1884,17 @@ pub mod tests {
         let (lo, hi) = s.object_bounds(top);
         assert!((lo.x + 2.5).abs() < 0.01 && (hi.x - 2.5).abs() < 0.01, "{lo} {hi}");
         // A half turn and twice the size about the origin: a goes to x = -4.
-        s.set_object(top, Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, std::f32::consts::PI, 0.0), 2.0);
+        s.set_object(top, Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, std::f32::consts::PI, 0.0), glam::Vec3::splat(2.0));
         let oa = &s.objects[a];
         assert!(oa.pivot.distance(Vec3::new(-4.0, 0.0, 1.0)) < 1e-4, "{}", oa.pivot);
-        assert!((oa.scale - 2.0).abs() < 1e-5 && euler_quat(oa.rotation).angle_between(glam::Quat::from_rotation_y(std::f32::consts::PI)) < 1e-4);
+        assert!((oa.scale - Vec3::splat(2.0)).abs().max_element() < 1e-5 && euler_quat(oa.rotation).angle_between(glam::Quat::from_rotation_y(std::f32::consts::PI)) < 1e-4);
         let (lo, hi) = s.object_bounds(a);
         assert!(((lo + hi) * 0.5).distance(Vec3::new(-4.0, 1.0, 1.0)) < 0.02, "{lo} {hi}");
         assert_eq!(s.moving_clusters(top).len(), 2);
         // Out of the group: moving the group leaves it.
         assert!(s.set_parent(a, None));
         let before = s.objects[a].pivot;
-        s.set_object(top, Vec3::ZERO, Vec3::ZERO, 1.0);
+        s.set_object(top, Vec3::ZERO, Vec3::ZERO, glam::Vec3::splat(1.0));
         assert_eq!(s.objects[a].pivot, before);
     }
 
@@ -1825,7 +1922,7 @@ pub mod tests {
         let o = s.add_object("long".into(), 0..s.clusters.len(), Vec3::ZERO, Vec3::ZERO);
         let before = s.positions().clone();
         let r = Vec3::new(0.0, 0.0, std::f32::consts::FRAC_PI_2);
-        s.set_object(o, Vec3::ZERO, r, 1.0);
+        s.set_object(o, Vec3::ZERO, r, glam::Vec3::splat(1.0));
         let q = euler_quat(r);
         for (a, b) in before.iter().zip(&s.positions()) {
             assert!((q * *a).distance(*b) < 1e-4);
@@ -1838,7 +1935,7 @@ pub mod tests {
                 assert!(s.positions()[v as usize].distance(c.centre) <= c.radius + 1e-4);
             }
         }
-        s.set_object(o, Vec3::ZERO, Vec3::ZERO, 1.0);
+        s.set_object(o, Vec3::ZERO, Vec3::ZERO, glam::Vec3::splat(1.0));
         for (a, b) in before.iter().zip(&s.positions()) {
             assert!(a.distance(*b) < 1e-4);
         }
