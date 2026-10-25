@@ -139,6 +139,8 @@ pub struct Editor {
     /// Where each navigation control was last drawn (points), by its label;
     /// the second "Left" is the track row's.
     nav_rects: Vec<(&'static str, egui::Rect)>,
+    /// Where some attribute fields were drawn last frame, for the tests.
+    field_rects: Vec<(&'static str, egui::Rect)>,
     /// Where the viewport's Show menu button was last drawn (points).
     show_rect: egui::Rect,
     /// Where its "Light count" entry was last drawn, when open.
@@ -184,6 +186,7 @@ impl Editor {
             began: None,
             navigate: true,
             nav_rects: Vec::new(),
+            field_rects: Vec::new(),
             show_rect: egui::Rect::NOTHING,
             show_item: egui::Rect::NOTHING,
             clip: None,
@@ -216,6 +219,7 @@ impl Editor {
             self.times.total = (t0 - b).as_secs_f32() * 1000.0;
         }
         self.began = Some(t0);
+        self.field_rects.clear();
         let ctx = self.ctx.clone();
         let out = ctx.run_ui(raw, |ui| self.ui(ui));
         self.times.layout = t0.elapsed().as_secs_f32() * 1000.0;
@@ -1027,6 +1031,43 @@ mod tests {
 
     fn raw(w: usize, h: usize) -> egui::RawInput {
         egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32))), ..Default::default() }
+    }
+
+    /// Typing into the scale field: nothing changes until Enter, a bad
+    /// entry ("0.01. ") leaves the value as it was, a good one is taken.
+    #[test]
+    fn typed_values_apply_on_enter_and_bad_ones_are_dropped() {
+        let mut ed = editor();
+        ed.make(create::Make::Primitive("cube"));
+        ed.duplicate_instanced();
+        let Selection::Object(i) = ed.app.selection else { panic!() };
+        // A light parented to it, as the car's are.
+        ed.app.parent_light(0, i, true);
+        ed.select(Selection::Object(i));
+        let (w, h) = (1200, 800);
+        for _ in 0..3 {
+            ed.frame(raw(w, h), w, h);
+        }
+        let at = ed.field_rects.iter().find(|(n, _)| *n == "scale").map(|(_, r)| r.center()).expect("scale field drawn");
+        let click = |down: bool| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: down, modifiers: Default::default() };
+        let key = |k: egui::Key| egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        let type_in = |ed: &mut Editor, text: &str| {
+            ed.frame(egui::RawInput { events: vec![egui::Event::PointerMoved(at), click(true)], ..raw(w, h) }, w, h);
+            ed.frame(egui::RawInput { events: vec![click(false)], ..raw(w, h) }, w, h);
+            ed.frame(egui::RawInput { events: vec![key(egui::Key::A)].into_iter().map(|e| match e { egui::Event::Key { key, .. } => egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND }, e => e }).collect(), ..raw(w, h) }, w, h);
+            for ch in text.chars() {
+                ed.frame(egui::RawInput { events: vec![egui::Event::Text(ch.to_string())], ..raw(w, h) }, w, h);
+                assert_eq!(ed.app.scene.objects[i].scale, 1.0, "nothing changes while typing ({text:?})");
+            }
+            ed.frame(egui::RawInput { events: vec![key(egui::Key::Enter)], ..raw(w, h) }, w, h);
+            for _ in 0..2 {
+                ed.frame(raw(w, h), w, h);
+            }
+        };
+        type_in(&mut ed, "0.01. ");
+        assert_eq!(ed.app.scene.objects[i].scale, 1.0, "a bad entry leaves it");
+        type_in(&mut ed, "2.5");
+        assert!((ed.app.scene.objects[i].scale - 2.5).abs() < 1e-6, "{}", ed.app.scene.objects[i].scale);
     }
 
     /// The layout puts the viewport between the panels, the frame is sized

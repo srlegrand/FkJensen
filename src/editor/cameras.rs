@@ -116,18 +116,18 @@ impl Editor {
         egui::Grid::new("camera").num_columns(4).show(ui, |ui| {
             ui.label("Position");
             for v in [&mut eye.x, &mut eye.y, &mut eye.z] {
-                changed |= ui.add(egui::DragValue::new(v).speed(speed).max_decimals(3)).changed();
+                changed |= ui.add(super::style::num(v).speed(speed).max_decimals(3)).changed();
             }
             ui.end_row();
             ui.label("Aim").on_hover_text("Degrees: about the vertical, and up from the horizon");
-            changed |= ui.add(egui::DragValue::new(&mut yaw).speed(0.5).max_decimals(2).suffix("°")).changed();
-            changed |= ui.add(egui::DragValue::new(&mut pitch).speed(0.5).range(-89.0..=89.0).max_decimals(2).suffix("°")).changed();
+            changed |= ui.add(super::style::num(&mut yaw).speed(0.5).max_decimals(2).suffix("°")).changed();
+            changed |= ui.add(super::style::num(&mut pitch).speed(0.5).range(-89.0..=89.0).max_decimals(2).suffix("°")).changed();
             ui.end_row();
             ui.label("Angle of view").on_hover_text("Vertical, degrees");
-            changed |= ui.add(egui::DragValue::new(&mut fov).speed(0.2).range(1.0..=170.0).max_decimals(1).suffix("°")).changed();
+            changed |= ui.add(super::style::num(&mut fov).speed(0.2).range(1.0..=170.0).max_decimals(1).suffix("°")).changed();
             ui.end_row();
             ui.label("Centre of interest").on_hover_text("How far ahead it turns about when tumbled");
-            changed |= ui.add(egui::DragValue::new(&mut dist).speed(speed).range(0.01..=100000.0).max_decimals(3)).changed();
+            changed |= ui.add(super::style::num(&mut dist).speed(speed).range(0.01..=100000.0).max_decimals(3)).changed();
             ui.end_row();
         });
         if changed {

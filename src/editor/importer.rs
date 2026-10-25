@@ -380,12 +380,12 @@ impl Importer {
             ui.end_row();
             if self.size != Size::AsIs {
                 ui.label(if self.size == Size::Length { "Length" } else { "Height" });
-                ui.add(egui::DragValue::new(&mut self.metres).speed(0.01).range(0.001..=10_000.0).suffix(" m"));
+                ui.add(super::style::num(&mut self.metres).speed(0.01).range(0.001..=10_000.0).suffix(" m"));
                 ui.end_row();
             }
             ui.label("Turn X");
             ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut self.rotate_x).speed(1.0).suffix("°"));
+                ui.add(super::style::num(&mut self.rotate_x).speed(1.0).suffix("°"));
                 if ui.small_button("-90").clicked() {
                     self.rotate_x -= 90.0;
                 }
@@ -396,7 +396,7 @@ impl Importer {
             ui.end_row();
             ui.label("Turn Y");
             ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut self.rotate_y).speed(1.0).suffix("°"));
+                ui.add(super::style::num(&mut self.rotate_y).speed(1.0).suffix("°"));
                 if ui.small_button("-90").clicked() {
                     self.rotate_y -= 90.0;
                 }
@@ -406,7 +406,7 @@ impl Importer {
             });
             ui.end_row();
             ui.label("Texture detail");
-            ui.add(egui::DragValue::new(&mut self.texel_mm).speed(0.05).range(0.05..=100.0).suffix(" mm"));
+            ui.add(super::style::num(&mut self.texel_mm).speed(0.05).range(0.05..=100.0).suffix(" mm"));
             ui.end_row();
         });
         ui.checkbox(&mut self.lod, "Levels of detail");

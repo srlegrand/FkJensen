@@ -774,6 +774,10 @@ and which one the view looks through. The menu bar's Display holds the
 navigation buttons, lights, wireframe and back-face toggles; framing is
 in the viewport's View menu.
 
+Number fields and sliders in the panels take a typed value on Enter (or
+when the field loses focus), not while typing; anything that is not a
+number leaves the value as it was, and Escape drops what was typed.
+
 Edit, as Maya's: Copy (Ctrl+C), Paste (Ctrl+V, where it was copied),
 Duplicate (Ctrl+D), Duplicate Instanced (Ctrl+Shift+D), Delete (Del), on
 the selected object (with everything under it), point light or

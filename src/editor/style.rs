@@ -89,3 +89,21 @@ pub fn apply(ctx: &egui::Context) {
         s.visuals.widgets.active.corner_radius = egui::CornerRadius::same(2);
     });
 }
+
+/// A number typed into a field: whitespace ignored, anything else that is
+/// not a finite number refused (the field goes back to its value).
+fn strict(text: &str) -> Option<f64> {
+    let t: String = text.chars().filter(|c| !c.is_whitespace()).map(|c| if c == '−' { '-' } else { c }).collect();
+    t.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+/// A number field: dragged, or typed and taken on Enter (or when it loses
+/// focus); a bad entry leaves the value as it was, Escape drops the typing.
+pub fn num<N: egui::emath::Numeric>(v: &mut N) -> egui::DragValue<'_> {
+    egui::DragValue::new(v).update_while_editing(false).custom_parser(strict)
+}
+
+/// A slider whose number, typed, behaves as `num`'s.
+pub fn slider<N: egui::emath::Numeric>(v: &mut N, range: std::ops::RangeInclusive<N>) -> egui::Slider<'_> {
+    egui::Slider::new(v, range).update_while_editing(false).custom_parser(strict)
+}

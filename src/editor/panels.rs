@@ -251,16 +251,18 @@ impl Editor {
             egui::Grid::new("transform").num_columns(4).show(ui, |ui| {
                 ui.label("Translate");
                 for v in [&mut p.x, &mut p.y, &mut p.z] {
-                    changed |= ui.add(egui::DragValue::new(v).speed(speed).max_decimals(3)).changed();
+                    changed |= ui.add(super::style::num(v).speed(speed).max_decimals(3)).changed();
                 }
                 ui.end_row();
                 ui.label("Rotate");
                 for v in [&mut r.x, &mut r.y, &mut r.z] {
-                    changed |= ui.add(egui::DragValue::new(v).speed(0.5).max_decimals(2).suffix("°")).changed();
+                    changed |= ui.add(super::style::num(v).speed(0.5).max_decimals(2).suffix("°")).changed();
                 }
                 ui.end_row();
                 ui.label("Scale");
-                changed |= ui.add(egui::DragValue::new(&mut k).speed(0.005).range(0.001..=1000.0).max_decimals(3)).changed();
+                let r = ui.add(super::style::num(&mut k).speed(0.005).range(0.001..=1000.0).max_decimals(3));
+                self.field_rects.push(("scale", r.rect));
+                changed |= r.changed();
                 ui.end_row();
             });
             ui.weak("Rotates X, then Y, then Z. Scales the same on every axis, so the texture tiles stay valid.");
@@ -322,11 +324,11 @@ impl Editor {
         egui::Grid::new("light").num_columns(4).show(ui, |ui| {
             ui.label("Position");
             for v in [&mut l.position.x, &mut l.position.y, &mut l.position.z] {
-                ui.add(egui::DragValue::new(v).speed(speed).max_decimals(3));
+                ui.add(super::style::num(v).speed(speed).max_decimals(3));
             }
             ui.end_row();
             ui.label("Lumens");
-            ui.add(egui::Slider::new(&mut l.lumens, scene::MIN_LUMENS..=scene::MAX_LUMENS).logarithmic(true).max_decimals(0));
+            ui.add(super::style::slider(&mut l.lumens, scene::MIN_LUMENS..=scene::MAX_LUMENS).logarithmic(true).max_decimals(0));
             ui.end_row();
             ui.label("Colour");
             let mut c = l.color.to_array();
@@ -360,13 +362,13 @@ impl Editor {
             ui.checkbox(&mut d.on, "");
             ui.end_row();
             ui.label("Illuminance");
-            ui.add(egui::Slider::new(&mut d.lux, 0.1..=raster::DIR_MAX_LUX).logarithmic(true).suffix(" lux").max_decimals(1));
+            ui.add(super::style::slider(&mut d.lux, 0.1..=raster::DIR_MAX_LUX).logarithmic(true).suffix(" lux").max_decimals(1));
             ui.end_row();
             ui.label("Azimuth");
-            let a = ui.add(egui::Slider::new(&mut az, 0.0..=360.0).suffix("°").max_decimals(1));
+            let a = ui.add(super::style::slider(&mut az, 0.0..=360.0).suffix("°").max_decimals(1));
             ui.end_row();
             ui.label("Elevation");
-            let e = ui.add(egui::Slider::new(&mut el, -10.0..=90.0).suffix("°").max_decimals(1));
+            let e = ui.add(super::style::slider(&mut el, -10.0..=90.0).suffix("°").max_decimals(1));
             ui.end_row();
             if a.changed() || e.changed() {
                 d.dir = raster::DirLight::towards(az, el);
@@ -397,13 +399,13 @@ impl Editor {
         let mut h = self.app.hours;
         egui::Grid::new("sun").num_columns(2).show(ui, |ui| {
             ui.label("Time of day");
-            if ui.add(egui::Slider::new(&mut h, 0.0..=24.0).custom_formatter(|v, _| hhmm(v as f32)).custom_parser(|s| crate::parse_hours(s).map(|h| h as f64))).changed() {
+            if ui.add(super::style::slider(&mut h, 0.0..=24.0).custom_formatter(|v, _| hhmm(v as f32)).custom_parser(|s| crate::parse_hours(s).map(|h| h as f64))).changed() {
                 self.app.hours = h.rem_euclid(24.0);
                 self.app.apply_daylight();
             }
             ui.end_row();
             ui.label("Brightness");
-            ui.add(egui::Slider::new(&mut self.app.settings.sun.brightness, 0.0..=raster::SUN_MAX).max_decimals(0));
+            ui.add(super::style::slider(&mut self.app.settings.sun.brightness, 0.0..=raster::SUN_MAX).max_decimals(0));
             ui.end_row();
             let e = self.app.settings.sun.dir.y.clamp(-1.0, 1.0).asin().to_degrees();
             ui.label("Elevation");
@@ -422,16 +424,16 @@ impl Editor {
             ui.checkbox(&mut s.sky.on, "on");
             ui.end_row();
             ui.label("Illuminance");
-            ui.add(egui::Slider::new(&mut s.sky.lux, 0.01..=120_000.0).logarithmic(true).suffix(" lux").max_decimals(2));
+            ui.add(super::style::slider(&mut s.sky.lux, 0.01..=120_000.0).logarithmic(true).suffix(" lux").max_decimals(2));
             ui.end_row();
             ui.label("Lighting contrast");
-            ui.add(egui::Slider::new(&mut s.sky.contrast, 0.0..=1.0)).on_hover_text("0 flat overcast, 1 from overhead only");
+            ui.add(super::style::slider(&mut s.sky.contrast, 0.0..=1.0)).on_hover_text("0 flat overcast, 1 from overhead only");
             ui.end_row();
             ui.label("Sky contrast");
-            ui.add(egui::Slider::new(&mut s.backdrop.contrast, 0.0..=1.0)).on_hover_text("the visible sky's gradient and sun glow");
+            ui.add(super::style::slider(&mut s.backdrop.contrast, 0.0..=1.0)).on_hover_text("the visible sky's gradient and sun glow");
             ui.end_row();
             ui.label("Exposure");
-            ui.add(egui::Slider::new(&mut s.exposure, 1e-6..=1.0).logarithmic(true).max_decimals(6));
+            ui.add(super::style::slider(&mut s.exposure, 1e-6..=1.0).logarithmic(true).max_decimals(6));
             ui.end_row();
         });
         if ui.button("Exposure from the sky").clicked() {
@@ -445,7 +447,7 @@ impl Editor {
         let mut refit = false;
         egui::Grid::new("render").num_columns(2).show(ui, |ui| {
             ui.label("Micropolygons");
-            if ui.add(egui::Slider::new(&mut self.app.settings.shading_rate_px, 0.5..=16.0).logarithmic(true).suffix(" px apart").max_decimals(2)).changed() {
+            if ui.add(super::style::slider(&mut self.app.settings.shading_rate_px, 0.5..=16.0).logarithmic(true).suffix(" px apart").max_decimals(2)).changed() {
                 self.app.point_budget = None;
             }
             ui.end_row();
@@ -470,9 +472,9 @@ impl Editor {
             if let FrameSize::Custom(mut w, mut h) = size {
                 ui.label("");
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut w).range(16..=8192).speed(4.0));
+                    ui.add(super::style::num(&mut w).range(16..=8192).speed(4.0));
                     ui.label("x");
-                    ui.add(egui::DragValue::new(&mut h).range(16..=8192).speed(4.0));
+                    ui.add(super::style::num(&mut h).range(16..=8192).speed(4.0));
                 });
                 ui.end_row();
                 size = FrameSize::Custom(w, h);
@@ -483,7 +485,7 @@ impl Editor {
             if size == FrameSize::Viewport {
                 ui.label("Resolution");
                 let mut pct = self.app.render_scale * 100.0;
-                if ui.add(egui::Slider::new(&mut pct, 6.25..=100.0).suffix(" %").max_decimals(0)).changed() {
+                if ui.add(super::style::slider(&mut pct, 6.25..=100.0).suffix(" %").max_decimals(0)).changed() {
                     self.app.render_scale = pct / 100.0;
                     self.app.point_budget = None;
                     refit = true;
@@ -506,11 +508,11 @@ impl Editor {
             ui.checkbox(&mut self.app.settings.bake_over_frames, "").on_hover_text("When a dragged object is let go, it is lit where it stands a part a frame, the drag's last picture shown meanwhile. Off: in one frame.");
             ui.end_row();
             ui.label("Moving: micropolygons");
-            ui.add(egui::Slider::new(&mut self.app.settings.moving_rate, 1.0..=8.0).logarithmic(true).prefix("x ").suffix(" apart").max_decimals(1))
+            ui.add(super::style::slider(&mut self.app.settings.moving_rate, 1.0..=8.0).logarithmic(true).prefix("x ").suffix(" apart").max_decimals(1))
                 .on_hover_text("While an object is moved, its micropolygons are this many times further apart. 1: as when still.");
             ui.end_row();
             ui.label("Moving: geometry error");
-            ui.add(egui::Slider::new(&mut self.app.settings.moving_detail, 1.0..=8.0).logarithmic(true).prefix("x ").max_decimals(1))
+            ui.add(super::style::slider(&mut self.app.settings.moving_detail, 1.0..=8.0).logarithmic(true).prefix("x ").max_decimals(1))
                 .on_hover_text("While an object is moved, its level of detail may show this many times the error. 1: as when still.");
             ui.end_row();
             ui.label("Shadows");
@@ -610,7 +612,7 @@ impl Editor {
                     }
                 });
             let mut h = self.app.hours;
-            let r = ui.add(egui::DragValue::new(&mut h).speed(0.02).custom_formatter(|v, _| hhmm(v as f32)).custom_parser(|s| crate::parse_hours(s).map(|h| h as f64)));
+            let r = ui.add(super::style::num(&mut h).speed(0.02).custom_formatter(|v, _| hhmm(v as f32)).custom_parser(|s| crate::parse_hours(s).map(|h| h as f64)));
             if r.changed() {
                 self.app.hours = h.rem_euclid(24.0);
                 self.app.apply_daylight();

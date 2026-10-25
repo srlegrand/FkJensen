@@ -30,13 +30,13 @@ impl Editor {
                         }
                         ui.end_row();
                         ui.label("Roughness").on_hover_text("0: a mirror; 1: no highlight to speak of");
-                        changed |= ui.add(egui::Slider::new(&mut m.roughness, 0.02..=1.0).max_decimals(3)).changed();
+                        changed |= ui.add(super::style::slider(&mut m.roughness, 0.02..=1.0).max_decimals(3)).changed();
                         ui.end_row();
                         ui.label("Metallic").on_hover_text("1: no diffuse, the colour is what it reflects");
-                        changed |= ui.add(egui::Slider::new(&mut m.metallic, 0.0..=1.0).max_decimals(3)).changed();
+                        changed |= ui.add(super::style::slider(&mut m.metallic, 0.0..=1.0).max_decimals(3)).changed();
                         ui.end_row();
                         ui.label("Specular").on_hover_text("A dielectric's reflectance facing the eye: 0.5 is 4%, most materials; 1 is 8%");
-                        changed |= ui.add(egui::Slider::new(&mut m.specular, 0.0..=1.0).max_decimals(3)).changed();
+                        changed |= ui.add(super::style::slider(&mut m.specular, 0.0..=1.0).max_decimals(3)).changed();
                         ui.end_row();
                     });
                     if ui.add_enabled(edited, egui::Button::new("Reset to the asset's")).clicked() {
