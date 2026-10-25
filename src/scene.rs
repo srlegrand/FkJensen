@@ -105,9 +105,22 @@ pub struct PointLight {
     /// the colour tints the light, the lumens say how strong it is.
     pub color: Vec3,
     pub lumens: f32,
+    /// Its radius, metres: the bigger, the softer its shadows grow with
+    /// distance from what casts them (shadow fields, `field.rs`).
+    pub size: f32,
+    /// Distance over which its shadows fade out with their occluder's
+    /// distance, metres; 0: they do not.
+    pub falloff: f32,
 }
 
+/// A point light's radius at start: a bulb's.
+pub const LIGHT_SIZE: f32 = 0.05;
+
 impl PointLight {
+    /// For filling in the rest of one: white, 800 lm, a bulb's size, no
+    /// falloff.
+    pub const DEFAULT: PointLight = PointLight { position: Vec3::ZERO, color: Vec3::ONE, lumens: 800.0, size: LIGHT_SIZE, falloff: 0.0 };
+
     /// Luminous intensity in candela.
     pub fn candela(&self) -> f32 {
         self.lumens / (4.0 * std::f32::consts::PI)
@@ -286,6 +299,8 @@ pub struct Scene {
     /// Each triangle's material, from its cluster's `material_base`; a
     /// triangle past the end has the first.
     pub tri_mat: Vec<u8>,
+    /// Shadow fields, one per asset, shared by its objects (`field.rs`).
+    pub fields: Vec<std::sync::Arc<crate::field::ShadowField>>,
 }
 
 /// Where a scene's geometry outside every object (the ground, the
@@ -401,6 +416,9 @@ pub struct Object {
     /// `frame() * frozen * frame_of(rest)⁻¹`, so a frozen rotation or scale
     /// reads 0 or 1 and the object stays where it is.
     pub frozen: glam::Affine3A,
+    /// Its shadow field (`field.rs`): an index into `Scene::fields`, shared
+    /// with its instances. None for a group or the ground.
+    pub field: Option<usize>,
     /// Where its translate reads 0 (Freeze Transformations on translate):
     /// the editor shows `pivot - origin`, the pivot stays where it is.
     pub origin: Vec3,
@@ -431,7 +449,7 @@ impl Object {
     /// A new object of clusters `clusters` whose geometry is stored where it
     /// stands.
     pub fn new(name: String, clusters: std::ops::Range<usize>, pivot: Vec3, rotation: Vec3, scale: Vec3, parent: Option<usize>) -> Object {
-        Object { name, clusters, pivot, rotation, scale, rest: (pivot, rotation, scale), frozen: glam::Affine3A::IDENTITY, origin: Vec3::ZERO, lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent, asset: None, materials: 0..0, asset_materials: Vec::new(), environment: false }
+        Object { name, clusters, pivot, rotation, scale, rest: (pivot, rotation, scale), frozen: glam::Affine3A::IDENTITY, origin: Vec3::ZERO, field: None, lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent, asset: None, materials: 0..0, asset_materials: Vec::new(), environment: false }
     }
 
     /// Its frame: scale along its axes, then rotation, then the pivot.
@@ -779,7 +797,9 @@ impl Scene {
             other.materials.push(Material::default());
         }
         let mbase = self.materials.len();
-        self.objects.extend(other.objects.iter().map(|o| Object { clusters: o.clusters.start + cbase..o.clusters.end + cbase, parent: o.parent.map(|p| p + obase), materials: o.materials.start + mbase..o.materials.end + mbase, ..o.clone() }));
+        let fbase = self.fields.len();
+        self.fields.extend(other.fields.iter().cloned());
+        self.objects.extend(other.objects.iter().map(|o| Object { clusters: o.clusters.start + cbase..o.clusters.end + cbase, parent: o.parent.map(|p| p + obase), materials: o.materials.start + mbase..o.materials.end + mbase, field: o.field.map(|f| f + fbase), ..o.clone() }));
         self.materials.extend(other.materials.iter().cloned());
         let other_clusters = other.clusters.len();
         if !other.textures.is_empty() || !self.textures.is_empty() {
@@ -897,6 +917,10 @@ impl Scene {
         let n = out.clusters.len();
         let (p, r, s) = o.rest;
         let mut ob = Object::new(o.name.clone(), 0..n, p, r, s, None);
+        if let Some(f) = o.field.and_then(|k| self.fields.get(k)) {
+            out.fields = vec![f.clone()];
+            ob.field = Some(0);
+        }
         ob.asset = None;
         ob.materials = 0..out.materials.len();
         ob.asset_materials = out.materials.clone();
@@ -1021,6 +1045,7 @@ impl Scene {
             }
         }
         out.lights = std::mem::take(&mut self.lights);
+        out.fields = std::mem::take(&mut self.fields);
         out.focus = self.focus;
         out.world = std::mem::take(&mut self.world);
         out.light_parents = std::mem::take(&mut self.light_parents).into_iter().map(|p| p.map(|p| object_index.get(p).copied().unwrap_or(usize::MAX)).filter(|&p| p != usize::MAX)).collect();

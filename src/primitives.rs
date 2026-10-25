@@ -134,6 +134,10 @@ pub fn part(name: &str) -> Option<Scene> {
     let n = scene.clusters.len();
     let i = scene.add_object(name.to_string(), 0..n, Vec3::ZERO, Vec3::ZERO);
     scene.objects[i].asset = Some(crate::world::asset_name(name).into());
+    // Its shadow field, made with it (a few thousand cells: quick).
+    let (f, _) = crate::field::ShadowField::bake(&scene, 0..n, 48);
+    scene.fields = vec![std::sync::Arc::new(f)];
+    scene.objects[i].field = Some(0);
     scene.scatter_missing_samples();
     Some(scene)
 }

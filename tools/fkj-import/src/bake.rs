@@ -292,6 +292,15 @@ pub fn bake_logged(m: &Model, o: &Options, levels: bool, log: &dyn Fn(String)) -
     scene.textures.entries = entries;
     scene.textures.sources = vec![Arc::new(Source::Memory(Arc::new(pool)))];
     scene.textures.alpha_sources = vec![alpha_pool.map(|p| Arc::new(Source::Memory(Arc::new(p))))];
+    // The shadow field (src/field.rs in FkJensen): what the model casts,
+    // for every light, wherever it stands.
+    let n = scene.clusters.len();
+    let (field, fr) = crate::field::ShadowField::bake(&scene, 0..n, crate::field::RES);
+    log(format!("shadow field: {} x {} x {} cells of {:.1} cm, {} opaque and {} cut-out triangles, {:.1} MB, in {:.1} s", field.n[0], field.n[1], field.n[2], field.h * 100.0, fr.opaque_tris, fr.cutout_tris, field.bytes() as f64 / 1e6, fr.seconds));
+    scene.fields = vec![std::sync::Arc::new(field)];
+    // One object over it all, at the origin, holding the field.
+    scene.objects = vec![crate::scene::Object::new(String::new(), 0..n, Vec3::ZERO, Vec3::ZERO, Vec3::ONE, None)];
+    scene.objects[0].field = Some(0);
     Baked { scene, levels, pool_bytes, lod: lod_stats }
 }
 

@@ -1176,7 +1176,7 @@ mod tests {
         let mut scene = Scene::new();
         let p = [Vec3::new(-2.0, 0.0, -2.0), Vec3::new(2.0, 0.0, -2.0), Vec3::new(2.0, 0.0, 2.0), Vec3::new(-2.0, 0.0, 2.0)];
         scene.push_mesh(&p, &[], &[Vec3::splat(0.6)], &[0, 2, 1, 0, 3, 2]);
-        let lights = vec![PointLight { position: Vec3::new(0.0, 1.0, 0.0), color: Vec3::ONE, lumens: 800.0 }];
+        let lights = vec![PointLight { position: Vec3::new(0.0, 1.0, 0.0), color: Vec3::ONE, lumens: 800.0, ..PointLight::DEFAULT }];
         let c = crate::camera::OrbitCamera { target: Vec3::ZERO, distance: 5.0, yaw: 0.5, pitch: 0.6, fov_y: 45f32.to_radians(), scene_radius: 3.0 };
         let cam = Camera { view: c.view(), proj: c.proj(1.5), eye: c.eye(), near: c.near() };
         let settings = RenderSettings::new(Sky::new(30.0, true));

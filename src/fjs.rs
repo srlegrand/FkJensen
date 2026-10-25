@@ -238,6 +238,14 @@ pub struct LightEntry {
     /// Linear RGB.
     pub color: [f32; 3],
     pub lumens: f32,
+    /// Its radius, metres (`scene::LIGHT_SIZE` when missing): how soft its
+    /// shadows grow.
+    #[serde(default = "light_size")]
+    pub size: f32,
+    /// Metres over which its shadows fade with their caster's distance;
+    /// 0 or missing: they do not.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub falloff: f32,
     /// The object it is parented to: an index into `objects`. It moves
     /// with it, keeping where it is relative to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,6 +260,13 @@ pub struct DirEntry {
     pub elevation: f32,
     pub color: [f32; 3],
     pub lux: f32,
+    /// Degrees across, as seen (1 when missing): how soft its shadows
+    /// grow.
+    #[serde(default = "dir_size")]
+    pub size: f32,
+    /// As a light's.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub falloff: f32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -261,6 +276,25 @@ pub struct SunEntry {
     pub color: [f32; 3],
     /// 0 to 1000.
     pub brightness: f32,
+    /// Degrees across, as seen (`raster::SUN_SIZE` when missing).
+    #[serde(default = "sun_size")]
+    pub size: f32,
+}
+
+fn light_size() -> f32 {
+    crate::scene::LIGHT_SIZE
+}
+
+fn dir_size() -> f32 {
+    crate::raster::DirLight::default().size
+}
+
+fn sun_size() -> f32 {
+    crate::raster::SUN_SIZE
+}
+
+fn is_zero(v: &f32) -> bool {
+    *v == 0.0
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -319,6 +353,9 @@ pub struct RenderEntry {
     pub sky_occlusion: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incremental_moves: Option<bool>,
+    /// Shadows traced through shadow fields (else shadow maps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_fields: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backface_culling: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -431,20 +468,122 @@ pub fn relative(path: &Path, dir: &Path) -> String {
 /// pivot, rotation and scale it was stored with (the origin, unturned, at
 /// scale 1 when it has none).
 pub fn load_asset(path: &Path) -> Result<Scene, String> {
+    read_asset(path, true)
+}
+
+/// `load_asset`; `field`: turned away without a shadow field (not so for
+/// a world asset: loose geometry, which casts none, as the ground).
+fn read_asset(path: &Path, need_field: bool) -> Result<Scene, String> {
     let t = std::time::Instant::now();
     let (mut s, _) = crate::fkj::read_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let n = s.clusters.len();
     let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let rest = s.objects.iter().find(|o| o.clusters == (0..n)).map(|o| (o.name.clone(), o.pivot, o.rotation, o.scale));
-    let (oname, pivot, rotation, scale) = rest.unwrap_or((name.clone(), Vec3::ZERO, Vec3::ZERO, Vec3::ONE));
+    let rest = s.objects.iter().find(|o| o.clusters == (0..n)).map(|o| (o.name.clone(), o.pivot, o.rotation, o.scale, o.field));
+    let (oname, pivot, rotation, scale, field) = rest.unwrap_or((name.clone(), Vec3::ZERO, Vec3::ZERO, Vec3::ONE, None));
     s.objects = vec![Object::new(if oname.is_empty() { name } else { oname }, 0..n, pivot, rotation, scale, None)];
+    s.objects[0].field = field;
     s.objects[0].asset = Some(path.to_path_buf());
     s.own_materials(0);
     s.refresh_bounds(0);
     s.lights.clear();
+    if need_field {
+        ensure_fields(&mut s, &path.display().to_string())?;
+    }
     s.scatter_missing_samples();
     eprintln!("{}: read in {:.2} s: {} triangles, {} clusters", path.display(), t.elapsed().as_secs_f64(), s.triangle_count(), n);
     Ok(s)
+}
+
+/// What an asset without a shadow field is turned away with: the editor
+/// looks for it to offer to build one.
+pub const NO_FIELD: &str = "has no shadow field";
+
+/// Whether assets without a shadow field are given one in memory when read
+/// (`--build-fields`) rather than turned away.
+pub static BUILD_MISSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Every model object of `scene` (not a group, not the ground) must have a
+/// shadow field: turned away with `NO_FIELD` when one has none, or, with
+/// `BUILD_MISSING`, given one baked in memory (shared by its instances).
+pub fn ensure_fields(scene: &mut Scene, what: &str) -> Result<(), String> {
+    let missing: Vec<usize> = (0..scene.objects.len()).filter(|&i| !scene.objects[i].clusters.is_empty() && !scene.objects[i].environment && scene.objects[i].field.is_none()).collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if !BUILD_MISSING.load(std::sync::atomic::Ordering::Relaxed) {
+        let names: Vec<&str> = missing.iter().map(|&i| scene.objects[i].name.as_str()).collect();
+        return Err(format!("{what}: {} {NO_FIELD}; build it with `fkj-import --fields {what}`, in the editor, or run with --build-fields", names.join(", ")));
+    }
+    for i in missing {
+        if scene.objects[i].field.is_none() {
+            bake_field(scene, i);
+        }
+    }
+    Ok(())
+}
+
+/// Bake object `i`'s shadow field, in memory, for it and its instances.
+pub fn bake_field(scene: &mut Scene, i: usize) {
+    let one = scene.extract_object(i);
+    let (f, r) = crate::field::ShadowField::bake(&one, 0..one.clusters.len(), crate::field::RES);
+    eprintln!("{}: shadow field built in {:.1} s ({} opaque, {} cut-out triangles, {:.1} MB)", scene.objects[i].name, r.seconds, r.opaque_tris, r.cutout_tris, f.bytes() as f64 / 1e6);
+    let k = scene.fields.len();
+    scene.fields.push(std::sync::Arc::new(f));
+    for j in scene.instances_of(i) {
+        scene.objects[j].field = Some(k);
+    }
+}
+
+/// Bake a shadow field into the asset at `path`, replacing any it had;
+/// the file is written beside it and moved over it.
+pub fn build_field_into(path: &Path) -> Result<crate::field::BakeReport, String> {
+    let (mut s, report) = crate::fkj::read_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !report.skipped.is_empty() {
+        return Err(format!("{}: sections this build cannot copy ({}): left as it is", path.display(), report.skipped.join(", ")));
+    }
+    let n = s.clusters.len();
+    if s.objects.iter().all(|o| o.clusters != (0..n)) {
+        let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        s.objects = vec![Object::new(name, 0..n, Vec3::ZERO, Vec3::ZERO, Vec3::ONE, None)];
+    }
+    let i = s.objects.iter().position(|o| o.clusters == (0..n)).unwrap();
+    let (f, r) = crate::field::ShadowField::bake(&s, 0..n, crate::field::RES);
+    s.fields = vec![std::sync::Arc::new(f)];
+    for o in &mut s.objects {
+        o.field = None;
+    }
+    s.objects[i].field = Some(0);
+    let tmp = path.with_extension("fja.part");
+    let written = std::fs::File::create(&tmp).and_then(|file| {
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
+        crate::fkj::write_to(&mut w, &s, &[])?;
+        std::io::Write::flush(&mut w)
+    });
+    // The source's tiles are read from the file being replaced: let it go
+    // before moving the new one over it.
+    drop(s);
+    match written.and_then(|_| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(r),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("{}: {e}", path.display()))
+        }
+    }
+}
+
+/// The assets `f` names (resolved) that have no shadow field.
+pub fn assets_without_fields(f: &SceneFile, dir: &Path, search: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for o in f.objects.iter().filter(|o| o.instance_of.is_none()) {
+        let Some(a) = &o.asset else { continue };
+        if crate::world::part_of(Path::new(a)).is_some() {
+            continue;
+        }
+        if let Some(p) = resolve(a, dir, search).filter(|p| !out.contains(p) && !crate::fkj::has_section(p, crate::fkj::TAG_SHDF).unwrap_or(true)) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// Write object `i` as an .fja at `path`, in its own space.
@@ -478,7 +617,7 @@ pub fn build(f: &SceneFile, dir: &Path, search: &[PathBuf]) -> Result<Scene, Str
         Some("built-in") => crate::world::build(),
         Some(w) => {
             let p = resolve(w, dir, search).ok_or_else(|| format!("world asset {w} not found"))?;
-            let mut s = load_asset(&p)?;
+            let mut s = read_asset(&p, false)?;
             s.objects.clear();
             s.world = World::Asset(p);
             s
@@ -527,7 +666,7 @@ pub fn build(f: &SceneFile, dir: &Path, search: &[PathBuf]) -> Result<Scene, Str
             scene.set_frozen(i, o.frozen.as_ref().map_or(glam::Affine3A::IDENTITY, affine_of), o.origin.map_or(Vec3::ZERO, v3));
         }
     }
-    scene.lights = f.lights.iter().map(|l| PointLight { position: v3(l.position), color: v3(l.color), lumens: l.lumens.clamp(crate::scene::MIN_LUMENS, crate::scene::MAX_LUMENS) }).collect();
+    scene.lights = f.lights.iter().map(|l| PointLight { position: v3(l.position), color: v3(l.color), lumens: l.lumens.clamp(crate::scene::MIN_LUMENS, crate::scene::MAX_LUMENS), size: l.size.clamp(0.0, 10.0), falloff: l.falloff.max(0.0) }).collect();
     scene.light_parents = f.lights.iter().map(|l| l.parent.and_then(|p| index.get(p).copied())).collect();
     scene.focus = scene.subject();
     Ok(scene)
@@ -571,6 +710,11 @@ pub fn save_assets(scene: &mut Scene, scene_path: &Path) -> Result<Vec<PathBuf>,
             continue;
         }
         let p = asset_name(&scene.objects[i].name, &dir, &written);
+        // Made in the editor or from an old file: its shadow field goes
+        // into its asset with it.
+        if scene.objects[i].field.is_none() && !scene.objects[i].environment {
+            bake_field(scene, i);
+        }
         write_asset(scene, i, &p)?;
         scene.objects[i].asset = Some(p.clone());
         // The asset holds its materials as they are.
@@ -678,7 +822,7 @@ pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight], light_pa
         lights: lights
             .iter()
             .enumerate()
-            .map(|(k, l)| LightEntry { position: a3(l.position), color: a3(l.color), lumens: round6(l.lumens), parent: light_parents.get(k).copied().flatten().filter(|&p| p < n).map(|p| at[p]) })
+            .map(|(k, l)| LightEntry { position: a3(l.position), color: a3(l.color), lumens: round6(l.lumens), size: round6(l.size), falloff: round6(l.falloff), parent: light_parents.get(k).copied().flatten().filter(|&p| p < n).map(|p| at[p]) })
             .collect(),
         ..Default::default()
     }
@@ -721,7 +865,7 @@ mod tests {
         let path = d.join("my scene.fjs");
         let written = save_assets(&mut s, &path).unwrap();
         assert_eq!(written, vec![d.join("ball_one.fja")]);
-        let mut f = entries(&s, &path, &[PointLight { position: Vec3::ONE, color: Vec3::ONE, lumens: 900.0 }], &[]);
+        let mut f = entries(&s, &path, &[PointLight { position: Vec3::ONE, color: Vec3::ONE, lumens: 900.0, ..PointLight::DEFAULT }], &[]);
         f.time = Some(17.5);
         write(&path, &f).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();

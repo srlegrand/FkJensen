@@ -45,6 +45,7 @@ pub const TAG_OBJS: [u8; 4] = *b"OBJS";
 pub const TAG_SAMP: [u8; 4] = *b"SAMP";
 pub const TAG_MATS: [u8; 4] = *b"MATS";
 pub const TAG_ALPH: [u8; 4] = *b"ALPH";
+pub const TAG_SHDF: [u8; 4] = *b"SHDF";
 
 /// Extra copies of clusters `first_cluster..first_cluster + cluster_count`
 /// of the `MESH` section, each at `transform` applied to the stored
@@ -111,7 +112,8 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
     let samp = !scene.samples.is_empty();
     let mats = !scene.materials.is_empty();
     let alph = textured && (0..scene.clusters.len()).any(|c| scene.textures.has_alpha(c));
-    head.u32(2 + !instances.is_empty() as u32 + textured as u32 + lods as u32 + objs as u32 + samp as u32 + mats as u32 + alph as u32);
+    let shdf: Vec<(usize, &crate::field::ShadowField)> = scene.objects.iter().enumerate().filter_map(|(i, o)| o.field.and_then(|k| scene.fields.get(k)).map(|f| (i, &**f))).collect();
+    head.u32(2 + !instances.is_empty() as u32 + textured as u32 + lods as u32 + objs as u32 + samp as u32 + mats as u32 + alph as u32 + !shdf.is_empty() as u32);
     head.u32(0);
     out.write_all(&head.0)?;
 
@@ -372,6 +374,22 @@ pub fn write_to(out: &mut impl std::io::Write, scene: &Scene, instances: &[Insta
     // metallic, f32 specular, u32 name bytes, the name in UTF-8 padded to
     // 4; per cluster u32 its first material; per triangle u8 its material
     // from its cluster's first; padded to 4.
+    // SHDF: u32 field count, u32 0; per field u32 the object it belongs
+    // to (an index into OBJS), then the field (`field.rs`): f32 x 3 its
+    // first cell, f32 cell size, u32 x 3 cells along x, y, z, u32 distance
+    // bytes and u32 density bytes (each 0 or the cell count), the bytes,
+    // padded to 4.
+    if !shdf.is_empty() {
+        let mut sh = W(Vec::new());
+        sh.u32(shdf.len() as u32);
+        sh.u32(0);
+        for (i, f) in &shdf {
+            sh.u32(*i as u32);
+            f.write(&mut sh.0);
+        }
+        section(out, TAG_SHDF, 1, &sh.0)?;
+    }
+
     if mats {
         let t = scene.triangle_count();
         let mut ms = W(Vec::with_capacity(16 + scene.materials.len() * 40 + scene.clusters.len() * 4 + t + 4));
@@ -534,6 +552,26 @@ pub fn read_file(path: &std::path::Path) -> Result<(Scene, ReadReport), String> 
     assemble(list, tex, alpha)
 }
 
+/// Whether the file at `path` has a section `tag` (headers only read).
+pub fn has_section(path: &std::path::Path, tag: [u8; 4]) -> Result<bool, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut buf = [0u8; 16];
+    f.read_exact(&mut buf).map_err(|_| "file is truncated".to_string())?;
+    let n = header(&buf)?;
+    let mut at = 16u64;
+    for _ in 0..n {
+        f.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
+        f.read_exact(&mut buf).map_err(|_| "file is truncated".to_string())?;
+        if buf[0..4] == tag {
+            return Ok(true);
+        }
+        let len = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        at = (at + 16 + len).div_ceil(8) * 8;
+    }
+    Ok(false)
+}
+
 fn alph_table_end(payload: &[u8]) -> Result<usize, String> {
     if payload.len() < 16 {
         return Err("ALPH section is truncated".into());
@@ -577,6 +615,7 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>, 
     let mut objs: Option<(&[u8], u32)> = None;
     let mut samp: Option<&[u8]> = None;
     let mut mats: Option<&[u8]> = None;
+    let mut shdf: Option<&[u8]> = None;
     for (tag, section_version, payload) in &list {
         match *tag {
             TAG_OBJS => objs = Some((payload, *section_version)),
@@ -587,6 +626,7 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>, 
             TAG_INST => inst_payloads.push(payload),
             TAG_SAMP if *section_version == 1 => samp = Some(payload),
             TAG_MATS if *section_version == 1 => mats = Some(payload),
+            TAG_SHDF if *section_version == 1 => shdf = Some(payload),
             other => report.skipped.push(String::from_utf8_lossy(&other).into_owned()),
         }
     }
@@ -638,6 +678,19 @@ fn assemble(list: Vec<([u8; 4], u32, Vec<u8>)>, tex: Option<(Vec<u8>, Source)>, 
     }
     if let Some((b, v)) = objs {
         read_objects(b, v, &mut scene, stored_clusters)?;
+    }
+    if let Some(b) = shdf {
+        let mut at = 8usize;
+        let n = b.get(0..4).map(|s| u32::from_le_bytes(s.try_into().unwrap()) as usize).ok_or("SHDF is truncated")?;
+        for _ in 0..n {
+            let i = b.get(at..at + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()) as usize).ok_or("SHDF is truncated")?;
+            at += 4;
+            let f = crate::field::ShadowField::read(b, &mut at)?;
+            if let Some(o) = scene.objects.get_mut(i) {
+                o.field = Some(scene.fields.len());
+                scene.fields.push(std::sync::Arc::new(f));
+            }
+        }
     }
     if scene.clusters.is_empty() {
         scene.bounds_min = Vec3::splat(-1.0);
@@ -1063,7 +1116,7 @@ fn read_lights(b: &[u8], scene: &mut Scene) -> Result<(), String> {
         let color = r.v3()?;
         let lumens = r.f32()?;
         r.f32()?;
-        scene.lights.push(PointLight { position, color, lumens });
+        scene.lights.push(PointLight { position, color, lumens, ..PointLight::DEFAULT });
     }
     Ok(())
 }
@@ -1081,7 +1134,7 @@ mod tests {
         s.push_mesh(&p, &[], &colors, &idx);
         s.scatter_over(0..s.clusters.len());
         crate::transfer::compute(&mut s.samples);
-        s.lights.push(PointLight { position: Vec3::new(1.0, 2.0, 3.0), color: Vec3::new(1.0, 0.5, 0.25), lumens: 800.0 });
+        s.lights.push(PointLight { position: Vec3::new(1.0, 2.0, 3.0), color: Vec3::new(1.0, 0.5, 0.25), lumens: 800.0, ..PointLight::DEFAULT });
         s.materials = vec![crate::scene::Material { name: "skin".into(), roughness: 0.3, ..Default::default() }, crate::scene::Material { name: "chrome".into(), metallic: 1.0, roughness: 0.1, tint: Vec3::new(0.9, 0.8, 0.7), specular: 0.5 }];
         s.tri_mat = (0..s.triangle_count()).map(|t| (t % 3 == 0) as u8).collect();
         s

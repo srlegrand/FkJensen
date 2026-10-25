@@ -38,6 +38,7 @@ use rayon::prelude::*;
 use crate::bounce::{self, Bounce};
 use crate::raster::{self, Camera, Frame, NO_TRI, NOT_VISIBLE, RenderSettings, Sky, View};
 use crate::scene::{PointLight, Scene};
+use crate::fieldtrace::{Fields, Towards};
 use crate::shadow::CubeShadow;
 use crate::sun::SunShadow;
 use crate::transfer::SkyShare;
@@ -468,7 +469,7 @@ pub struct Renderer {
     /// only it keeps a share of its own in the shading cache, so memory
     /// grows by one share a point.
     hot: Vec<usize>,
-    prev_global: Option<(Sky, raster::Sun, f32, bool, bool, bool, usize, bool, bool)>,
+    prev_global: Option<(Sky, raster::Sun, f32, bool, bool, bool, bool, usize, bool, bool)>,
     /// The directional lights as last shaded.
     prev_dirs: [raster::DirLight; raster::MAX_DIR_LIGHTS],
     /// The sun's shadow map, and what it was built for (direction, texels,
@@ -1009,7 +1010,7 @@ impl Renderer {
         let reach: Vec<f32> = lights.iter().map(|l| if settings.light_reach { raster::light_reach(l, cut) } else { f32::INFINITY }).collect();
 
         // What changed since the last frame decides what is thrown away.
-        let global = (settings.sky, settings.sun, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.bounce, settings.shadow_res, settings.adaptive, settings.sky_occlusion);
+        let global = (settings.sky, settings.sun, settings.exposure, settings.light_reach, settings.shadows && settings.shadow_res > 0, settings.shadow_fields, settings.bounce, settings.shadow_res, settings.adaptive, settings.sky_occlusion);
         // Without incremental moves (to compare), a move relights all.
         let global_changed = self.prev_global != Some(global) || self.prev_lights.len() != lights.len() || (!settings.incremental_moves && !self.moves.is_empty());
         // Spheres (old and new position, with reach) of lights that changed,
@@ -1165,8 +1166,10 @@ impl Renderer {
             full_resolve = true;
         }
 
-        // Shadow maps for lights that have none.
-        if settings.shadows {
+        // Shadow maps for lights that have none (when shadows are not traced
+        // through fields).
+        let maps = settings.shadows && !settings.shadow_fields;
+        if maps {
             let missing: Vec<usize> = (0..lights.len()).filter(|&i| self.shadows[i].is_none()).collect();
             let built: Vec<(usize, CubeShadow)> = missing
                 .par_iter()
@@ -1184,7 +1187,7 @@ impl Renderer {
             }
         }
         // The sun's map, when it is up and its direction or the scene changed.
-        if settings.shadows && settings.sun.up() {
+        if maps && settings.sun.up() {
             let res = (settings.shadow_res * 4).clamp(256, 2048);
             let key = (settings.sun.dir, res, key);
             if self.sun_key != Some(key) {
@@ -1197,7 +1200,7 @@ impl Renderer {
             }
         }
         // Each directional light's map, as the sun's.
-        if settings.shadows {
+        if maps {
             let res = (settings.shadow_res * 4).clamp(256, 2048);
             let focus = (scene.focus_centre(), scene.focus_radius());
             for (i, d) in settings.dir_lights.iter().enumerate() {
@@ -1214,27 +1217,47 @@ impl Renderer {
                 }
             }
         }
+        // Shadow fields placed where their objects stand, and for each point
+        // light the objects whose fields could reach into its reach.
+        let fields = (settings.shadows && settings.shadow_fields).then(|| Fields::of(scene));
+        let fields = fields.as_ref();
+        let field_near: Vec<Vec<usize>> = match fields {
+            Some(f) => lights.iter().zip(&reach).map(|(l, &r)| f.near(l.position, r + l.size)).collect(),
+            None => Vec::new(),
+        };
         frame.stats.shadow_ms = ts.elapsed().as_secs_f32() * 1000.0;
+        // A parallel light's shadow: its field trace or its map.
+        fn par_with<'a>(fields: Option<&'a Fields>, on: bool, map: Option<&'a SunShadow>, size: f32, falloff: f32) -> (Option<&'a SunShadow>, Option<(&'a Fields, f32, f32)>) {
+            match fields {
+                Some(f) => (None, Some((f, (size.to_radians() * 0.5).tan(), falloff))),
+                None if on => (map, None),
+                None => (None, None),
+            }
+        }
+        let par = |map, size, falloff| par_with(fields, settings.shadows, map, size, falloff);
         // Parallel lights: the sun, then the directional lights.
-        let mut suns = vec![SunLit {
-            lux: settings.sun.lux(settings.exposure),
-            dir: settings.sun.dir,
-            shadow: if settings.shadows && settings.sun.up() { self.sun_shadow.as_ref() } else { None },
-        }];
+        let (s0, f0) = par(if settings.sun.up() { self.sun_shadow.as_ref() } else { None }, settings.sun.size, 0.0);
+        let mut suns = vec![SunLit { lux: settings.sun.lux(settings.exposure), dir: settings.sun.dir, shadow: s0, field: f0 }];
         for (i, d) in settings.dir_lights.iter().enumerate() {
             if d.lights() {
-                suns.push(SunLit { lux: d.color * d.lux, dir: d.dir, shadow: if settings.shadows { self.dir_shadows[i].as_ref().map(|s| &s.0) } else { None } });
+                let (s, f) = par(self.dir_shadows[i].as_ref().map(|s| &s.0), d.size, d.falloff);
+                suns.push(SunLit { lux: d.color * d.lux, dir: d.dir, shadow: s, field: f });
             }
         }
         let sun = &suns[..];
         // The sun alone, and each directional light by its slot, for the
         // sum and the shares.
-        let sun_main = [SunLit { lux: suns[0].lux, dir: suns[0].dir, shadow: suns[0].shadow }];
+        let sun_main = [SunLit { lux: suns[0].lux, dir: suns[0].dir, shadow: suns[0].shadow, field: suns[0].field }];
         let dir_lit: Vec<Option<SunLit>> = settings
             .dir_lights
             .iter()
             .enumerate()
-            .map(|(i, d)| d.lights().then(|| SunLit { lux: d.color * d.lux, dir: d.dir, shadow: if settings.shadows { self.dir_shadows[i].as_ref().map(|s| &s.0) } else { None } }))
+            .map(|(i, d)| {
+                d.lights().then(|| {
+                    let (s, f) = par(self.dir_shadows[i].as_ref().map(|s| &s.0), d.size, d.falloff);
+                    SunLit { lux: d.color * d.lux, dir: d.dir, shadow: s, field: f }
+                })
+            })
             .collect();
         let dir_lit = &dir_lit;
         let sun_main = &sun_main;
@@ -1245,7 +1268,13 @@ impl Renderer {
         // Bounce: light the surfels again where light changed, then throw
         // away the receivers that bounce could reach from there.
         let tb = std::time::Instant::now();
-        let shadows: Vec<Option<&CubeShadow>> = (0..lights.len()).map(|i| if settings.shadows { self.shadows[i].as_ref() } else { None }).collect();
+        let shadows: Vec<Shadow> = (0..lights.len())
+            .map(|i| match fields {
+                Some(f) => Shadow::Field { fields: f, near: &field_near[i], light: lights[i] },
+                None if settings.shadows => self.shadows[i].as_ref().map_or(Shadow::None, Shadow::Map),
+                None => Shadow::None,
+            })
+            .collect();
         let sky = settings.sky;
         // Each sample's share of the sky, made again when the sky's shape
         // changes or an object moves.
@@ -1276,20 +1305,29 @@ impl Renderer {
                 // The brightest change, as an intensity (cd): how far the
                 // change in bounce light can be seen.
                 let changed = std::sync::Mutex::new(0f32);
-                b.radiance.par_iter_mut().zip(b.surfels.par_iter()).zip(surfel_share.par_iter()).for_each(|((r, sf), &share)| {
-                    if !all && !spheres.iter().any(|(p, rr)| p.distance(sf.position) <= rr + (sf.area / std::f32::consts::PI).sqrt()) {
+                // Eight at a time: the shadows are looked up eight lanes
+                // at once.
+                b.radiance.par_chunks_mut(8).zip(b.surfels.par_chunks(8)).zip(surfel_share.par_chunks(8)).for_each(|((r, sf), share)| {
+                    let need = (0..sf.len())
+                        .filter(|&j| all || spheres.iter().any(|(p, rr)| p.distance(sf[j].position) <= rr + (sf[j].area / std::f32::consts::PI).sqrt()))
+                        .fold(0u32, |m, j| m | 1 << j);
+                    if need == 0 {
                         return;
                     }
-                    let in_reach: Vec<usize> = (0..lights.len()).filter(|&i| lights[i].position.distance(sf.position) <= reach[i]).collect();
                     // Direct light only, without the sky's ground term: the
                     // ground is in the cloud.
-                    let new = shade_point(sf.position, sf.normal, sf.albedo, sf.position + sf.normal, Sky { lux: sky.lux * share, ..sky }, false, lights, &in_reach, &reach, &shadows, sun).0;
-                    let delta = (new - *r).abs().max_element() * sf.area;
-                    *r = new;
-                    lit.fetch_add(1, Ordering::Relaxed);
-                    if delta > 0.0 {
-                        let mut m = changed.lock().unwrap();
-                        *m = m.max(delta);
+                    let new = light_surfels(sf, share, need, sky, lights, &reach, &shadows, sun);
+                    for j in 0..sf.len() {
+                        if need & (1 << j) == 0 {
+                            continue;
+                        }
+                        let delta = (new[j] - r[j]).abs().max_element() * sf[j].area;
+                        r[j] = new[j];
+                        lit.fetch_add(1, Ordering::Relaxed);
+                        if delta > 0.0 {
+                            let mut m = changed.lock().unwrap();
+                            *m = m.max(delta);
+                        }
                     }
                 });
                 frame.stats.surfels_lit = lit.into_inner();
@@ -2111,68 +2149,135 @@ pub struct SunLit<'a> {
     pub lux: Vec3,
     pub dir: Vec3,
     pub shadow: Option<&'a SunShadow>,
+    /// Traced through the objects' fields instead: them, the light's
+    /// angular size (tan of its half width) and its falloff.
+    pub field: Option<(&'a Fields, f32, f32)>,
 }
 
-/// Diffuse radiance (cd/m²) leaving a point (a surfel: it has no
-/// highlight), and how many lights were evaluated. `n` is already turned
-/// to the eye's side.
+impl SunLit<'_> {
+    /// Light reaching each point of `mask` (normal `n`) past what casts
+    /// shadows, 0 to 1.
+    fn lit8(&self, p: crate::simd::V3, n: crate::simd::V3, mask: u32) -> [f32; 8] {
+        match (self.field, self.shadow) {
+            (Some((f, k, fall)), _) => {
+                // Only the objects the eight points' way to it can meet.
+                let (c, r) = sphere8(p, mask);
+                let mut buf = [0usize; 64];
+                let mut count = 0;
+                let which: &[usize] = if f.along(&f.all, c, r + FIELD_NUDGE, self.dir, 1e5, k, f32::INFINITY, &mut buf, &mut count) { &buf[..count] } else { &f.all };
+                if which.is_empty() {
+                    return std::array::from_fn(|j| if mask & (1 << j) != 0 { 1.0 } else { 0.0 });
+                }
+                let (p, n) = (points8(p), points8(n));
+                f.light8(which, &p, &n, Towards::Sun { dir: self.dir, k }, fall, mask)
+            }
+            (None, Some(m)) => m.lit8(p, n, mask),
+            (None, None) => std::array::from_fn(|j| if mask & (1 << j) != 0 { 1.0 } else { 0.0 }),
+        }
+    }
+}
+
+/// How far off its surface a point may be moved before a field is traced
+/// from it, metres (`fieldtrace::NUDGE_MAX`): the reach of the objects asked.
+const FIELD_NUDGE: f32 = crate::fieldtrace::NUDGE_MAX;
+
+/// A sphere round the points of the lanes in `mask`.
+fn sphere8(p: crate::simd::V3, mask: u32) -> (Vec3, f32) {
+    let (px, py, pz) = (p.x.to_array(), p.y.to_array(), p.z.to_array());
+    let at = |j: usize| Vec3::new(px[j], py[j], pz[j]);
+    let lanes = (0..8).filter(|j| mask & (1 << j) != 0);
+    let count = lanes.clone().count();
+    if count == 0 {
+        return (Vec3::ZERO, 0.0);
+    }
+    let c = lanes.clone().map(at).sum::<Vec3>() / count as f32;
+    (c, lanes.map(|j| at(j).distance(c)).fold(0.0, f32::max))
+}
+
+/// Eight points or vectors, each its own.
+fn points8(p: crate::simd::V3) -> [Vec3; 8] {
+    let (x, y, z) = (p.x.to_array(), p.y.to_array(), p.z.to_array());
+    std::array::from_fn(|j| Vec3::new(x[j], y[j], z[j]))
+}
+
+/// What shadows a point light: nothing, its map, or the objects' fields
+/// near it.
+#[derive(Clone, Copy)]
+pub enum Shadow<'a> {
+    None,
+    Map(&'a CubeShadow),
+    Field { fields: &'a Fields, near: &'a [usize], light: PointLight },
+}
+
+impl Shadow<'_> {
+    /// Light reaching each point of `mask` (normal `n`) past what casts
+    /// shadows, 0 to 1.
+    fn lit8(&self, p: crate::simd::V3, n: crate::simd::V3, mask: u32) -> [f32; 8] {
+        match *self {
+            Shadow::None => std::array::from_fn(|j| if mask & (1 << j) != 0 { 1.0 } else { 0.0 }),
+            Shadow::Map(m) => m.lit8(p, n, mask),
+            Shadow::Field { fields, near, light } => {
+                // Only the objects the eight points' way to it can meet.
+                let (c, r) = sphere8(p, mask);
+                let to = light.position - c;
+                let len = to.length().max(1e-6);
+                let mut buf = [0usize; 64];
+                let mut count = 0;
+                let which: &[usize] = if fields.along(near, c, r + FIELD_NUDGE, to / len, len, f32::INFINITY, light.size, &mut buf, &mut count) { &buf[..count] } else { near };
+                if which.is_empty() {
+                    return std::array::from_fn(|j| if mask & (1 << j) != 0 { 1.0 } else { 0.0 });
+                }
+                let (p, n) = (points8(p), points8(n));
+                fields.light8(which, &p, &n, Towards::Point { at: light.position, size: light.size }, light.falloff, mask)
+            }
+        }
+    }
+}
+
+/// Diffuse radiance (cd/m²) leaving up to eight surfels (those of `need`;
+/// they have no highlight), direct light only: the sky (`share` of it,
+/// without its ground term), the suns and the lights in reach.
 #[allow(clippy::too_many_arguments)]
-fn shade_point(
-    p: Vec3,
-    n: Vec3,
-    albedo: Vec3,
-    eye: Vec3,
-    sky: Sky,
-    ground: bool,
-    lights: &[PointLight],
-    in_reach: &[usize],
-    reach: &[f32],
-    shadows: &[Option<&CubeShadow>],
-    suns: &[SunLit],
-) -> (Vec3, u64) {
+fn light_surfels(sf: &[crate::bounce::Surfel], share: &[f32], need: u32, sky: Sky, lights: &[PointLight], reach: &[f32], shadows: &[Shadow], suns: &[SunLit]) -> [Vec3; 8] {
+    use crate::simd::{F, V3};
     let inv_pi = std::f32::consts::FRAC_1_PI;
-    let _ = eye;
-    let mut diffuse = albedo * sky.irradiance_from(n, ground) * inv_pi;
-    let mut evals = 0;
-    // The sun and directional lights: everywhere, parallel, each through
-    // its own map.
+    let lane = |g: &dyn Fn(&crate::bounce::Surfel) -> f32| F::from(std::array::from_fn::<f32, 8, _>(|j| sf.get(j).map_or(0.0, g)));
+    let p = V3 { x: lane(&|s| s.position.x), y: lane(&|s| s.position.y), z: lane(&|s| s.position.z) };
+    let n = V3 { x: lane(&|s| s.normal.x), y: lane(&|s| s.normal.y), z: lane(&|s| s.normal.z) };
+    let mut e = [Vec3::ZERO; 8];
+    let lanes = |m: u32| (0..sf.len()).filter(move |&j| m & (1 << j) != 0);
+    for j in lanes(need) {
+        e[j] = Sky { lux: sky.lux * share[j], ..sky }.irradiance_from(sf[j].normal, false);
+    }
+    // The sun and directional lights: everywhere, parallel.
     for sun in suns {
         if sun.lux == Vec3::ZERO {
             continue;
         }
-        let ndl = n.dot(sun.dir);
-        if ndl > 0.0 {
-            let vis = sun.shadow.map(|m| m.lit(p, n)).unwrap_or(1.0);
-            if vis > 0.0 {
-                let e = sun.lux * (ndl * vis);
-                diffuse += e * albedo * inv_pi;
-            }
+        let ndl: [f32; 8] = std::array::from_fn(|j| sf.get(j).map_or(0.0, |s| s.normal.dot(sun.dir)));
+        let facing = lanes(need).filter(|&j| ndl[j] > 0.0).fold(0, |m, j| m | 1 << j);
+        if facing == 0 {
+            continue;
+        }
+        let vis = sun.lit8(p, n, facing);
+        for j in lanes(facing) {
+            e[j] += sun.lux * (ndl[j] * vis[j]);
         }
     }
-    for &i in in_reach {
-        let l = &lights[i];
-        let d = l.position - p;
-        let d2 = d.length_squared().max(1e-12);
-        if d2 > reach[i] * reach[i] {
+    for (i, l) in lights.iter().enumerate() {
+        let d: [Vec3; 8] = std::array::from_fn(|j| sf.get(j).map_or(Vec3::ZERO, |s| l.position - s.position));
+        let d2: [f32; 8] = std::array::from_fn(|j| d[j].length_squared().max(1e-12));
+        let ndl: [f32; 8] = std::array::from_fn(|j| sf.get(j).map_or(0.0, |s| s.normal.dot(d[j]) / d2[j].sqrt()));
+        let facing = lanes(need).filter(|&j| d2[j] <= reach[i] * reach[i] && ndl[j] > 0.0).fold(0, |m, j| m | 1 << j);
+        if facing == 0 {
             continue;
         }
-        evals += 1;
-        let ldir = d / d2.sqrt();
-        let ndl = n.dot(ldir);
-        if ndl <= 0.0 {
-            continue;
+        let vis = shadows[i].lit8(p, n, facing);
+        for j in lanes(facing) {
+            e[j] += l.color * (l.candela() / d2[j] * ndl[j] * vis[j]);
         }
-        let vis = match shadows[i] {
-            Some(m) => m.lit(p, n),
-            None => 1.0,
-        };
-        if vis <= 0.0 {
-            continue;
-        }
-        let e = l.color * (l.candela() / d2 * ndl * vis);
-        diffuse += e * albedo * inv_pi;
     }
-    (diffuse, evals)
+    std::array::from_fn(|j| if need & (1 << j) != 0 { e[j] * sf[j].albedo * inv_pi } else { Vec3::ZERO })
 }
 
 /// Lights that keep a share of their own in the shading cache.
@@ -2455,7 +2560,7 @@ pub fn shade_batch(
     lights: &[PointLight],
     in_reach: &[usize],
     reach: &[f32],
-    shadows: &[Option<&CubeShadow>],
+    shadows: &[Shadow],
     suns: &[SunLit],
     diffuse: &mut [Vec3],
     spec: &mut [Vec3],
@@ -2578,10 +2683,7 @@ pub fn shade_batch(
             let ndl = nx * sun.dir.x + ny * sun.dir.y + nz * sun.dir.z;
             let facing = ndl.simd_gt(zero).to_bitmask() & ((1u32 << m) - 1);
             if facing != 0 {
-                let vis = match sun.shadow {
-                    Some(s) => s.lit8(V3 { x: px, y: py, z: pz }, V3 { x: nx, y: ny, z: nz }, facing),
-                    None => std::array::from_fn(|j| if facing & (1 << j) != 0 { 1.0 } else { 0.0 }),
-                };
+                let vis = sun.lit8(V3 { x: px, y: py, z: pz }, V3 { x: nx, y: ny, z: nz }, facing);
                 let e = ndl.max(zero) * f32x8::from(vis);
                 let dir = (f32x8::splat(sun.dir.x), f32x8::splat(sun.dir.y), f32x8::splat(sun.dir.z));
                 // The sun's lux is per channel: colour it in `add`.
@@ -2605,10 +2707,7 @@ pub fn shade_batch(
             if lit == 0 {
                 continue;
             }
-            let vis = match shadows[i] {
-                Some(map) => map.lit8(V3 { x: px, y: py, z: pz }, V3 { x: nx, y: ny, z: nz }, lit),
-                None => std::array::from_fn(|j| if lit & (1 << j) != 0 { 1.0 } else { 0.0 }),
-            };
+            let vis = shadows[i].lit8(V3 { x: px, y: py, z: pz }, V3 { x: nx, y: ny, z: nz }, lit);
             let e = f32x8::splat(l.candela()) / d2 * ndl.max(zero) * f32x8::from(vis);
             add(e, ndl, (lx, ly, lz), l.color, &mut dr, &mut dg, &mut db);
         }
@@ -2630,12 +2729,12 @@ pub fn shade_batch(
 /// no shadow maps.
 pub fn shading_rate(seconds: f64) -> f64 {
     let lights = [
-        PointLight { position: Vec3::new(1.0, 2.0, 1.0), color: Vec3::ONE, lumens: 800.0 },
-        PointLight { position: Vec3::new(-2.0, 1.0, 0.5), color: Vec3::new(1.0, 0.8, 0.6), lumens: 400.0 },
+        PointLight { position: Vec3::new(1.0, 2.0, 1.0), color: Vec3::ONE, lumens: 800.0, ..PointLight::DEFAULT },
+        PointLight { position: Vec3::new(-2.0, 1.0, 0.5), color: Vec3::new(1.0, 0.8, 0.6), lumens: 400.0, ..PointLight::DEFAULT },
     ];
     let in_reach = [0usize, 1];
     let reach = [f32::INFINITY; 2];
-    let shadows: [Option<&CubeShadow>; 2] = [None, None];
+    let shadows = [Shadow::None, Shadow::None];
     let sky = Sky::new(30.0, true);
     let eye = Vec3::new(0.0, 1.0, 5.0);
     // Shaded as a frame shades them: batches of points, eight at a time.
@@ -2758,7 +2857,7 @@ mod tests {
         // barely up.
         let pos = [Vec3::new(-0.25, 0.0, 0.0), Vec3::new(0.0, -3.0, 0.0), Vec3::new(0.25, 0.0, 0.0), Vec3::new(0.0, 0.05, 0.0)];
         scene.push_mesh(&pos, &[], &[Vec3::splat(0.6)], &[0, 1, 2, 0, 2, 3]);
-        let lights = [PointLight { position: Vec3::new(0.07, 0.0, 0.3), color: Vec3::ONE, lumens: 300.0 }];
+        let lights = [PointLight { position: Vec3::new(0.07, 0.0, 0.3), color: Vec3::ONE, lumens: 300.0, ..PointLight::DEFAULT }];
         let (w, h) = (320, 320);
         let cam = cam_at(0.0, w, h, Vec3::new(0.0, -1.2, 0.0), 6.0, 0.0);
         let settings = RenderSettings { shadows: false, bounce: false, ..RenderSettings::new(Sky::new(30.0, true)) };
@@ -2808,7 +2907,7 @@ mod tests {
         let (w, h) = (160, 90);
         let settings = RenderSettings { bounce: false, ..RenderSettings::new(Sky::new(30.0, true)) };
         let cam = |yaw: f32| cam_at(yaw, w, h, Vec3::new(0.0, 2.0, 0.0), 6.0, 0.0);
-        let lights = [PointLight { position: Vec3::new(0.0, 3.0, 3.0), color: Vec3::ONE, lumens: 800.0 }];
+        let lights = [PointLight { position: Vec3::new(0.0, 3.0, 3.0), color: Vec3::ONE, lumens: 800.0, ..PointLight::DEFAULT }];
         let mut r = Renderer::new();
         let mut frame = Frame::new(w, h);
         r.render(&scene, &cam(0.0), &lights, &settings, &mut frame);
@@ -2894,7 +2993,8 @@ mod tests {
         let (scene, mut lights) = world();
         let (w, h) = (240, 135);
         let cam = cam_at(0.0, w, h, Vec3::new(0.0, 0.85, 0.0), 6.0, 0.07);
-        let settings = RenderSettings::new(Sky::new(30.0, true));
+        // Its shadow map is made again, the others kept.
+        let settings = RenderSettings { shadow_fields: false, ..RenderSettings::new(Sky::new(30.0, true)) };
         let mut r = Renderer::new();
         let mut frame = Frame::new(w, h);
         r.render(&scene, &cam, &lights, &settings, &mut frame);
@@ -3174,12 +3274,12 @@ mod tests {
     /// highlight wider and lower.
     #[test]
     fn metal_and_roughness_change_the_light() {
-        let light = [PointLight { position: Vec3::new(0.0, 2.0, 0.0), color: Vec3::ONE, lumens: 1000.0 }];
+        let light = [PointLight { position: Vec3::new(0.0, 2.0, 0.0), color: Vec3::ONE, lumens: 1000.0, ..PointLight::DEFAULT }];
         let shade = |mat: crate::scene::Material, eye: Vec3| {
             let mut b = Batch::default();
             b.push(Vec3::ZERO, Vec3::Y, Vec3::splat(0.5), &mat);
             let (mut d, mut sp) = (vec![Vec3::ZERO], vec![Vec3::ZERO]);
-            shade_batch(&b, eye, Sky::new(0.0, false), false, &light, &[0], &[f32::INFINITY], &[None], &[], &mut d, &mut sp, true);
+            shade_batch(&b, eye, Sky::new(0.0, false), false, &light, &[0], &[f32::INFINITY], &[Shadow::None], &[], &mut d, &mut sp, true);
             (d[0], sp[0])
         };
         let metal = crate::scene::Material { metallic: 1.0, ..Default::default() };
@@ -3200,24 +3300,38 @@ mod tests {
         let mut scene = Scene::new();
         let quad = |c: Vec3, h: f32| [c + Vec3::new(-h, 0.0, h), c + Vec3::new(h, 0.0, h), c + Vec3::new(h, 0.0, -h), c + Vec3::new(-h, 0.0, -h)];
         scene.push_mesh(&quad(Vec3::ZERO, 2.0), &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
+        let card = scene.clusters.len();
         scene.push_mesh(&quad(Vec3::new(0.0, 0.6, 0.0), 0.25), &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
-        let lights = [PointLight { position: Vec3::new(0.0, 1.6, 0.0), color: Vec3::ONE, lumens: 2000.0 }];
+        let n = scene.clusters.len();
+        with_field(&mut scene, card..n);
+        let lights = [PointLight { position: Vec3::new(0.0, 1.6, 0.0), color: Vec3::ONE, lumens: 2000.0, ..PointLight::DEFAULT }];
         let (w, h) = (160, 120);
         // Looking down from the side, so the floor under the card shows.
         let cam = cam_at(0.0, w, h, Vec3::ZERO, 3.0, 1.0);
-        let on = RenderSettings::new(Sky::new(1.0, false));
-        // Every point shaded: adaptive shading refines where the shadow
-        // makes an edge, so a point there can come out a level above its
-        // interpolated self without the shadow.
-        let mut a = Frame::new(w, h);
-        render(&scene, &cam, &lights, &RenderSettings { exposure: 0.01, adaptive: false, ..on }, &mut a);
-        let mut b = Frame::new(w, h);
-        render(&scene, &cam, &lights, &RenderSettings { exposure: 0.01, shadows: false, adaptive: false, ..on }, &mut b);
-        // Pixels where the floor shows in both and differs: under the card's shadow.
-        let darker = a.color.iter().zip(&b.color).filter(|(x, y)| (**x & 0xff) + 20 < (**y & 0xff)).count();
-        assert!(darker > 50, "{darker} pixels darker with shadows");
-        let brighter: Vec<(usize, u32, u32)> = a.color.iter().zip(&b.color).enumerate().filter(|(_, (x, y))| (**x & 0xff) > (**y & 0xff)).map(|(i, (x, y))| (i, *x, *y)).collect();
-        assert!(brighter.is_empty(), "{brighter:x?}");
+        // Through its field and through a map.
+        for fields in [true, false] {
+            let on = RenderSettings { shadow_fields: fields, ..RenderSettings::new(Sky::new(1.0, false)) };
+            // Every point shaded: adaptive shading refines where the shadow
+            // makes an edge, so a point there can come out a level above its
+            // interpolated self without the shadow.
+            let mut a = Frame::new(w, h);
+            render(&scene, &cam, &lights, &RenderSettings { exposure: 0.01, adaptive: false, ..on }, &mut a);
+            let mut b = Frame::new(w, h);
+            render(&scene, &cam, &lights, &RenderSettings { exposure: 0.01, shadows: false, adaptive: false, ..on }, &mut b);
+            // Pixels where the floor shows in both and differs: under the card's shadow.
+            let darker = a.color.iter().zip(&b.color).filter(|(x, y)| (**x & 0xff) + 20 < (**y & 0xff)).count();
+            assert!(darker > 50, "{darker} pixels darker with shadows (fields {fields})");
+            let brighter: Vec<(usize, u32, u32)> = a.color.iter().zip(&b.color).enumerate().filter(|(_, (x, y))| (**x & 0xff) > (**y & 0xff)).map(|(i, (x, y))| (i, *x, *y)).collect();
+            assert!(brighter.is_empty(), "{brighter:x?}");
+        }
+    }
+
+    /// The clusters `range` made an object, its shadow field baked.
+    fn with_field(scene: &mut Scene, range: std::ops::Range<usize>) {
+        let i = scene.add_object("card".into(), range.clone(), Vec3::ZERO, Vec3::ZERO);
+        let (f, _) = crate::field::ShadowField::bake(scene, range, crate::field::RES);
+        scene.fields.push(std::sync::Arc::new(f));
+        scene.objects[i].field = Some(scene.fields.len() - 1);
     }
 
     /// A textured quad is shaded from its tiles, not its vertex colours.
@@ -3401,41 +3515,46 @@ mod tests {
         let mut scene = Scene::new();
         let quad = |c: Vec3, h: f32| [c + Vec3::new(-h, 0.0, h), c + Vec3::new(h, 0.0, h), c + Vec3::new(h, 0.0, -h), c + Vec3::new(-h, 0.0, -h)];
         scene.push_mesh(&quad(Vec3::ZERO, 3.0), &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
+        let card = scene.clusters.len();
         scene.push_mesh(&quad(Vec3::new(0.0, 0.6, 0.0), 0.3), &[], &[Vec3::splat(0.5)], &[0, 1, 2, 0, 2, 3]);
+        let n = scene.clusters.len();
+        with_field(&mut scene, card..n);
         let (w, h) = (160, 120);
         let cam = cam_at(0.0, w, h, Vec3::ZERO, 4.0, 0.5);
-        let off = RenderSettings { bounce: false, cull_backfaces: false, ..RenderSettings::new(Sky::new(30.0, true)) };
-        let mut lit = RenderSettings { ..off };
-        lit.dir_lights[0] = raster::DirLight { on: true, dir: Vec3::Y, color: Vec3::ONE, lux: 300.0 };
-        let (mut a, mut b) = (Frame::new(w, h), Frame::new(w, h));
-        render(&scene, &cam, &[], &off, &mut a);
-        render(&scene, &cam, &[], &lit, &mut b);
-        let (mut brighter, mut shaded, mut sky_same) = (0, 0, true);
-        for y in 0..h {
-            for x in 0..w {
-                let i = y * w + x;
-                if a.tri_id[i] == NO_TRI {
-                    sky_same &= a.color[i] == b.color[i];
-                    continue;
-                }
-                let Some((p, _)) = raster::unproject(&b, &scene, x, y) else { continue };
-                if p.y > 0.01 {
-                    continue;
-                }
-                let (va, vb) = (a.color[i] & 255, b.color[i] & 255);
-                if p.x.abs() < 0.2 && p.z.abs() < 0.2 {
-                    // Under the card: its shadow, straight down.
-                    if vb <= va + 2 {
-                        shaded += 1;
+        for fields in [true, false] {
+            let off = RenderSettings { bounce: false, cull_backfaces: false, shadow_fields: fields, ..RenderSettings::new(Sky::new(30.0, true)) };
+            let mut lit = RenderSettings { ..off };
+            lit.dir_lights[0] = raster::DirLight { on: true, dir: Vec3::Y, color: Vec3::ONE, lux: 300.0, ..Default::default() };
+            let (mut a, mut b) = (Frame::new(w, h), Frame::new(w, h));
+            render(&scene, &cam, &[], &off, &mut a);
+            render(&scene, &cam, &[], &lit, &mut b);
+            let (mut brighter, mut shaded, mut sky_same) = (0, 0, true);
+            for y in 0..h {
+                for x in 0..w {
+                    let i = y * w + x;
+                    if a.tri_id[i] == NO_TRI {
+                        sky_same &= a.color[i] == b.color[i];
+                        continue;
                     }
-                } else if p.x.abs() > 1.0 && vb > va + 20 {
-                    brighter += 1;
+                    let Some((p, _)) = raster::unproject(&b, &scene, x, y) else { continue };
+                    if p.y > 0.01 {
+                        continue;
+                    }
+                    let (va, vb) = (a.color[i] & 255, b.color[i] & 255);
+                    if p.x.abs() < 0.2 && p.z.abs() < 0.2 {
+                        // Under the card: its shadow, straight down.
+                        if vb <= va + 2 {
+                            shaded += 1;
+                        }
+                    } else if p.x.abs() > 1.0 && vb > va + 20 {
+                        brighter += 1;
+                    }
                 }
             }
+            assert!(sky_same, "the backdrop does not change");
+            assert!(brighter > 100, "{brighter} pixels lit");
+            assert!(shaded > 10, "{shaded} pixels in the card's shadow (fields {fields})");
         }
-        assert!(sky_same, "the backdrop does not change");
-        assert!(brighter > 100, "{brighter} pixels lit");
-        assert!(shaded > 10, "{shaded} pixels in the card's shadow");
         let (az, el) = raster::DirLight::angles(raster::DirLight::towards(123.0, 37.0));
         assert!((az - 123.0).abs() < 1e-3 && (el - 37.0).abs() < 1e-3);
     }
@@ -3453,7 +3572,7 @@ mod tests {
         // Every point shaded, as the share is: adaptive shading would
         // interpolate where the fresh render does not.
         let mut settings = RenderSettings { adaptive: false, ..RenderSettings::new(Sky::new(30.0, true)) };
-        settings.dir_lights[0] = raster::DirLight { on: true, dir: raster::DirLight::towards(40.0, 50.0), color: Vec3::new(1.0, 0.9, 0.8), lux: 200.0 };
+        settings.dir_lights[0] = raster::DirLight { on: true, dir: raster::DirLight::towards(40.0, 50.0), color: Vec3::new(1.0, 0.9, 0.8), lux: 200.0, ..Default::default() };
         let mut r = Renderer::new();
         let mut f = Frame::new(w, h);
         r.render(&scene, &cam, &lights, &settings, &mut f);

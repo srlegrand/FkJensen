@@ -94,7 +94,7 @@ impl LightRig {
             return false;
         }
         let color = normalise_colour(LIGHT_COLOURS[self.lights.len() % LIGHT_COLOURS.len()]);
-        self.lights.push(PointLight { position, color, lumens: lumens.clamp(MIN_LUMENS, MAX_LUMENS) });
+        self.lights.push(PointLight { position, color, lumens: lumens.clamp(MIN_LUMENS, MAX_LUMENS), ..PointLight::DEFAULT });
         self.links.resize(self.lights.len() - 1, None);
         self.links.push(None);
         self.selected = self.lights.len() - 1;

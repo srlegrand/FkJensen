@@ -50,17 +50,17 @@ left out keeps the program's own value.
 | `fjs` | format version, 1 |
 | `world` | the geometry outside every object: an `.fja` path, or left out for none; `"built-in"`, from files written before the ground and mountains were objects, gives both as objects |
 | `objects` | objects and groups, in order; a group before what is in it |
-| `lights` | point lights: `position` (metres, in the world), `color` (linear RGB), `lumens` (1 to 2,000,000), `parent` (the object it is parented to, an index into `objects`; it keeps its place relative to it) |
-| `directional` | up to four directional lights: `on`, `azimuth` and `elevation` (degrees; azimuth clockwise from -Z), `color`, `lux` (up to 150,000) |
+| `lights` | point lights: `position` (metres, in the world), `color` (linear RGB), `lumens` (1 to 2,000,000), `size` (its radius, metres: how soft its shadows grow; 0.05 when left out), `falloff` (metres over which its shadows fade with their caster's distance; 0, they do not, when left out), `parent` (the object it is parented to, an index into `objects`; it keeps its place relative to it) |
+| `directional` | up to four directional lights: `on`, `azimuth` and `elevation` (degrees; azimuth clockwise from -Z), `color`, `lux` (up to 150,000), `size` (degrees across; 1 when left out), `falloff` (as a light's) |
 | `time` | time of day, hours; sets the sun, the sky and the exposure before the fields below, which override it |
-| `sun` | `direction` (towards the sun), `color`, `brightness` (0 to 1000) |
+| `sun` | `direction` (towards the sun), `color`, `brightness` (0 to 1000), `size` (degrees across; 0.6 when left out) |
 | `sky` | `on`, `lux`, `tint`, `contrast` (lighting contrast, 0 to 1) |
 | `backdrop` | the sky as seen: `zenith`, `horizon` colours, `contrast` (0 to 1) |
 | `exposure` | display value per cd/m² before the tone curve |
 | `camera` | the perspective camera, Maya's persp: `target`, `distance` (metres), `yaw`, `pitch`, `fov` (degrees) |
 | `cameras` | the scene's cameras: each a `name` and the same fields as `camera` |
 | `view` | the camera the view looks through, by name; persp when absent |
-| `render` | `shadows`, `shadow_res`, `bounce`, `light_reach`, `occlusion_culling`, `adaptive`, `sky_occlusion`, `incremental_moves`, `backface_culling`, `wireframe`, `drag_preview`, `bake_over_frames`, `moving_rate`, `moving_detail` |
+| `render` | `shadows`, `shadow_fields` (true: shadows through the objects' shadow fields; false: shadow maps), `shadow_res` (the maps'), `bounce`, `light_reach`, `occlusion_culling`, `adaptive`, `sky_occlusion`, `incremental_moves`, `backface_culling`, `wireframe`, `drag_preview`, `bake_over_frames`, `moving_rate`, `moving_detail` |
 
 An object:
 

@@ -26,7 +26,9 @@
 //!   fkjensen --png out.png --bench-dir   then turn the first directional light five times, timing each frame
 //!   fkjensen --close                   start on the close framing of the subject
 //!   fkjensen --look ex,ey,ez,tx,ty,tz  camera at e looking at t, in metres
-//!   fkjensen --no-shadows              point lights without shadow maps
+//!   fkjensen --no-shadows              no shadows
+//!   fkjensen --shadow-maps             shadows from shadow maps, not the objects' shadow fields
+//!   fkjensen --build-fields            bake, in memory, the shadow field of an asset that has none
 //!   fkjensen --no-bounce               no bounce light
 //!   fkjensen --hardware                print what this machine is and what FkJensen chooses for it
 //!   fkjensen --fb                      draw to /dev/fb0 even when a display server is running (Linux)
@@ -48,6 +50,8 @@ mod camera;
 mod debug;
 #[cfg(target_os = "linux")]
 mod fbdev;
+mod field;
+mod fieldtrace;
 mod fjs;
 mod fkj;
 mod hardware;
@@ -143,7 +147,7 @@ Controls
   K                      sky on / off          , / .    sky dimmer / brighter (x2)
   H                      light count view: how many lights each pixel evaluates
   X                      light reach off / on (to compare cost and picture)
-  M                      shadow maps on / off
+  M                      shadows on / off
   I                      bounce light on / off
   Z / Shift+Z            render resolution finer / coarser (x1.25)
   V / Shift+V            next / previous visual debug view (--visual-debug)
@@ -400,7 +404,7 @@ impl App {
         let s = &mut self.settings;
         for (k, d) in s.dir_lights.iter_mut().enumerate() {
             *d = match f.directional.get(k) {
-                Some(e) => raster::DirLight { on: e.on, dir: raster::DirLight::towards(e.azimuth, e.elevation), color: v3(e.color), lux: e.lux.clamp(0.0, raster::DIR_MAX_LUX) },
+                Some(e) => raster::DirLight { on: e.on, dir: raster::DirLight::towards(e.azimuth, e.elevation), color: v3(e.color), lux: e.lux.clamp(0.0, raster::DIR_MAX_LUX), size: e.size.clamp(0.0, 20.0), falloff: e.falloff.max(0.0) },
                 None => raster::DirLight::default(),
             };
         }
@@ -408,6 +412,7 @@ impl App {
             s.sun.dir = v3(e.direction).normalize_or(s.sun.dir);
             s.sun.color = v3(e.color);
             s.sun.brightness = e.brightness.clamp(0.0, raster::SUN_MAX);
+            s.sun.size = e.size.clamp(0.0, 20.0);
         }
         if let Some(e) = f.sky {
             s.sky.on = e.on;
@@ -448,6 +453,7 @@ impl App {
             set(&mut s.wireframe, r.wireframe);
             set(&mut s.drag_preview, r.drag_preview);
             set(&mut s.bake_over_frames, r.bake_over_frames);
+            set(&mut s.shadow_fields, r.shadow_fields);
             if let Some(x) = r.moving_rate {
                 s.moving_rate = x.clamp(1.0, 16.0);
             }
@@ -496,11 +502,11 @@ impl App {
             .filter(|d| d.on || **d != raster::DirLight::default())
             .map(|d| {
                 let (az, el) = raster::DirLight::angles(d.dir);
-                fjs::DirEntry { on: d.on, azimuth: round6(az), elevation: round6(el), color: a3(d.color), lux: round6(d.lux) }
+                fjs::DirEntry { on: d.on, azimuth: round6(az), elevation: round6(el), color: a3(d.color), lux: round6(d.lux), size: round6(d.size), falloff: round6(d.falloff) }
             })
             .collect();
         f.time = Some(round6(self.hours));
-        f.sun = Some(fjs::SunEntry { direction: a3(s.sun.dir), color: a3(s.sun.color), brightness: round6(s.sun.brightness) });
+        f.sun = Some(fjs::SunEntry { direction: a3(s.sun.dir), color: a3(s.sun.color), brightness: round6(s.sun.brightness), size: round6(s.sun.size) });
         f.sky = Some(fjs::SkyEntry { on: s.sky.on, lux: round6(s.sky.lux), tint: a3(s.sky.tint), contrast: round6(s.sky.contrast) });
         f.backdrop = Some(fjs::BackdropEntry { zenith: a3(s.backdrop.zenith), horizon: a3(s.backdrop.horizon), contrast: round6(s.backdrop.contrast) });
         f.exposure = Some(s.exposure);
@@ -528,6 +534,7 @@ impl App {
             wireframe: Some(s.wireframe),
             drag_preview: Some(s.drag_preview),
             bake_over_frames: Some(s.bake_over_frames),
+            shadow_fields: Some(s.shadow_fields),
             moving_rate: Some(round6(s.moving_rate)),
             moving_detail: Some(round6(s.moving_detail)),
         });
@@ -1417,7 +1424,7 @@ fn default_rig(scene: &Scene) -> Vec<PointLight> {
     }
     let c = scene.focus_centre();
     let r = scene.focus_radius();
-    vec![PointLight { position: c + Vec3::new(1.2, 1.6, 1.0) * r, color: lights::normalise_colour(lights::LIGHT_COLOURS[1]), lumens: 800.0 }]
+    vec![PointLight { position: c + Vec3::new(1.2, 1.6, 1.0) * r, color: lights::normalise_colour(lights::LIGHT_COLOURS[1]), lumens: 800.0, ..PointLight::DEFAULT }]
 }
 
 /// Frame the subject from the front. Close: from above, filling the view.
@@ -1556,6 +1563,7 @@ fn load_scene(path: &Path) -> Result<(Scene, Option<fjs::SceneFile>), String> {
         _ => {
             let mut scene = load_file(path)?;
             prepare_opened(&mut scene, path);
+            fjs::ensure_fields(&mut scene, &path.display().to_string())?;
             Ok((scene, None))
         }
     }
@@ -1667,8 +1675,8 @@ fn parse_light(s: &str) -> Option<PointLight> {
     let v: Vec<f32> = s.split(',').map(|x| x.trim().parse().ok()).collect::<Option<_>>()?;
     let lumens = |l: f32| l.clamp(scene::MIN_LUMENS, scene::MAX_LUMENS);
     match v.as_slice() {
-        [x, y, z] => Some(PointLight { position: Vec3::new(*x, *y, *z), color: Vec3::ONE, lumens: 800.0 }),
-        [x, y, z, l] => Some(PointLight { position: Vec3::new(*x, *y, *z), color: Vec3::ONE, lumens: lumens(*l) }),
+        [x, y, z] => Some(PointLight { position: Vec3::new(*x, *y, *z), color: Vec3::ONE, lumens: 800.0, ..PointLight::DEFAULT }),
+        [x, y, z, l] => Some(PointLight { position: Vec3::new(*x, *y, *z), color: Vec3::ONE, lumens: lumens(*l), ..PointLight::DEFAULT }),
         _ => None,
     }
 }
@@ -1702,6 +1710,7 @@ fn main() {
     let mut moving: (Option<f32>, Option<f32>) = (None, None);
     let mut bench_drag = false;
     let mut bench_orbit = false;
+    let mut shadow_maps = false;
     let mut use_fb = false;
     let mut look: Option<(Vec3, Vec3)> = None;
     let mut highres: Option<bool> = None;
@@ -1754,7 +1763,7 @@ fn main() {
                     eprintln!("--dir takes azimuth,elevation,lux");
                     std::process::exit(2);
                 }
-                dir_lights.push(raster::DirLight { on: true, dir: raster::DirLight::towards(v[0], v[1]), color: Vec3::ONE, lux: v[2].clamp(0.0, raster::DIR_MAX_LUX) });
+                dir_lights.push(raster::DirLight { on: true, dir: raster::DirLight::towards(v[0], v[1]), color: Vec3::ONE, lux: v[2].clamp(0.0, raster::DIR_MAX_LUX), ..Default::default() });
             }
             "--light-contrast" => {
                 i += 1;
@@ -1833,6 +1842,8 @@ fn main() {
             }
             "--bench-drag" => bench_drag = true,
             "--bench-orbit" => bench_orbit = true,
+            "--build-fields" => fjs::BUILD_MISSING.store(true, std::sync::atomic::Ordering::Relaxed),
+            "--shadow-maps" => shadow_maps = true,
             "--editor" => editor = true,
             "--import" => {
                 i += 1;
@@ -1873,7 +1884,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fjs] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--light-each-drag-step] [--bake-at-once] [--save scene.fjs] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--moving-rate K] [--moving-detail K] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fjs] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--light-each-drag-step] [--bake-at-once] [--save scene.fjs] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--moving-rate K] [--moving-detail K] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--build-fields] [--shadow-maps] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1900,11 +1911,25 @@ fn main() {
     let highres = highres.or(plan.as_ref().map(|p| p.highres)).unwrap_or(true);
 
     let mut scene_file = None;
+    // A scene turned away for lacking shadow fields: the editor starts
+    // without it and offers to build them.
+    let mut turned_away = None;
     let (mut scene, name) = match &path {
         Some(p) => match load_scene(p) {
             Ok((s, f)) => {
                 scene_file = f;
                 (s, p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+            }
+            Err(e) if editor && png_out.is_none() && e.contains(fjs::NO_FIELD) => {
+                eprintln!("{e}");
+                turned_away = Some(e);
+                match built_in_with(highres) {
+                    Ok(s) => (s, "T-rex, car, mountains".into()),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("{e}");
@@ -1934,6 +1959,9 @@ fn main() {
     }
     if let Some(f) = &scene_file {
         app.apply_file(f);
+    }
+    if shadow_maps {
+        app.settings.shadow_fields = false;
     }
     if let Some(h) = hours {
         app.hours = h;
@@ -2073,7 +2101,7 @@ fn main() {
                         eprintln!("--import is for --png (drag a model onto the editor, or File > Import)");
                     }
                     eprintln!("{CONTROLS}");
-                    editor::run(app, path);
+                    editor::run(app, path, turned_away);
                 }
             }
             return;
@@ -2081,6 +2109,7 @@ fn main() {
         #[cfg(not(target_pointer_width = "64"))]
         {
             let _ = &import;
+            let _ = &turned_away;
             eprintln!("--editor is not in this build (64-bit machines only)");
             std::process::exit(2);
         }

@@ -353,6 +353,11 @@ impl Editor {
             if egui::color_picker::color_edit_button_rgb(ui, &mut c).changed() {
                 l.color = lights::normalise_colour(Vec3::from_array(c));
             }
+            ui.end_row();            ui.label("Light Radius").on_hover_text("Metres. The bigger, the softer its shadows grow away from what casts them (shadow fields).");
+            ui.add(super::style::num(&mut l.size).speed(0.002).range(0.0..=10.0).max_decimals(3));
+            ui.end_row();
+            ui.label("Shadow Falloff").on_hover_text("Metres over which its shadows fade with their caster's distance (shadow fields). 0: they do not.");
+            ui.add(super::style::num(&mut l.falloff).speed(0.01).range(0.0..=1000.0).max_decimals(2));
             ui.end_row();
         });
         ui.horizontal_wrapped(|ui| {
@@ -396,6 +401,11 @@ impl Editor {
             if egui::color_picker::color_edit_button_rgb(ui, &mut c).changed() {
                 d.color = lights::normalise_colour(Vec3::from_array(c));
             }
+            ui.end_row();            ui.label("Light Angle").on_hover_text("Degrees across, as it is seen. The bigger, the softer its shadows grow away from what casts them (shadow fields).");
+            ui.add(super::style::slider(&mut d.size, 0.0..=20.0).suffix("°").max_decimals(2));
+            ui.end_row();
+            ui.label("Shadow Falloff").on_hover_text("Metres over which its shadows fade with their caster's distance (shadow fields). 0: they do not.");
+            ui.add(super::style::num(&mut d.falloff).speed(0.01).range(0.0..=1000.0).max_decimals(2));
             ui.end_row();
         });
         ui.horizontal_wrapped(|ui| {
@@ -424,6 +434,9 @@ impl Editor {
             ui.end_row();
             ui.label("Brightness");
             ui.add(super::style::slider(&mut self.app.settings.sun.brightness, 0.0..=raster::SUN_MAX).max_decimals(0));
+            ui.end_row();
+            ui.label("Light Angle").on_hover_text("Degrees across, as it is seen (the real sun's: about 0.53). The bigger, the softer its shadows (shadow fields).");
+            ui.add(super::style::slider(&mut self.app.settings.sun.size, 0.0..=20.0).suffix("°").max_decimals(2));
             ui.end_row();
             let e = self.app.settings.sun.dir.y.clamp(-1.0, 1.0).asin().to_degrees();
             ui.label("Elevation");
@@ -536,13 +549,23 @@ impl Editor {
             ui.label("Shadows");
             ui.checkbox(&mut self.app.settings.shadows, "");
             ui.end_row();
-            ui.label("Shadow map");
-            egui::ComboBox::from_id_salt("shadow res").selected_text(format!("{} texels", self.app.settings.shadow_res)).show_ui(ui, |ui| {
-                for r in [128, 256, 512, 1024, 2048] {
-                    ui.selectable_value(&mut self.app.settings.shadow_res, r, format!("{r} texels"));
-                }
+            ui.label("Shadow method");
+            let method = if self.app.settings.shadow_fields { "Shadow fields" } else { "Shadow maps" };
+            egui::ComboBox::from_id_salt("shadow method").selected_text(method).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.app.settings.shadow_fields, true, "Shadow fields")
+                    .on_hover_text("Each object's baked distance field (opaque surfaces) and leaf density (cut-out foliage), traced towards every light: soft with the light's size, nothing rendered per light.");
+                ui.selectable_value(&mut self.app.settings.shadow_fields, false, "Shadow maps").on_hover_text("A depth map rendered from each light: six per point light.");
             });
             ui.end_row();
+            if !self.app.settings.shadow_fields {
+                ui.label("Shadow map");
+                egui::ComboBox::from_id_salt("shadow res").selected_text(format!("{} texels", self.app.settings.shadow_res)).show_ui(ui, |ui| {
+                    for r in [128, 256, 512, 1024, 2048] {
+                        ui.selectable_value(&mut self.app.settings.shadow_res, r, format!("{r} texels"));
+                    }
+                });
+                ui.end_row();
+            }
             ui.label("Bounce light");
             ui.checkbox(&mut self.app.settings.bounce, "");
             ui.end_row();

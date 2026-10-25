@@ -53,6 +53,7 @@ A reader skips any section whose tag it does not know, using the length.
 | `SAMP` | surface samples and their sky transfer | yes |
 | `MATS` | materials, and which triangle has which | yes |
 | `ALPH` | cut-out masks: per-triangle alpha tiles | yes, streamed from the file |
+| `SHDF` | shadow fields: what each object casts | yes |
 | `PNTS` | points, particles | reserved |
 | `CURV` | curves, fur and hair | reserved |
 | `VOLM` | volumes | reserved |
@@ -174,6 +175,38 @@ point a pixel on screen and level 4 in shadow maps. Bounce light counts a
 masked triangle's surfel at its solid share. The importer spreads surface
 samples, and so sky transfer, only where the mask is solid. Like the
 colour tiles, the pool stays in the file and blocks are read as needed.
+
+## SHDF
+
+Shadow fields (`src/field.rs`, traced in `src/fieldtrace.rs`): for each
+model object, a grid round its geometry, in its own space, from which the
+shadows it casts are traced, for every light, wherever it stands. Every
+model asset must have one: one without is turned away when read, unless
+it is built then (`--build-fields`, or the editor's Missing Shadow Fields
+dialog); the ground, the mountains and a scene's world asset need none.
+Section version 1.
+
+    u32       field count
+    u32       0
+    per field
+      u32       the object it belongs to (an index into OBJS)
+      f32 x 3   the first cell's centre, metres, in the asset's space
+      f32       cell size, metres
+      u32 x 3   cells along x, y and z (x fastest)
+      u32       distance bytes: 0 or the cell count
+      u32       density bytes: 0 or the cell count
+      u8 x n    distance: to the nearest opaque triangle, unsigned, in
+                eighths of a cell, at most 255 (31.9 cells)
+      u8 x n    density: optical depth across a cell, in 64ths, from the
+                solid area of cut-out triangles in it (as thin plates
+                turned every way, each blocking half its area)
+      zero padding to a multiple of 4 bytes
+
+A triangle is cut-out when under 90% of its alpha points are solid; the
+rest are opaque. The grid has 128 cells along the model's longest side
+and one cell of margin round it. Baking takes seconds a model on 2 cores
+(the car 3 s, a 22,000-triangle tree with leaf cards 10 s). Instances
+share their original's field.
 
 ## LODS
 

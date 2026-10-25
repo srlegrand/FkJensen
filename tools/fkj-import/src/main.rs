@@ -24,6 +24,11 @@
 //! of the sky past the model itself as order-2 spherical harmonics.
 //! `fkj-import --sky in.fja -o out.fja` adds them to a file made before.
 //!
+//! Shadow fields (src/field.rs in FkJensen): a grid round the model of the
+//! distance to its opaque surfaces and the density of its cut-out ones,
+//! from which its shadows are traced. `fkj-import --fields a.fja b.fja`
+//! bakes them into files made before, in place.
+//!
 //! Levels of detail (src/lod.rs in FkJensen): the mesh is built into a
 //! cluster hierarchy, each level about half the triangles of the one below,
 //! and every level gets its own tiles from the same textures. `--no-lod`
@@ -45,6 +50,8 @@ mod samples;
 mod transfer;
 #[path = "../../../src/lod.rs"]
 mod lod;
+#[path = "../../../src/field.rs"]
+mod field;
 
 mod fbx;
 mod gltf_in;
@@ -71,6 +78,8 @@ fn main() {
     let mut opts = Options { texel: 0.002, max_level: MAX_LEVEL };
     let mut levels = true;
     let mut sky_only = false;
+    let mut fields_only = false;
+    let mut inputs: Vec<PathBuf> = Vec::new();
     let mut i = 0;
     let num = |a: Option<&String>, what: &str| -> f32 {
         a.and_then(|s| s.parse().ok()).unwrap_or_else(|| {
@@ -110,6 +119,7 @@ fn main() {
             }
             "--no-lod" => levels = false,
             "--sky" => sky_only = true,
+            "--fields" => fields_only = true,
             "--texture" => {
                 texture = args.get(i + 1).map(PathBuf::from);
                 i += 1;
@@ -121,12 +131,28 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fja [--length M | --height M] [--rotate-x DEG] [--rotate-y DEG] [--texel M] [--max-level N] [--textures DIR] [--texture FILE (OBJ)] [--no-lod]\n       fkj-import --sky model.fja -o out.fja   (add surface samples and sky transfer to an .fja made before them)");
+                eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fja [--length M | --height M] [--rotate-x DEG] [--rotate-y DEG] [--texel M] [--max-level N] [--textures DIR] [--texture FILE (OBJ)] [--no-lod]\n       fkj-import --sky model.fja -o out.fja   (add surface samples and sky transfer to an .fja made before them)\n       fkj-import --fields a.fja [b.fja ...]   (bake shadow fields into .fja files made before them, in place)");
                 return;
             }
-            a => input = Some(PathBuf::from(a)),
+            a => {
+                input = Some(PathBuf::from(a));
+                inputs.push(PathBuf::from(a));
+            }
         }
         i += 1;
+    }
+    if fields_only {
+        let mut failed = false;
+        for p in &inputs {
+            match add_field(p) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("{e}");
+                    failed = true;
+                }
+            }
+        }
+        std::process::exit(failed as i32);
     }
     let Some(input) = input else {
         eprintln!("usage: fkj-import model.(glb|gltf|fbx|obj) -o out.fja [--length M | --height M] ...");
@@ -185,6 +211,41 @@ fn main() {
         bytes as f64 / 1e6,
         t0.elapsed().as_secs_f64()
     );
+}
+
+/// Bake a shadow field into the .fja at `path`, in place: written beside
+/// it, then moved over it.
+fn add_field(path: &std::path::Path) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
+    let (mut s, report) = fkj::read_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !report.skipped.is_empty() {
+        return Err(format!("{}: sections this build cannot copy ({}): left as it is", path.display(), report.skipped.join(", ")));
+    }
+    let n = s.clusters.len();
+    if s.objects.iter().all(|o| o.clusters != (0..n)) {
+        s.objects = vec![scene::Object::new(String::new(), 0..n, glam::Vec3::ZERO, glam::Vec3::ZERO, glam::Vec3::ONE, None)];
+    }
+    let i = s.objects.iter().position(|o| o.clusters == (0..n)).unwrap();
+    let (f, r) = field::ShadowField::bake(&s, 0..n, field::RES);
+    eprintln!("{}: shadow field {} x {} x {} cells of {:.1} cm, {} opaque and {} cut-out triangles, {:.1} MB, in {:.1} s", path.display(), f.n[0], f.n[1], f.n[2], f.h * 100.0, r.opaque_tris, r.cutout_tris, f.bytes() as f64 / 1e6, r.seconds);
+    s.fields = vec![std::sync::Arc::new(f)];
+    for o in &mut s.objects {
+        o.field = None;
+    }
+    s.objects[i].field = Some(0);
+    let tmp = path.with_extension("fja.part");
+    let written = std::fs::File::create(&tmp).and_then(|f| {
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+        fkj::write_to(&mut w, &s, &[])?;
+        std::io::Write::flush(&mut w)
+    });
+    drop(s);
+    written.and_then(|_| std::fs::rename(&tmp, path)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })?;
+    eprintln!("wrote {} in {:.1} s", path.display(), t0.elapsed().as_secs_f64());
+    Ok(())
 }
 
 /// Add surface samples and their sky transfer to an .fja made without

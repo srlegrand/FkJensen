@@ -254,9 +254,9 @@ pub fn build() -> Scene {
 pub fn set_lights() -> Vec<PointLight> {
     vec![
         // An 18 kW HMI's worth, high and to the front left.
-        PointLight { position: Vec3::new(-14.0, 16.0, 18.0), color: normalise_colour(Vec3::new(1.0, 0.85, 0.7)), lumens: 1_000_000.0 },
-        PointLight { position: Vec3::new(16.0, 5.0, 6.0), color: normalise_colour(Vec3::new(0.7, 0.8, 1.0)), lumens: 40_000.0 },
-        PointLight { position: Vec3::new(3.0, 10.0, -16.0), color: normalise_colour(Vec3::new(1.0, 1.0, 1.0)), lumens: 200_000.0 },
+        PointLight { position: Vec3::new(-14.0, 16.0, 18.0), color: normalise_colour(Vec3::new(1.0, 0.85, 0.7)), lumens: 1_000_000.0, ..PointLight::DEFAULT },
+        PointLight { position: Vec3::new(16.0, 5.0, 6.0), color: normalise_colour(Vec3::new(0.7, 0.8, 1.0)), lumens: 40_000.0, ..PointLight::DEFAULT },
+        PointLight { position: Vec3::new(3.0, 10.0, -16.0), color: normalise_colour(Vec3::new(1.0, 1.0, 1.0)), lumens: 200_000.0, ..PointLight::DEFAULT },
     ]
 }
 
@@ -266,8 +266,8 @@ pub fn set_lights() -> Vec<PointLight> {
 #[cfg(test)]
 pub fn small_lights() -> Vec<PointLight> {
     vec![
-        PointLight { position: Vec3::new(-0.2, 1.1, 0.22), color: normalise_colour(Vec3::new(1.0, 0.8, 0.6)), lumens: 400.0 },
-        PointLight { position: Vec3::new(0.3, 1.0, -0.25), color: normalise_colour(Vec3::new(0.65, 0.8, 1.0)), lumens: 120.0 },
+        PointLight { position: Vec3::new(-0.2, 1.1, 0.22), color: normalise_colour(Vec3::new(1.0, 0.8, 0.6)), lumens: 400.0, ..PointLight::DEFAULT },
+        PointLight { position: Vec3::new(0.3, 1.0, -0.25), color: normalise_colour(Vec3::new(0.65, 0.8, 1.0)), lumens: 120.0, ..PointLight::DEFAULT },
     ]
 }
 

@@ -221,6 +221,12 @@ pub struct DirLight {
     /// Linear RGB, luminance 1 (`lights::normalise_colour`).
     pub color: Vec3,
     pub lux: f32,
+    /// How wide it looks, degrees across: the wider, the softer its
+    /// shadows grow with distance from what casts them (shadow fields).
+    pub size: f32,
+    /// Distance over which its shadows fade with their occluder's
+    /// distance, metres; 0: they do not.
+    pub falloff: f32,
 }
 
 /// Brightest a directional light may be: a little over full summer sun.
@@ -228,7 +234,7 @@ pub const DIR_MAX_LUX: f32 = 150_000.0;
 
 impl Default for DirLight {
     fn default() -> Self {
-        DirLight { on: false, dir: DirLight::towards(210.0, 40.0), color: Vec3::ONE, lux: 2_000.0 }
+        DirLight { on: false, dir: DirLight::towards(210.0, 40.0), color: Vec3::ONE, lux: 2_000.0, size: 1.0, falloff: 0.0 }
     }
 }
 
@@ -263,13 +269,19 @@ pub struct Sun {
     pub dir: Vec3,
     pub color: Vec3,
     pub brightness: f32,
+    /// How wide it looks, degrees across (the real sun: about 0.53).
+    pub size: f32,
 }
+
+/// The sun's width at start, degrees: a little over the real one, so its
+/// shadows soften as they do on film.
+pub const SUN_SIZE: f32 = 0.6;
 
 pub const SUN_MAX: f32 = 1000.0;
 
 impl Default for Sun {
     fn default() -> Self {
-        Sun { dir: Vec3::new(0.3, 0.7, 0.6).normalize(), color: Vec3::ONE, brightness: 0.0 }
+        Sun { dir: Vec3::new(0.3, 0.7, 0.6).normalize(), color: Vec3::ONE, brightness: 0.0, size: SUN_SIZE }
     }
 }
 
@@ -344,8 +356,11 @@ pub struct RenderSettings {
     pub sun: Sun,
     /// Skip lights at pixels beyond their reach. Off only to compare.
     pub light_reach: bool,
-    /// Shadow maps for the point lights.
+    /// Shadows at all.
     pub shadows: bool,
+    /// Shadows traced through each object's shadow field (`field.rs`), for
+    /// every light; off: shadow maps.
+    pub shadow_fields: bool,
     /// Texels per cube face edge of each shadow map.
     pub shadow_res: usize,
     /// Bucket edge in pixels.
@@ -407,7 +422,7 @@ impl RenderSettings {
     }
 
     pub fn new(sky: Sky) -> Self {
-        Self { cull_backfaces: true, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true, sky_occlusion: true, dir_lights: [DirLight::default(); MAX_DIR_LIGHTS], drag_preview: true, bake_over_frames: true, moving_rate: MOVING_RATE, moving_detail: MOVING_DETAIL }
+        Self { cull_backfaces: true, wireframe: false, exposure: default_exposure(sky.lux), sky, backdrop: Backdrop::default(), sun: Sun::default(), light_reach: true, shadows: true, shadow_fields: true, shadow_res: crate::shadow::SHADOW_RES, tile: TILE, bounce: true, bounce_budget_ms: None, view: View::Shaded, cache_budget: CACHE_BUDGET, shading_rate_px: SHADING_RATE_PX, occlusion: true, adaptive: true, incremental_moves: true, sky_occlusion: true, dir_lights: [DirLight::default(); MAX_DIR_LIGHTS], drag_preview: true, bake_over_frames: true, moving_rate: MOVING_RATE, moving_detail: MOVING_DETAIL }
     }
 }
 
@@ -1296,7 +1311,7 @@ mod tests {
     #[test]
     fn sun_at_1000_is_full_white_and_0_is_nothing() {
         for exposure in [0.0001, 0.01, 1.0] {
-            let sun = Sun { dir: Vec3::Y, color: Vec3::ONE, brightness: SUN_MAX };
+            let sun = Sun { dir: Vec3::Y, color: Vec3::ONE, brightness: SUN_MAX, size: SUN_SIZE };
             // A white surface facing it.
             let shown = tonemap(sun.lux(exposure) / std::f32::consts::PI * exposure);
             assert!((shown - Vec3::ONE).abs().max_element() < 1e-4, "{shown}");
@@ -1346,7 +1361,7 @@ mod tests {
         let (w, h) = (320, 200);
         let mut frame = Frame::new(w, h);
         let settings = settings();
-        let lights = [PointLight { position: Vec3::new(0.0, 0.0, 3.0), color: Vec3::ONE, lumens: 100.0 }];
+        let lights = [PointLight { position: Vec3::new(0.0, 0.0, 3.0), color: Vec3::ONE, lumens: 100.0, ..PointLight::DEFAULT }];
         render(&scene, &camera(w, h), &lights, &settings, &mut frame);
         assert_eq!(frame.stats.tris_drawn, 2);
         assert_ne!(frame.tri_id[h / 2 * w + w / 2], NO_TRI);
@@ -1383,9 +1398,9 @@ mod tests {
         assert_ne!(dark.tri_id[centre], NO_TRI);
         assert_eq!(dark.color[centre], 0, "no lights, no sky: the quad is black");
         let mut lit = Frame::new(w, h);
-        let near_light = [PointLight { position: Vec3::new(0.0, 0.0, 0.5), color: Vec3::ONE, lumens: 50.0 }];
+        let near_light = [PointLight { position: Vec3::new(0.0, 0.0, 0.5), color: Vec3::ONE, lumens: 50.0, ..PointLight::DEFAULT }];
         render(&scene, &camera(w, h), &near_light, &settings, &mut lit);
-        let far_light = [PointLight { position: Vec3::new(0.0, 0.0, 2.0), color: Vec3::ONE, lumens: 50.0 }];
+        let far_light = [PointLight { position: Vec3::new(0.0, 0.0, 2.0), color: Vec3::ONE, lumens: 50.0, ..PointLight::DEFAULT }];
         let mut dim = Frame::new(w, h);
         render(&scene, &camera(w, h), &far_light, &settings, &mut dim);
         let g = |c: u32| (c >> 8) & 0xff;
@@ -1453,7 +1468,7 @@ mod tests {
         let sky = Sky::new(30.0, true);
         let cut = cut_lux(&sky, default_exposure(sky.lux));
         for lm in [12.0, 400.0, 12_000.0, crate::scene::MAX_LUMENS] {
-            let l = PointLight { position: Vec3::ZERO, color: Vec3::ONE, lumens: lm };
+            let l = PointLight { position: Vec3::ZERO, color: Vec3::ONE, lumens: lm, ..PointLight::DEFAULT };
             let r = light_reach(&l, cut);
             assert!((l.lux_at(r) / cut - 1.0).abs() < 1e-3);
         }
@@ -1470,7 +1485,7 @@ mod tests {
         // Off to the side so the near sphere does not hide it.
         let far: Vec<Vec3> = p.iter().map(|v| *v * 50.0 + Vec3::new(180.0, 0.0, -400.0)).collect();
         scene.push_mesh(&far, &[], &[], &idx);
-        let lights = [PointLight { position: Vec3::new(0.0, 1.5, 1.5), color: Vec3::ONE, lumens: 400.0 }];
+        let lights = [PointLight { position: Vec3::new(0.0, 1.5, 1.5), color: Vec3::ONE, lumens: 400.0, ..PointLight::DEFAULT }];
         let (w, h) = (200, 150);
         let settings = RenderSettings::new(Sky::new(30.0, true));
         let mut culled = Frame::new(w, h);

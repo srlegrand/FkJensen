@@ -15,6 +15,7 @@ pub mod paint;
 mod cameras;
 mod create;
 mod edit;
+mod fields;
 mod materials;
 mod navigate;
 mod panels;
@@ -117,6 +118,8 @@ pub struct Editor {
     pub path: Option<PathBuf>,
     browser: Option<(Browser, Purpose)>,
     pub importer: Option<importer::Importer>,
+    /// Assets turned away for lacking a shadow field, offered to be built.
+    fields_wanted: Option<fields::Wanted>,
     /// The last thing done or gone wrong, shown in the status bar.
     message: Option<(String, bool, Instant)>,
     /// An object moved from the attribute editor: its bounce light is made
@@ -178,6 +181,7 @@ impl Editor {
             path: None,
             browser: None,
             importer: None,
+            fields_wanted: None,
             message: None,
             pending_bounce: None,
             captured: [false; 3],
@@ -570,7 +574,11 @@ impl Editor {
                 self.last_selection = Selection::Nothing;
                 self.pending_bounce = None;
             }
-            Err(e) => self.say(e, true),
+            Err(e) => {
+                if !self.offer_fields(&e, fields::Then::Open(path)) {
+                    self.say(e, true);
+                }
+            }
         }
     }
 
@@ -604,7 +612,11 @@ impl Editor {
                 self.select(Selection::Object(first));
                 self.say(format!("added {name} from {} ({} triangles in all its levels)", path.display(), importer::thousands(tris)), false);
             }
-            Err(e) => self.say(e, true),
+            Err(e) => {
+                if !self.offer_fields(&e, fields::Then::Add(path)) {
+                    self.say(e, true);
+                }
+            }
         }
     }
 
@@ -637,8 +649,11 @@ impl Editor {
     /// Put an imported model in the scene, at the origin, as one object.
     fn add_model(&mut self, mut model: crate::scene::Scene, name: String) {
         let n = model.clusters.len();
+        // The shadow field baked with it stays its.
+        let field = model.objects.first().and_then(|o| o.field);
         model.objects.clear();
-        model.add_object(name.clone(), 0..n, glam::Vec3::ZERO, glam::Vec3::ZERO);
+        let i = model.add_object(name.clone(), 0..n, glam::Vec3::ZERO, glam::Vec3::ZERO);
+        model.objects[i].field = field;
         model.scatter_missing_samples();
         let tris = model.triangle_count();
         let first = self.app.scene.objects.len();
@@ -741,6 +756,7 @@ impl Editor {
                 }
             }
         }
+        self.fields_dialog(&ctx);
     }
 
     fn menu(&mut self, ui: &mut egui::Ui) {
@@ -1093,9 +1109,16 @@ impl ApplicationHandler for Runner {
 }
 
 /// Run the editor in a window until it is closed.
-pub fn run(app: App, scene_path: Option<PathBuf>) {
+/// `turned_away`: why `scene_path` could not be read (it lacks shadow
+/// fields), offered to be built.
+pub fn run(app: App, scene_path: Option<PathBuf>, turned_away: Option<String>) {
     let mut ed = Editor::new(app);
-    ed.path = scene_path;
+    match (turned_away, scene_path) {
+        (Some(e), Some(p)) => {
+            ed.offer_fields(&e, fields::Then::Open(p));
+        }
+        (_, p) => ed.path = p,
+    }
     let event_loop = match EventLoop::new() {
         Ok(e) => e,
         Err(e) => {
@@ -1721,7 +1744,7 @@ mod tests {
         ed.app.hours = 15.25;
         ed.app.apply_daylight();
         ed.app.settings.adaptive = false;
-        ed.app.settings.dir_lights[1] = crate::raster::DirLight { on: true, dir: crate::raster::DirLight::towards(100.0, 30.0), color: glam::Vec3::new(1.0, 0.5, 0.25), lux: 5000.0 };
+        ed.app.settings.dir_lights[1] = crate::raster::DirLight { on: true, dir: crate::raster::DirLight::towards(100.0, 30.0), color: glam::Vec3::new(1.0, 0.5, 0.25), lux: 5000.0, ..Default::default() };
         ed.app.cam.yaw = 0.7;
         let dir = std::env::temp_dir().join(format!("fkj-editor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1776,6 +1799,36 @@ mod tests {
         assert_eq!(ed.app.scene.objects[1].clusters.start, before);
         assert_eq!(ed.app.selection, Selection::Object(1));
         ed.frame(raw(800, 500), 800, 500);
+    }
+
+    /// An asset without a shadow field is turned away with the dialog up;
+    /// built into the asset, it is added.
+    #[test]
+    fn missing_fields_are_offered_then_built() {
+        let mut ed = editor();
+        let dir = std::env::temp_dir().join(format!("fkj-fields-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ball.fja");
+        crate::fjs::write_asset(&ed.app.scene, 0, &path).unwrap();
+        assert!(!crate::fkj::has_section(&path, crate::fkj::TAG_SHDF).unwrap());
+        let n = ed.app.scene.objects.len();
+        ed.add_asset(path.clone());
+        assert_eq!(ed.app.scene.objects.len(), n, "turned away");
+        assert!(ed.fields_wanted.is_some());
+        for _ in 0..3 {
+            ed.frame(raw(900, 600), 900, 600);
+        }
+        if let Ok(p) = std::env::var("FKJ_EDITOR_SHOT") {
+            let frame = crate::raster::Frame { width: 900, height: 600, color: ed.buf.clone(), ..crate::raster::Frame::new(1, 1) };
+            crate::save_png(&frame, &p.replace(".png", "_fields.png")).unwrap();
+        }
+        crate::fjs::build_field_into(&path).unwrap();
+        assert!(crate::fkj::has_section(&path, crate::fkj::TAG_SHDF).unwrap());
+        ed.fields_wanted = None;
+        ed.add_asset(path);
+        assert_eq!(ed.app.scene.objects.len(), n + 1);
+        assert!(ed.app.scene.objects[n].field.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The editor draws a whole frame: panels, text and the viewport.

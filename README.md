@@ -52,8 +52,9 @@ set opens with three lights sized like film lights on a night exterior: a
 **The sun.** Infinitely far: parallel light and parallel shadows, the same
 on everything in the scene, with no reach. Its brightness runs from 0
 (none) to 1000, which lights a white surface facing it to full white at the
-current exposure; it is not in lumens. Its shadows come from an
-orthographic shadow map in three cascades round the subject (about 1.6
+current exposure; it is not in lumens. Its shadows come from the
+objects' shadow fields (Shadows, below); with shadow maps chosen instead,
+from an orthographic shadow map in three cascades round the subject (about 1.6
 times its radius, 600 m, 25 km), each 4 times the point lights' texels a
 side, up to 2048, read with the same 3 x 3 filter (`src/sun.rs`).
 
@@ -102,12 +103,40 @@ is set by its illuminance on an upward-facing surface, in lux; the set
 opens at 30 lux, dusk. The sky behind the scene is drawn from the same
 values.
 
-**Shadows.** The sun's map is above. Each point light has a cube shadow map, 512 x 512 per face
+**Shadows.** Every light's shadows, the sun's, the directional lights'
+and the point lights', come from the objects' shadow fields
+(`src/field.rs`, `src/fieldtrace.rs`): baked once with each model, a grid
+round it in its own space holding, per cell, how far the nearest opaque
+surface is (a distance field) and, for cut-out leaves on cards, how much
+they block (an optical depth). A shading point's ray towards a light
+steps through each field it passes, in the object's own space, so a
+field is good wherever its object stands, turned or scaled, and is shared
+by its instances. How close the ray passes a surface against how far it
+has gone (`d / (k t)`, `k` the light's size) is the penumbra (Quilez's
+soft-shadow estimate), so a shadow is sharp where its caster touches what
+it falls on and soft further off; leaves dapple as `exp(-depth)`. Each
+light has a size (Light Radius for a point light, 5 cm at start; Light
+Angle for the sun, 0.6 degrees, and a directional light, 1) and a Shadow
+Falloff, the distance over which its shadows fade with their caster's
+distance (0: they do not). Eight rays step together in eight lanes.
+Nothing is drawn per light: a moved light only shades again.
+
+Every model asset must carry its field (`SHDF`, `docs/format.md`):
+`fkj-import` bakes it on import, and one without is turned away when
+read (`--build-fields` bakes missing ones in memory; the editor offers to
+bake them into the assets). The ground, the mountains and a scene's world
+asset cast none. The idea of baking per-object shadow data that sharpens
+near the caster is Simon Legrand's; prior art: Zhou et al., Precomputed
+Shadow Fields (2005); Unreal Engine's mesh distance field shadows (Wright,
+2015).
+
+Shadow maps stay, under Render settings > Shadow method or `--shadow-maps`.
+Each point light then has a cube shadow map, 512 x 512 per face
 (Williams 1978), read with a 3 x 3 percentage-closer filter for soft edges
 (Reeves, Salesin, Cook 1987) and a normal offset against self-shadowing.
 A map only holds the geometry inside its light's reach: whatever can shadow
 a point the light reaches is nearer the light than that point. Maps are
-kept until their light moves or changes strength. `M` turns them off. The
+kept until their light moves or changes strength. `M` turns shadows off, fields or maps. The
 sky has no shadow map: what objects take of it is under Sky occlusion,
 below.
 
@@ -343,6 +372,13 @@ copying everything else:
 
     tools/fkj-import/target/release/fkj-import --sky assets/models/trex_highres.fkj -o trex_highres_sky.fkj
 
+Each model also gets its shadow field (Shadows, above): 3 s for the car
+and 10 s for a 22,000-triangle tree on 2 cores. An asset made before this
+has none and is turned away when read; `--fields` bakes one into each
+asset named, in place:
+
+    tools/fkj-import/target/release/fkj-import --fields assets/models/car.fja assets/models/trex.fja
+
 An OBJ's materials are not read: `--texture` gives its base colour
 texture. The high-resolution T-rex is a ZBrush export with the same UVs as
 the glTF one, so it takes the glTF's base colour texture.
@@ -549,7 +585,10 @@ Headless, for tests and screenshots (no window, no display needed):
 - `--exposure E` sets the display value per cd/m².
 - `--view lights` writes the light count view.
 - `--no-reach` evaluates every light at every point, to compare.
-- `--no-shadows` turns shadow maps off.
+- `--no-shadows` turns shadows off.
+- `--shadow-maps` uses shadow maps instead of shadow fields.
+- `--build-fields` bakes, in memory, the shadow field of any asset read
+  without one, instead of turning it away.
 - `--no-bounce` turns bounce light off.
 - `--close` starts on the close framing.
 - `--look ex,ey,ez,tx,ty,tz` puts the camera at e looking at t, in metres.
@@ -615,7 +654,7 @@ of each pass in milliseconds.
     K                      sky on / off          , / .    sky dimmer / brighter (x2)
     H                      light count view: how many lights each pixel evaluates
     X                      light reach off / on (to compare cost and picture)
-    M                      shadow maps on / off
+    M                      shadows on / off
     I                      bounce light on / off
     Z / Shift+Z            render resolution finer / coarser (x1.25)
     V / Shift+V            next / previous visual debug view (--visual-debug)
@@ -945,6 +984,17 @@ bounce light. `src/texture.rs` is the texture tiles and their cache;
 
 ## Measured
 
+Shadow fields against shadow maps (25/10/2026), 2 cores of an Intel Xeon
+at 2.1 GHz, 960 x 540, the night scene (the high-resolution T-rex, the
+car with its six lamps, 25 instanced trees, a 20 lux directional rim
+light): with only the six lamps, fields 2.3 s of shading against maps
+0.63 s to draw plus 0.74 s of shading; with only the rim light, 1.0 s
+against 0.24 s plus 0.59 s. The whole frame with bounce light: 25.6 s
+against 22.7 s, of which lighting the surfels 4.9 s against 2.9 s.
+Fields cost more where many points trace through the object they lie on
+towards a light close by (the car under its own lamps, the T-rex beside
+them); nothing is drawn when a light moves.
+
 Eight-wide SIMD (`src/simd.rs`, the `wide` crate): shading, shadow map
 lookups and fills, and the bounce raster's texel loops work on eight
 points or texels at a time. Same machine (2 cores of an Intel Xeon at
@@ -1139,6 +1189,12 @@ Not measured yet: a Raspberry Pi.
 ## Not done yet
 
 - Reflections (environment and per-object cube maps): not started.
+- Shadow fields: the ground, the mountains and a scene's world asset
+  have none, so they cast no shadow (the mountains do not shadow
+  themselves); under shadow maps they do. A field's grid is 128 cells
+  along its model's longest side, so detail under a cell (3.9 cm on the
+  car) casts no shadow of its own. Lights are not linked: a lamp inside
+  its car's field is shadowed by the car's own surfaces round it.
 - Visual debug views: no view yet for culling (frustum and normal cone),
   for the surfel tree, or for the texture cache over time; text is a 5 x 7
   pixel font in capitals.

@@ -54,7 +54,7 @@ Read `LLM_instructions.md` too: the checks to run first and how changes are deli
 
 Each effect uses the CPU-era cheat for it, cached and invalidated by light reach:
 
-- Shadows: one cube shadow map per point light, covering its reach, re-rendered only when the light or geometry in its reach moves (Williams 1978), filtered for soft edges (Reeves, Salesin, Cook 1987). Deep shadow maps for fur and volumes (Lokovic, Veach 2000).
+- Shadows: each object's shadow field, baked with its asset (a distance field for opaque surfaces, an optical depth for cut-out leaves), traced from each shading point towards each light in the object's own space; soft with the light's size (Zhou et al. 2005; Wright 2015; Quilez). Kept as the alternative: one cube shadow map per point light, covering its reach, re-rendered only when the light or geometry in its reach moves (Williams 1978), filtered for soft edges (Reeves, Salesin, Cook 1987). Deep shadow maps for fur and volumes (Lokovic, Veach 2000).
 - Reflections: environment maps, and a cube map rendered from each reflective object, as 3D Studio's Auto Reflect did (Blinn, Newell 1976). Re-rendered only when something it sees changes.
 - Bounce light: the lit micropolygon cache is gathered into a tree of micro lights, far ones merged, near ones kept apart (point-based colour bleeding, Christensen 2008; Lightcuts). The automatic form of placing 16 to 32 lights on a hemisphere to fake GI.
 - Soft sky light: spherical harmonics and precomputed transfer where they fit (Sloan, Kautz, Snyder 2002).
@@ -74,6 +74,8 @@ Each effect uses the CPU-era cheat for it, cached and invalidated by light reach
 - Credit: FkJensen was created by Simon Legrand.
 
 ## Log
+
+- 25/10/2026: shadow fields are the shadows of every light: each model asset carries a grid in its own space (`SHDF`): the distance to its nearest opaque surface, and the optical depth of its cut-out leaves. Shading points trace them towards each light, eight rays a step in eight lanes, penumbra from how close a ray passes against how far it has gone, so shadows sharpen at contact and soften with distance; per-light size and falloff. Nothing is drawn per light. Every asset must have its field: baked at import, `fkj-import --fields` for older ones, turned away without it (or baked on the spot on request). Shadow maps stay as the alternative. The idea is Simon Legrand's.
 
 - 25/10/2026: Freeze Transformations (Modify menu), each channel on its own: rotate and scale fold into a matrix kept per object, translate into an origin the translate counts from; nothing moves. An object's and its clusters' transforms are made again from its channels and quantisation boxes at each move, not from the last move, so a scale to 1e-6 and back keeps its precision. Viewport overlays each toggled in the Show menu.
 - 25/10/2026: scale along an object's own axes (non-uniform), as Maya's: a cluster's normals take a matrix (the inverse transpose of its object's transform) instead of a rotation; normal cones are dropped for stretched objects. Move handles end in cones, scale handles in blocks along the object's own axes. Several objects can be selected in the outliner (Ctrl, Shift), parented, grouped and deleted together.
