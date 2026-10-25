@@ -29,6 +29,7 @@
 //!   fkjensen --no-shadows              no shadows
 //!   fkjensen --shadow-maps             shadows from shadow maps, not the objects' shadow fields
 //!   fkjensen --build-fields            bake, in memory, the shadow field of an asset that has none
+//!   fkjensen --no-overlays             no lights, cameras, boxes or manipulators drawn over the picture
 //!   fkjensen --no-bounce               no bounce light
 //!   fkjensen --hardware                print what this machine is and what FkJensen chooses for it
 //!   fkjensen --fb                      draw to /dev/fb0 even when a display server is running (Linux)
@@ -1711,6 +1712,7 @@ fn main() {
     let mut bench_drag = false;
     let mut bench_orbit = false;
     let mut shadow_maps = false;
+    let mut no_overlays = false;
     let mut use_fb = false;
     let mut look: Option<(Vec3, Vec3)> = None;
     let mut highres: Option<bool> = None;
@@ -1844,6 +1846,7 @@ fn main() {
             "--bench-orbit" => bench_orbit = true,
             "--build-fields" => fjs::BUILD_MISSING.store(true, std::sync::atomic::Ordering::Relaxed),
             "--shadow-maps" => shadow_maps = true,
+            "--no-overlays" => no_overlays = true,
             "--editor" => editor = true,
             "--import" => {
                 i += 1;
@@ -1884,7 +1887,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: fkjensen [scene.fjs] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--light-each-drag-step] [--bake-at-once] [--save scene.fjs] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--moving-rate K] [--moving-detail K] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--build-fields] [--shadow-maps] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
+                eprintln!("usage: fkjensen [scene.fjs] [--png out.png] [--size WxH] [--light x,y,z[,lumens]] [--time HH:MM] [--sun 0-1000] [--dir AZ,EL,LUX] [--light-contrast 0-1] [--sky-contrast 0-1] [--sky LUX] [--exposure E] [--view lights] [--no-reach] [--no-occlusion] [--no-adaptive] [--no-sky-occlusion] [--relight-on-move] [--light-each-drag-step] [--bake-at-once] [--save scene.fjs] [--[no-]shadows] [--[no-]bounce] [--[no-]highres] [--shadow-res N] [--scale F] [--shading-rate PX] [--moving-rate K] [--moving-detail K] [--no-auto] [--hardware] [--close] [--look ex,ey,ez,tx,ty,tz] [--build-fields] [--shadow-maps] [--no-overlays] [--bench-drag] [--bench-orbit] [--bench-move] [--bench-dir] [--fb] [--visual-debug] [--debug-view NAME|all] [--select N] [--editor [--import MODEL]]\n{CONTROLS}");
                 return;
             }
             a => path = Some(PathBuf::from(a)),
@@ -1962,6 +1965,10 @@ fn main() {
     }
     if shadow_maps {
         app.settings.shadow_fields = false;
+    }
+    if no_overlays {
+        app.overlays = Overlays { selection: false, manipulator: false, cameras: false, light_line: false };
+        app.rig.show = false;
     }
     if let Some(h) = hours {
         app.hours = h;

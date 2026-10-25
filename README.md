@@ -1,10 +1,23 @@
 # FkJensen
 
-A 3D viewport that renders on the CPU and nothing else, following the path
-3D graphics would have taken if GPUs had never existed (see
-`DESIGN_PHILOSOPHY.md`): REYES-style shading kept between frames, shadow
-maps, point-based bounce light, no ray tracing. No GPU API is linked; the frame is made on the cores
-with rayon and copied to the window through shared memory (softbuffer).
+A 3D viewport and editor that renders on the CPU and nothing else. No GPU
+API is linked: the frame is made on the cores with rayon and copied to the
+window through shared memory (softbuffer), or straight to the Linux
+framebuffer where there is no window system.
+
+The name: Fuck Jensen. Jensen Huang co-founded Nvidia, whose graphics cards
+have been priced out of reach of the people who make pictures with them.
+
+The aim is one program that runs the same scenes on anything from a
+Raspberry Pi 1 to a Threadripper, without a GPU at all: it measures the
+machine it starts on and picks its own resolution, shading rate, level of
+detail and caches to fit (Fitting the machine, below). It follows the path
+3D graphics would have taken if GPUs had never existed
+(`DESIGN_PHILOSOPHY.md`): REYES-style micropolygons shaded once and kept
+between frames, shadows traced through per-object shadow fields baked
+with each model, point-based bounce light, sky occlusion precomputed per
+model, no ray tracing against triangles. `docs/whitepaper.md` sets out the
+design and what it costs.
 
 It does not read USD. A scene is an `.fjs` file, a small JSON file
 (`docs/scene.md`) that points at `.fja` assets and says where each stands,
@@ -31,9 +44,15 @@ open ground, and they get no surface samples.
 On machines whose plan leaves it out (see Fitting the machine), the T-rex is
 its 28 K-triangle version.
 
-![The set from the wide view](docs/set_wide.png)
+![The set from the wide view (25/10/2026)](docs/set_wide.png)
 
-![The set from the close view](docs/set_close.png)
+![The set from the close view (25/10/2026)](docs/set_close.png)
+
+`assets/night_forest.fjs` is a night scene over the same models: the car
+with its six lamps parented to it, 25 instances of one tree under a group,
+a moonlit directional rim light, every shadow from shadow fields.
+
+![The night scene through its camera, shotCam: 1280 x 720 in 29 s on 2 cores of a Xeon at 2.1 GHz, bounce light included (25/10/2026)](docs/night.png)
 
 ## Light
 
@@ -130,6 +149,8 @@ near the caster is Simon Legrand's; prior art: Zhou et al., Precomputed
 Shadow Fields (2005); Unreal Engine's mesh distance field shadows (Wright,
 2015).
 
+![A low sun with a Light Angle of 0.3 degrees (left) and 6 degrees (right): the pole's shadow is sharp at its foot either way and widens away from it](docs/soft_shadows.png)
+
 Shadow maps stay, under Render settings > Shadow method or `--shadow-maps`.
 Each point light then has a cube shadow map, 512 x 512 per face
 (Williams 1978), read with a 3 x 3 percentage-closer filter for soft edges
@@ -143,8 +164,9 @@ below.
 **Bounce light.** Point-based colour bleeding (Christensen 2008), no rays
 (`src/bounce.rs`). The surfaces become a cloud of discs (surfels): one per
 large triangle, up to six per small cluster binned by facing, 561,573 for
-the built-in set. Each is lit directly, by the sky and the point lights
-through their shadow maps: that lit cloud is the set of micro lights. The
+the built-in set. Each is lit directly, by the sky, the sun, the directional lights and
+the point lights, through their shadows (fields or maps), eight at a
+time: that lit cloud is the set of micro lights. The
 surfels sit in a tree whose nodes carry summed area, normal and mean
 radiance.
 
@@ -591,6 +613,8 @@ Headless, for tests and screenshots (no window, no display needed):
 - `--build-fields` bakes, in memory, the shadow field of any asset read
   without one, instead of turning it away.
 - `--no-bounce` turns bounce light off.
+- `--no-overlays` draws no lights, cameras, selection boxes or
+  manipulators over the picture.
 - `--close` starts on the close framing.
 - `--look ex,ey,ez,tx,ty,tz` puts the camera at e looking at t, in metres.
 - `--no-highres` uses the 28 K-triangle T-rex instead of the 10.8 M one,
@@ -714,12 +738,14 @@ the window manager's modifier to Meta for Alt to tumble here.
 with egui, on the CPU like everything else: egui's triangles are filled by
 `src/editor/paint.rs` into the buffer the frame is copied into.
 
-![The editor with the T-rex selected (23/10/2026)](docs/editor.png)
+![The editor on the night scene (25/10/2026)](docs/editor.png)
 
-- **Menus and tools** along the top: File (Open, Save, Save As, Import,
-  Quit), Edit (group, new empty group, add, delete or reset lights),
-  View (frame, lights, wireframe, back-face culling), and the select, move,
-  rotate and scale tools.
+- **Menus and shelf** along the top, as Maya's: File (Open, Save, Save
+  As, Import, Quit), Edit (Copy, Paste, Duplicate, Duplicate Instanced,
+  Delete, Group, Parent, Unparent), Modify (Freeze Transformations),
+  Create (Polygon Primitives, Lights, Cameras, Empty Group) and Display
+  (navigation buttons, lights, wireframe, back-face culling); under them
+  the shelf (below). The viewport has its own View, Panels and Show menus.
 - **Outliner** on the left: the objects and their groups, the point and
   directional lights, the sun, the sky and exposure, the render settings. Click to select, double
   click to frame, drag an object onto another to put it under it, onto
@@ -734,11 +760,14 @@ with egui, on the CPU like everything else: egui's triangles are filled by
 - **Attribute editor** on the right, for what is selected: an object's
   name, translate, rotate about X, Y and Z (degrees, X first, then Y,
   then Z, as Maya's xyz order), scale along X, Y and Z, triangles,
-  levels of detail and size; a light's position, lumens and colour; the
-  sun's time and brightness; the sky's illuminance, both contrasts and the
-  exposure; the render settings (micropolygon spacing, frame size,
-  how much coarser a moving object is drawn, shadows, bounce) with the
-  last frame's numbers.
+  levels of detail and size, its materials; a point light's position,
+  lumens, colour, Light Radius and Shadow Falloff; a directional light's
+  angles, illuminance, colour, Light Angle and Shadow Falloff; the sun's
+  time, brightness and Light Angle; the sky's illuminance, both contrasts
+  and the exposure; a camera's position, aim and angle of view; the
+  render settings (micropolygon spacing, frame size, how much coarser a
+  moving object is drawn, shadows and their method, fields or maps,
+  bounce) with the last frame's numbers.
 - **Frame size**: 1920 x 1080 at start, whatever the window's size, shown
   as large as fits in the viewport with bars round it; Custom takes a
   width and height; Viewport pixels follows the viewport, times the
@@ -867,6 +896,8 @@ each cluster's level of detail for the view, so a far instance draws its
 coarse levels. Scene files write an instance as `instance_of` an earlier
 object (`docs/scene.md`).
 
+![25 instances of one tree with leaf cards, the sun's shadows through their leaves (25/10/2026)](docs/trees.png)
+
 Shortcuts: Ctrl+O open, Ctrl+S save, Ctrl+Shift+S save as, Ctrl+I import,
 Ctrl+G put the selected object in a new group. A scene file dropped on the
 window opens; a model dropped on it opens the importer.
@@ -881,6 +912,13 @@ an old `.fkj` (its ground) becomes `<scene>_world.fja`. Assets already on
 disk are not written again: moving an object only changes the `.fjs`.
 Open takes `.fjs` and old `.fkj` scenes; an `.fja` dropped on the window
 or chosen in File > Import is added as an object.
+
+An object written as a new asset gets its shadow field baked first. A
+scene or asset opened with an asset that has no field puts up Missing
+Shadow Fields: it lists those assets and offers Build and Save into the
+Assets (baked on a thread and written into each file, then opened), Build
+for This Session (baked in memory only) or Cancel. `--editor` started on
+such a scene opens the built-in set behind the dialog.
 
 ### Importer
 
@@ -909,21 +947,23 @@ Painting the interface took about 7 ms a frame at 1920 x 1080 on the same
 ## How a frame is made
 
 1. **What changed.** Lights are compared with the last frame's. A changed
-   light marks the clusters inside its old and new reach, and throws away
-   its shadow map if it moved or changed strength. The light changed last
+   light marks the clusters inside its old and new reach, and, with shadow
+   maps, throws away its map if it moved or changed strength. The light changed last
    keeps its own share of each point's shading (diffuse and highlight)
    beside the sum, so while it is dragged only its share is redone: the
    old share out, the new one in, one light evaluated a point instead of
    all of them. The first frame of a drag makes the share. While the
    camera holds still, grids are not checked against the view again. A change of
    sky, exposure, light reach, shadows or number of lights throws away all
-   shading. A moved object keeps every shadow map: each light and sun
+   shading. With shadow maps, a moved object keeps every map: each light and sun
    cascade that reaches where it was or is clears one rectangle round both
    places and draws again only the clusters that cover it. Only the
    moved object and the shading points whose shadow cone (towards a point
    light) or cylinder (towards the sun) crosses its old or new box are
    shaded again. Letting go makes the bounce light again.
-2. **Shadow maps** for lights that have none (`src/shadow.rs`), in parallel.
+2. **Shadows.** With shadow fields, each object's field is placed where
+   the object stands (`src/fieldtrace.rs`); nothing is drawn. With shadow
+   maps, maps for lights that have none (`src/shadow.rs`), in parallel.
    Then **surfels** inside a changed light's reach are lit again, and the
    bounce receivers that change could reach are thrown away.
 3. **Visibility** (`src/raster.rs`), skipped while the camera has not moved.
@@ -955,7 +995,8 @@ Painting the interface took about 7 ms a frame at 1920 x 1080 on the same
    under visible pixels are diced and shaded, and only those
    whose shading was not kept: radiance in cd/m² from the sky (times the
    point's share of it, from its object's sky transfer), then each
-   light in reach through its shadow map, by the point's material
+   light in reach through its shadow (the shadow fields its ray to the
+   light crosses, eight points at a time, or its map), by the point's material
    (below): GGX highlight with Smith visibility and Schlick's Fresnel on
    every surface, the sky's highlight from the mirror direction, and
    diffuse what the highlight leaves. Adaptive shading: every other point of a grid
@@ -979,9 +1020,12 @@ Painting the interface took about 7 ms a frame at 1920 x 1080 on the same
 and writes the binary format of `.fja` assets (and old `.fkj` scenes);
 `src/fjs.rs` reads and writes `.fjs` scenes and places their assets. `src/world.rs` makes the ground plane, valley and mountains,
 and the set's lights. `src/lights.rs` is the light rig and the picking and dragging
-maths. `src/shadow.rs` and `src/bounce.rs` are the shadow maps and the
-bounce light. `src/texture.rs` is the texture tiles and their cache;
-`tools/fkj-import` is the model converter, a separate crate.
+maths. `src/field.rs` bakes, stores and reads shadow fields and
+`src/fieldtrace.rs` traces rays through them; `src/shadow.rs` and
+`src/sun.rs` are the shadow maps; `src/bounce.rs` the bounce light.
+`src/texture.rs` is the texture tiles and their cache; `src/editor/` the
+editor; `tools/fkj-import` is the model converter, a separate crate that
+shares the scene, format, level of detail, sample and field code.
 
 ## Measured
 
@@ -1195,7 +1239,9 @@ Not measured yet: a Raspberry Pi.
   themselves); under shadow maps they do. A field's grid is 128 cells
   along its model's longest side, so detail under a cell (3.9 cm on the
   car) casts no shadow of its own. Lights are not linked: a lamp inside
-  its car's field is shadowed by the car's own surfaces round it.
+  its car's field is shadowed by the car's own surfaces round it. Points
+  tracing through their own object to a light close by cost more than a
+  shadow map (Measured). No visual debug view shows the fields yet.
 - Visual debug views: no view yet for culling (frustum and normal cone),
   for the surfel tree, or for the texture cache over time; text is a 5 x 7
   pixel font in capitals.
@@ -1261,7 +1307,8 @@ Not measured yet: a Raspberry Pi.
   and frame size follow the machine and are not saved; a scene saved
   with the high-resolution T-rex asks for it on any machine (the Pi
   included) rather than the plan picking the low-resolution one.
-- The editor: no undo; one object selected at a time; a copied or
+- The editor: no undo; the manipulator moves only the last of several
+  objects selected; a copied or
   duplicated object is a full copy of its geometry (Duplicate Instanced
   shares it); instances share their materials (no per-instance material
   changes); a model is added at the origin; the interface is
@@ -1299,7 +1346,6 @@ Not measured yet: a Raspberry Pi.
   shading against 1.3 M and 260 to 277 ms at two pixels (3.7 M and 545 to
   569 ms before this change).
 - `tools/fkj-import` does not read USD (`docs/format.md`).
-- Light rigs, directional lights and the sky setting are not saved.
 - Text overlay: the numbers are in the window title.
 - Framebuffer output: no vsync and no double buffering, so a frame can
   tear while it is written; dropping a file to open it needs a window.
