@@ -563,6 +563,7 @@ is), and every scene using it gets them.
     cargo run --release -- scene.fjs        a scene (an .fja opens as a scene of that object; an old .fkj opens too)
     cargo run --release -- --save my.fjs    write what is open as a scene, and .fja assets beside it for what has none
     cargo run --release -- --editor         the editor (below), 64-bit machines
+    cargo run --release -- --editor assets/night_forest.fjs   the night scene: the T-rex, the car and its lamps, 25 trees
 
 Headless, for tests and screenshots (no window, no display needed):
 

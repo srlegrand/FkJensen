@@ -24,6 +24,12 @@ Changes made here: converted to an `.fja` asset with `tools/fkj-import`, scaled 
 4.79 m long, base colour baked to per-triangle texture tiles, other maps
 dropped.
 
+## night_forest.fjs
+
+A scene (`docs/scene.md`) over `models/trex_highres.fja`, `models/car.fja`
+and `models/tree.fja`: the car with its six lamps parented to it, 25 trees
+as instances of one under a group, a moonlit rim light.
+
 ## chess_set.fkj
 
 No longer in the built-in set (21/10/2026); open it with

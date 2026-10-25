@@ -1,0 +1,344 @@
+{
+  "fjs": 1,
+  "objects": [
+    {
+      "name": "ground",
+      "asset": "built-in:ground",
+      "pivot": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "scale": 1.0
+    },
+    {
+      "name": "mountains",
+      "asset": "built-in:mountains",
+      "pivot": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "scale": 1.0
+    },
+    {
+      "name": "trex_highres",
+      "asset": "models/trex_highres.fja",
+      "pivot": [3.32082, 0.0, 3.14604],
+      "rotation": [-2.81098e-7, 59.944, -3.27878e-7],
+      "scale": 1.0
+    },
+    {
+      "name": "car",
+      "asset": "models/car.fja",
+      "pivot": [7.5, 0.0, 5.0],
+      "rotation": [0.0, -35.0, 0.0],
+      "scale": 1.0
+    },
+    {
+      "name": "trees",
+      "pivot": [4.83834, 0.0, 3.04635],
+      "rotation": [0.0, 0.0, 0.0],
+      "scale": 1.0
+    },
+    {
+      "name": "mountains1",
+      "pivot": [0.0, -0.117969, 11.2882],
+      "rotation": [0.0, 0.0, 0.0],
+      "scale": 0.00337924,
+      "instance_of": 1
+    },
+    {
+      "name": "tree1",
+      "asset": "models/tree.fja",
+      "pivot": [-20.326, 0.0, 9.927],
+      "rotation": [0.0, 352.98, 0.0],
+      "scale": 1.047,
+      "parent": 4
+    },
+    {
+      "name": "tree2",
+      "pivot": [24.469, 0.0, -8.187],
+      "rotation": [0.0, 248.84, 0.0],
+      "scale": 1.025,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree3",
+      "pivot": [-21.966, 0.0, 1.232],
+      "rotation": [0.0, 50.52, 0.0],
+      "scale": 0.861,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree4",
+      "pivot": [13.424, 0.0, 24.724],
+      "rotation": [0.0, 6.43999, 0.0],
+      "scale": 1.123,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree5",
+      "pivot": [-16.706, 0.0, -19.252],
+      "rotation": [0.0, 252.35, 0.0],
+      "scale": 1.139,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree6",
+      "pivot": [20.41, 0.0, 13.688],
+      "rotation": [0.0, 7.65002, 0.0],
+      "scale": 1.041,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree7",
+      "pivot": [29.174, 0.0, 18.785],
+      "rotation": [0.0, 173.6, 0.0],
+      "scale": 1.069,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree8",
+      "pivot": [-1.413, 0.0, -11.41],
+      "rotation": [0.0, 114.81, 0.0],
+      "scale": 1.15,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree9",
+      "pivot": [36.837, 0.0, -1.217],
+      "rotation": [0.0, 27.09, 0.0],
+      "scale": 1.014,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree10",
+      "pivot": [11.601, 0.0, 14.452],
+      "rotation": [0.0, 265.32, 0.0],
+      "scale": 1.12,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree11",
+      "pivot": [-11.2, 0.0, -0.195],
+      "rotation": [0.0, 265.35, 0.0],
+      "scale": 1.061,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree12",
+      "pivot": [26.614, 0.0, 6.874],
+      "rotation": [0.0, 285.58, 0.0],
+      "scale": 1.125,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree13",
+      "pivot": [18.869, 0.0, -21.253],
+      "rotation": [0.0, 126.66, 0.0],
+      "scale": 1.056,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree14",
+      "pivot": [-3.664, 0.0, 19.551],
+      "rotation": [0.0, 324.3, 0.0],
+      "scale": 1.111,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree15",
+      "pivot": [5.998, 0.0, -19.393],
+      "rotation": [0.0, 150.18, 0.0],
+      "scale": 1.087,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree16",
+      "pivot": [-6.827, 0.0, 32.381],
+      "rotation": [0.0, 310.85, 0.0],
+      "scale": 1.022,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree17",
+      "pivot": [4.892, 0.0, 28.501],
+      "rotation": [0.0, 224.99, 0.0],
+      "scale": 0.965,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree18",
+      "pivot": [-12.218, 0.0, 19.143],
+      "rotation": [0.0, 209.76, 0.0],
+      "scale": 1.033,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree19",
+      "pivot": [-24.204, 0.0, -11.649],
+      "rotation": [0.0, 28.87, 0.0],
+      "scale": 1.042,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree20",
+      "pivot": [1.572, 0.0, -30.236],
+      "rotation": [0.0, 357.6, 0.0],
+      "scale": 1.114,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree21",
+      "pivot": [14.619, 0.0, 33.662],
+      "rotation": [0.0, 262.15, 0.0],
+      "scale": 0.967,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree22",
+      "pivot": [-10.409, 0.0, 10.116],
+      "rotation": [0.0, 264.61, 0.0],
+      "scale": 1.024,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree23",
+      "pivot": [36.026, 0.0, 10.506],
+      "rotation": [0.0, 158.59, 0.0],
+      "scale": 1.102,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree24",
+      "pivot": [-12.579, 0.0, -8.819],
+      "rotation": [0.0, 30.16, 0.0],
+      "scale": 1.075,
+      "parent": 4,
+      "instance_of": 6
+    },
+    {
+      "name": "tree25",
+      "pivot": [-16.861, 0.0, 26.741],
+      "rotation": [0.0, 10.72, 0.0],
+      "scale": 1.03,
+      "parent": 4,
+      "instance_of": 6
+    }
+  ],
+  "lights": [
+    {
+      "position": [6.64439, 0.8, 7.35517],
+      "color": [1.0, 0.95, 0.85],
+      "lumens": 1200.0,
+      "parent": 3
+    },
+    {
+      "position": [5.5795, 0.8, 6.60952],
+      "color": [1.0, 0.95, 0.85],
+      "lumens": 1200.0,
+      "parent": 3
+    },
+    {
+      "position": [6.37079, 1.1, 7.18801],
+      "color": [1.0, 0.92, 0.75],
+      "lumens": 1500.0,
+      "parent": 3
+    },
+    {
+      "position": [5.83015, 1.1, 6.80945],
+      "color": [1.0, 0.92, 0.75],
+      "lumens": 1500.0,
+      "parent": 3
+    },
+    {
+      "position": [9.54338, 0.95, 3.47651],
+      "color": [1.0, 0.04, 0.02],
+      "lumens": 250.0,
+      "parent": 3
+    },
+    {
+      "position": [8.23273, 0.95, 2.55879],
+      "color": [1.0, 0.04, 0.02],
+      "lumens": 250.0,
+      "parent": 3
+    }
+  ],
+  "directional": [
+    {
+      "on": true,
+      "azimuth": 60.0,
+      "elevation": 11.0,
+      "color": [0.45, 0.65, 1.6],
+      "lux": 20.0
+    }
+  ],
+  "time": 21.0833,
+  "sun": {
+    "direction": [-0.502918, -0.68635, -0.525355],
+    "color": [1.60254, 0.881396, 0.400635],
+    "brightness": 480.0
+  },
+  "sky": {
+    "on": true,
+    "lux": 0.15,
+    "tint": [0.45, 0.6, 1.4],
+    "contrast": 0.9
+  },
+  "backdrop": {
+    "zenith": [0.04, 0.06, 0.2],
+    "horizon": [0.12, 0.16, 0.38],
+    "contrast": 0.9
+  },
+  "exposure": 0.07361,
+  "camera": {
+    "target": [0.0, 3.89039, 14.8263],
+    "distance": 55.7095,
+    "yaw": 17.1106,
+    "pitch": 13.5502,
+    "fov": 45.0
+  },
+  "cameras": [
+    {
+      "name": "shotCam",
+      "target": [6.19057, 2.83665, 2.98356],
+      "distance": 8.73378,
+      "yaw": 3.47807,
+      "pitch": -2.74567,
+      "fov": 50.0
+    }
+  ],
+  "render": {
+    "shadows": true,
+    "shadow_res": 512,
+    "bounce": true,
+    "light_reach": true,
+    "occlusion_culling": true,
+    "adaptive": true,
+    "sky_occlusion": true,
+    "incremental_moves": true,
+    "backface_culling": true,
+    "wireframe": false,
+    "drag_preview": true,
+    "bake_over_frames": true,
+    "moving_rate": 3.0,
+    "moving_detail": 3.0
+  }
+}
