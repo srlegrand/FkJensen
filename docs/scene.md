@@ -73,6 +73,8 @@ An object:
 | `scale` | along the object's own axes, before its rotation (Maya's order): one number when the same on every axis, else `[x, y, z]`; 1 when left out |
 | `parent` | the group it is in, the index of an earlier entry in `objects` |
 | `materials` | how its materials differ from its asset's in this scene: each an `index` (from 0, in the asset's order), its `name` (for reading), and whichever of `tint`, `roughness`, `metallic`, `specular` differ |
+| `frozen` | what Freeze Transformations folded in: 12 numbers, the three axes then the translation of an affine map between the object's frame and its geometry; left out when nothing is frozen |
+| `origin` | where its translate reads 0 (a frozen translate), metres; left out at the origin |
 | `instance_of` | an instance of an earlier entry in `objects` (its index): that entry's geometry, materials and texture tiles, stored once; `asset` and `materials` are left out |
 
 `pivot`, `rotation` and `scale` are absolute, from the rest the asset

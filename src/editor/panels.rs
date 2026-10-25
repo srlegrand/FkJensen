@@ -24,6 +24,14 @@ enum Action {
 #[derive(Clone, Copy)]
 struct LightDrag(usize);
 
+/// A number with up to 7 decimals, trailing zeros dropped: 1, 0.25,
+/// 0.0000125.
+fn short(v: f64) -> String {
+    let t = format!("{v:.7}");
+    let t = t.trim_end_matches('0');
+    t.trim_end_matches('.').to_string()
+}
+
 fn hhmm(h: f32) -> String {
     let m = (h.rem_euclid(24.0) * 60.0).round() as u32 % (24 * 60);
     format!("{:02}:{:02}", m / 60, m % 60)
@@ -249,7 +257,8 @@ impl Editor {
         }
         ui.add_space(4.0);
         let o = self.app.scene.objects[i].clone();
-        let (mut p, mut r, mut k) = (o.pivot, o.rotation * (180.0 / std::f32::consts::PI), o.scale);
+        // Translate reads from where it was frozen.
+        let (mut p, mut r, mut k) = (o.pivot - o.origin, o.rotation * (180.0 / std::f32::consts::PI), o.scale);
         let speed = (self.app.scene.focus_radius() as f64 * 0.004).max(0.0005);
         let mut changed = false;
         egui::CollapsingHeader::new("Transform").default_open(true).show(ui, |ui| {
@@ -266,7 +275,7 @@ impl Editor {
                 ui.end_row();
                 ui.label("Scale");
                 for (a, v) in [&mut k.x, &mut k.y, &mut k.z].into_iter().enumerate() {
-                    let r = ui.add(super::style::num(v).speed(0.005).range(0.001..=1000.0).max_decimals(3));
+                    let r = ui.add(super::style::num(v).speed(0.005).range(1e-6..=1e6).custom_formatter(|v, _| short(v)));
                     if a == 0 {
                         self.field_rects.push(("scale", r.rect));
                     }
@@ -277,7 +286,7 @@ impl Editor {
             ui.weak("Scales along its own axes, then rotates X, then Y, then Z.");
         });
         if changed {
-            self.app.move_object(i, p, r * (std::f32::consts::PI / 180.0), k);
+            self.app.move_object(i, p + o.origin, r * (std::f32::consts::PI / 180.0), k);
             self.pending_bounce = Some(i);
         }
         if !group {

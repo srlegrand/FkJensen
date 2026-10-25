@@ -786,6 +786,23 @@ and which one the view looks through. The menu bar's Display holds the
 navigation buttons, lights, wireframe and back-face toggles; framing is
 in the viewport's View menu.
 
+Modify > Freeze Transformations, as Maya's, on the selected objects: the
+channels checked under it (Translate, Rotate, Scale, all three at start)
+read 0, 0 and 1 from then on and nothing moves. A frozen rotation or
+scale is folded into the object, so later turns are about the world's
+axes and later scales along them; a frozen translate leaves the pivot
+where it is and counts the translate from there. Lights parented to it
+stay where they are. Scene files keep what was frozen (`docs/scene.md`).
+An object's transform is made again from its channels each time it
+moves, not from the last one, so scaling to a millionth and back loses
+nothing; scale goes down to 0.000001.
+
+The viewport's Show menu, as Maya's, turns each overlay on or off on its
+own: selection boxes, manipulators, lights, the selected light's height
+line, cameras, the navigation buttons and the heads up display (the
+tool, what is selected and the time); All and None set them together.
+A hidden manipulator cannot be taken, nor a hidden camera picked.
+
 Number fields and sliders in the panels take a typed value on Enter (or
 when the field loses focus), not while typing; anything that is not a
 number leaves the value as it was, and Escape drops what was typed.

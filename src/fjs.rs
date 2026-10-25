@@ -95,6 +95,33 @@ pub struct ObjectEntry {
     /// `materials` are then that entry's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_of: Option<usize>,
+    /// What Freeze Transformations folded into it: an affine map, its
+    /// three axes then its translation (12 numbers), between its frame
+    /// and its geometry. Left out when nothing is frozen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen: Option<[f32; 12]>,
+    /// Where its translate reads 0 (a frozen translate); left out at the
+    /// origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<[f32; 3]>,
+}
+
+fn frozen_entry(o: &crate::scene::Object) -> Option<[f32; 12]> {
+    (!o.frozen.abs_diff_eq(glam::Affine3A::IDENTITY, 1e-6)).then(|| affine_entry(&o.frozen))
+}
+
+fn origin_entry(o: &crate::scene::Object) -> Option<[f32; 3]> {
+    (o.origin != Vec3::ZERO).then(|| a3(o.origin))
+}
+
+/// An affine map as 12 numbers (axes, then translation), and back.
+pub fn affine_entry(a: &glam::Affine3A) -> [f32; 12] {
+    let c = a.to_cols_array();
+    c.map(round6)
+}
+
+pub fn affine_of(e: &[f32; 12]) -> glam::Affine3A {
+    glam::Affine3A::from_cols_array(e)
 }
 
 /// A change to one of an object's materials: only what differs from the
@@ -494,6 +521,12 @@ pub fn build(f: &SceneFile, dir: &Path, search: &[PathBuf]) -> Result<Scene, Str
     for (o, &i) in f.objects.iter().zip(&index) {
         scene.set_object(i, v3(o.pivot), v3(o.rotation.map(f32::to_radians)), o.scale.v());
     }
+    // Then what was frozen, each object on its own.
+    for (o, &i) in f.objects.iter().zip(&index) {
+        if o.frozen.is_some() || o.origin.is_some() {
+            scene.set_frozen(i, o.frozen.as_ref().map_or(glam::Affine3A::IDENTITY, affine_of), o.origin.map_or(Vec3::ZERO, v3));
+        }
+    }
     scene.lights = f.lights.iter().map(|l| PointLight { position: v3(l.position), color: v3(l.color), lumens: l.lumens.clamp(crate::scene::MIN_LUMENS, crate::scene::MAX_LUMENS) }).collect();
     scene.light_parents = f.lights.iter().map(|l| l.parent.and_then(|p| index.get(p).copied())).collect();
     scene.focus = scene.subject();
@@ -612,6 +645,8 @@ pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight], light_pa
                     parent: o.parent.filter(|&p| p < n && at[p] < at[i]).map(|p| at[p]),
                     materials: Vec::new(),
                     instance_of: Some(at[j]),
+                    frozen: frozen_entry(o),
+                    origin: origin_entry(o),
                 };
             }
             ObjectEntry {
@@ -627,6 +662,8 @@ pub fn entries(scene: &Scene, scene_path: &Path, lights: &[PointLight], light_pa
                 parent: o.parent.filter(|&p| p < n && at[p] < at[i]).map(|p| at[p]),
                 materials: if o.clusters.is_empty() { Vec::new() } else { material_changes(scene, i) },
                 instance_of: None,
+                frozen: frozen_entry(o),
+                origin: origin_entry(o),
             }
         })
         .collect();

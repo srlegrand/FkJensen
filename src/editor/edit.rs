@@ -7,12 +7,16 @@ use crate::Selection;
 use crate::raster::DirLight;
 use crate::scene::{PointLight, Scene};
 
+/// Where a copied object stood: pivot, rotation, scale, what was frozen
+/// and where its translate reads 0.
+type Placing = (glam::Vec3, glam::Vec3, glam::Vec3, glam::Affine3A, glam::Vec3);
+
 /// What Copy took.
 pub enum Clip {
     /// An object and what is under it, as they were: each a scene of one
     /// object at rest, with where it stood and the copy it is in (an index
     /// into the list, before it).
-    Objects(Vec<(Scene, (glam::Vec3, glam::Vec3, glam::Vec3), Option<usize>)>),
+    Objects(Vec<(Scene, Placing, Option<usize>)>),
     Light(PointLight),
     Directional(DirLight),
     Camera(crate::SceneCamera),
@@ -101,7 +105,7 @@ impl Editor {
                         one.objects[0].asset_materials = o.asset_materials.clone();
                         one.objects[0].environment = o.environment;
                         let parent = o.parent.and_then(|p| tree.iter().position(|&t| t == p));
-                        (one, (o.pivot, o.rotation, o.scale), parent)
+                        (one, (o.pivot, o.rotation, o.scale, o.frozen, o.origin), parent)
                     })
                     .collect();
                 Some(Clip::Objects(items))
@@ -118,7 +122,7 @@ impl Editor {
         match &self.clip {
             Some(Clip::Objects(items)) => {
                 let mut made: Vec<usize> = Vec::new();
-                for (one, (pivot, rotation, scale), parent) in items {
+                for (one, (pivot, rotation, scale, frozen, origin), parent) in items {
                     let s = &mut self.app.scene;
                     let j = if one.clusters.is_empty() { s.add_group(one.objects[0].name.clone(), *pivot) } else {
                         let j = s.objects.len();
@@ -127,6 +131,7 @@ impl Editor {
                     };
                     s.objects[j].parent = parent.map(|p| made[p]);
                     s.set_object(j, *pivot, *rotation, *scale);
+                    s.set_frozen(j, *frozen, *origin);
                     made.push(j);
                 }
                 if let Some(&first) = made.first() {
@@ -186,6 +191,27 @@ impl Editor {
         let n = made.len();
         self.select(Selection::Object(made[0]));
         self.say(format!("{} instanced{}", self.app.scene.objects[made[0]].name, if n > 1 { format!(" with {} under it", n - 1) } else { String::new() }), false);
+    }
+
+    /// Freeze Transformations on the selected objects: the channels asked
+    /// for read 0, 0 and 1 from now on and nothing moves (lights parented
+    /// to them keep their places).
+    pub fn freeze_selected(&mut self, translate: bool, rotate: bool, scale: bool) {
+        let objs = self.selected_objects();
+        for &i in &objs {
+            self.app.scene.freeze(i, translate, rotate, scale);
+            let f = self.app.scene.object_frame(i);
+            let rig = &mut self.app.rig;
+            for k in 0..rig.lights.len() {
+                if let Some(mut l) = rig.link(k).filter(|l| l.object == i) {
+                    l.local = f.inverse().transform_point3(rig.lights[k].position);
+                    l.last = rig.lights[k].position;
+                    rig.set_link(k, Some(l));
+                }
+            }
+        }
+        let what: Vec<&str> = [(translate, "translate"), (rotate, "rotate"), (scale, "scale")].iter().filter(|x| x.0).map(|x| x.1).collect();
+        self.say(format!("froze {} on {} object{}", what.join(", "), objs.len(), if objs.len() == 1 { "" } else { "s" }), false);
     }
 
     /// Copy and paste in one, leaving the clipboard as it was.

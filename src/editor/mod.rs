@@ -152,6 +152,10 @@ pub struct Editor {
     /// Position).
     parenting: Option<usize>,
     pub preserve_position: bool,
+    /// Which channels Freeze Transformations freezes.
+    pub freeze: (bool, bool, bool),
+    /// The viewport's heads up display: tool, selection, time.
+    pub hud: bool,
 }
 
 impl Editor {
@@ -192,6 +196,8 @@ impl Editor {
             clip: None,
             parenting: None,
             preserve_position: true,
+            freeze: (true, true, true),
+            hud: true,
         }
     }
 
@@ -808,6 +814,18 @@ impl Editor {
                     ui.close();
                 }
             });
+            // Maya's Modify: Freeze Transformations and its options.
+            ui.menu_button("Modify", |ui| {
+                let some = !self.selected_objects().is_empty();
+                if ui.add_enabled(some, egui::Button::new("Freeze Transformations")).on_hover_text("The checked channels read 0, 0 and 1 from now on; nothing moves").clicked() {
+                    let (t, r, s) = self.freeze;
+                    self.freeze_selected(t, r, s);
+                    ui.close();
+                }
+                ui.checkbox(&mut self.freeze.0, "Translate");
+                ui.checkbox(&mut self.freeze.1, "Rotate");
+                ui.checkbox(&mut self.freeze.2, "Scale");
+            });
             self.create_menu(ui);
             // Maya's Display; framing is in the viewport's View menu.
             ui.menu_button("Display", |ui| {
@@ -899,8 +917,10 @@ impl Editor {
                     self.view_menu(ui);
                     self.panels_menu(ui);
                     self.show_menu(ui);
-                    ui.label(egui::RichText::new(self.app.view_name()).color(egui::Color32::from_rgb(140, 200, 255)));
-                    ui.label(egui::RichText::new(text).color(egui::Color32::from_gray(230)));
+                    if self.hud {
+                        ui.label(egui::RichText::new(self.app.view_name()).color(egui::Color32::from_rgb(140, 200, 255)));
+                        ui.label(egui::RichText::new(text).color(egui::Color32::from_gray(230)));
+                    }
                 });
             });
         });
@@ -917,6 +937,28 @@ impl Editor {
             None => "picture".to_string(),
         };
         let menu = ui.menu_button(format!("Show: {name}"), |ui| {
+            // What is drawn over the picture, each on its own, as Maya's
+            // Show menu.
+            ui.horizontal(|ui| {
+                ui.weak("Overlays");
+                for (label, on) in [("All", true), ("None", false)] {
+                    if ui.small_button(label).clicked() {
+                        let o = &mut self.app.overlays;
+                        (o.selection, o.manipulator, o.cameras, o.light_line) = (on, on, on, on);
+                        self.app.rig.show = on;
+                        self.navigate = on;
+                        self.hud = on;
+                    }
+                }
+            });
+            ui.checkbox(&mut self.app.overlays.selection, "Selection boxes");
+            ui.checkbox(&mut self.app.overlays.manipulator, "Manipulators");
+            ui.checkbox(&mut self.app.rig.show, "Lights (L)");
+            ui.checkbox(&mut self.app.overlays.light_line, "Light height line");
+            ui.checkbox(&mut self.app.overlays.cameras, "Cameras");
+            ui.checkbox(&mut self.navigate, "Navigation buttons");
+            ui.checkbox(&mut self.hud, "Heads up display").on_hover_text("The tool, what is selected and the time, beside these menus");
+            ui.separator();
             if ui.selectable_label(self.app.visual.is_none() && self.app.settings.view == crate::raster::View::Shaded, "Picture").clicked() {
                 self.app.visual = None;
                 self.app.settings.view = crate::raster::View::Shaded;
@@ -1131,6 +1173,77 @@ mod tests {
 
     fn raw(w: usize, h: usize) -> egui::RawInput {
         egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32))), ..Default::default() }
+    }
+
+    /// Freeze Transformations: the frozen channels read 0, 0 and 1,
+    /// nothing moves (nor a light parented to it), later moves start from
+    /// there, and a scene saves and opens it so.
+    #[test]
+    fn frozen_transforms_read_zero_and_nothing_moves() {
+        let mut ed = editor();
+        ed.make(create::Make::Primitive("cube"));
+        let Selection::Object(i) = ed.app.selection else { panic!() };
+        ed.app.scene.set_object(i, glam::Vec3::new(2.0, 0.5, -1.0), glam::Vec3::new(0.3, 0.8, 0.0), glam::Vec3::new(2.0, 0.5, 1.5));
+        ed.app.parent_light(0, i, true);
+        let light = ed.app.rig.lights[0].position;
+        let range = ed.app.scene.objects[i].clusters.clone();
+        let pos = |ed: &Editor| -> Vec<glam::Vec3> { range.clone().flat_map(|c| ed.app.scene.cluster_pos(&ed.app.scene.clusters[c]).collect::<Vec<_>>()).collect() };
+        let before = pos(&ed);
+        ed.select(Selection::Object(i));
+        ed.freeze_selected(true, true, true);
+        let o = &ed.app.scene.objects[i];
+        assert_eq!((o.pivot - o.origin, o.rotation, o.scale), (glam::Vec3::ZERO, glam::Vec3::ZERO, glam::Vec3::ONE));
+        assert!(pos(&ed).iter().zip(&before).all(|(a, b)| a.distance(*b) < 1e-5), "nothing moves");
+        ed.app.sync_lights();
+        assert!(ed.app.rig.lights[0].position.distance(light) < 1e-5, "nor its light");
+        // A quarter turn about Y from there: about the pivot, as frozen.
+        let p = ed.app.scene.objects[i].pivot;
+        ed.app.scene.set_object(i, p, glam::Vec3::new(0.0, std::f32::consts::FRAC_PI_2, 0.0), glam::Vec3::ONE);
+        let q = glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        assert!(pos(&ed).iter().zip(&before).all(|(a, b)| a.distance(q * (*b - p) + p) < 1e-4));
+        // A scale far under a thousandth is taken.
+        ed.app.scene.set_object(i, p, glam::Vec3::new(0.0, std::f32::consts::FRAC_PI_2, 0.0), glam::Vec3::splat(1e-5));
+        assert!((ed.app.scene.objects[i].scale.x - 1e-5).abs() < 1e-9);
+        ed.app.scene.set_object(i, p, glam::Vec3::new(0.0, std::f32::consts::FRAC_PI_2, 0.0), glam::Vec3::ONE);
+        let now = pos(&ed);
+        let d = std::env::temp_dir().join(format!("fkj-freeze-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        ed.save(d.join("f.fjs"));
+        let mut other = editor();
+        other.open(d.join("f.fjs"));
+        let _ = std::fs::remove_dir_all(&d);
+        let j = other.app.scene.objects.iter().position(|o| o.name == "cube1").unwrap();
+        let o = &other.app.scene.objects[j];
+        assert!((o.pivot - o.origin).length() < 1e-5 && (o.rotation.y - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        let got: Vec<glam::Vec3> = o.clusters.clone().flat_map(|c| other.app.scene.cluster_pos(&other.app.scene.clusters[c]).collect::<Vec<_>>()).collect();
+        assert!(got.iter().zip(&now).all(|(a, b)| a.distance(*b) < 1e-3), "opened where it was saved");
+    }
+
+    /// Every overlay off: the picture is the picture with nothing selected.
+    #[test]
+    fn overlays_turn_off_one_by_one() {
+        let mut ed = editor();
+        ed.app.frame = crate::raster::Frame::new(320, 200);
+        ed.app.render();
+        let plain = ed.app.frame.color.clone();
+        ed.app.selection = Selection::Object(0);
+        ed.app.render();
+        assert_ne!(ed.app.frame.color, plain, "the box and manipulator show");
+        ed.app.overlays.selection = false;
+        ed.app.render();
+        assert_ne!(ed.app.frame.color, plain, "the manipulator still shows");
+        ed.app.overlays.manipulator = false;
+        ed.app.render();
+        let lights_on = ed.app.frame.color.clone();
+        ed.app.rig.show = false;
+        ed.app.render();
+        let lights_off = ed.app.frame.color.clone();
+        ed.app.selection = Selection::Nothing;
+        ed.app.render();
+        assert_eq!(lights_off, ed.app.frame.color, "nothing of the selection shows");
+        assert_ne!(lights_on, lights_off, "lights are an overlay of their own");
+        let _ = plain;
     }
 
     /// Several objects selected (Ctrl and Shift clicks in the outliner):

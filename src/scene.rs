@@ -397,6 +397,13 @@ pub struct Object {
     /// Pivot, rotation and scale its geometry is stored at (where `xf` is
     /// the identity): an asset's own.
     pub rest: (Vec3, Vec3, Vec3),
+    /// What Freeze Transformations folded in: its geometry stands at
+    /// `frame() * frozen * frame_of(rest)⁻¹`, so a frozen rotation or scale
+    /// reads 0 or 1 and the object stays where it is.
+    pub frozen: glam::Affine3A,
+    /// Where its translate reads 0 (Freeze Transformations on translate):
+    /// the editor shows `pivot - origin`, the pivot stays where it is.
+    pub origin: Vec3,
     /// Bounds of its finest level's vertices, in the world (round its
     /// oriented box).
     pub lo: Vec3,
@@ -424,7 +431,7 @@ impl Object {
     /// A new object of clusters `clusters` whose geometry is stored where it
     /// stands.
     pub fn new(name: String, clusters: std::ops::Range<usize>, pivot: Vec3, rotation: Vec3, scale: Vec3, parent: Option<usize>) -> Object {
-        Object { name, clusters, pivot, rotation, scale, rest: (pivot, rotation, scale), lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent, asset: None, materials: 0..0, asset_materials: Vec::new(), environment: false }
+        Object { name, clusters, pivot, rotation, scale, rest: (pivot, rotation, scale), frozen: glam::Affine3A::IDENTITY, origin: Vec3::ZERO, lo: pivot, hi: pivot, xf: glam::Affine3A::IDENTITY, box_lo: pivot, box_hi: pivot, parent, asset: None, materials: 0..0, asset_materials: Vec::new(), environment: false }
     }
 
     /// Its frame: scale along its axes, then rotation, then the pivot.
@@ -465,6 +472,15 @@ pub fn linear_parts(a: &glam::Affine3A) -> (f32, glam::Quat, glam::Mat3) {
     let q = glam::Quat::from_mat3(&r).normalize();
     let n = if m.determinant().abs() > 1e-30 { m.inverse().transpose() } else { glam::Mat3::from_quat(q) };
     (k, q, n)
+}
+
+/// Whether an affine map keeps angles (a rotation and a scale the same on
+/// every axis).
+pub fn is_conformal(a: &glam::Affine3A) -> bool {
+    let m = glam::Mat3::from(a.matrix3);
+    let (x, y, z) = (m.x_axis, m.y_axis, m.z_axis);
+    let l = x.length();
+    (y.length() - l).abs() <= 1e-4 * l && (z.length() - l).abs() <= 1e-4 * l && x.dot(y).abs() <= 1e-4 * l * l && y.dot(z).abs() <= 1e-4 * l * l && x.dot(z).abs() <= 1e-4 * l * l
 }
 
 /// How an affine map scales areas, about: its determinant to the 2/3.
@@ -1292,7 +1308,7 @@ impl Scene {
     /// under it moves with it, about its pivot.
     pub fn set_object(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: Vec3) {
         let o = self.objects[i].clone();
-        let scale = scale.max(Vec3::splat(1e-4));
+        let scale = scale.max(Vec3::splat(1e-6));
         if pivot == o.pivot && rotation == o.rotation && scale == o.scale {
             return;
         }
@@ -1310,35 +1326,95 @@ impl Scene {
         self.place_one(i, pivot, rotation, scale);
     }
 
+    /// Freeze Transformations, as Maya's, on object `i`: what is asked of
+    /// translate, rotate and scale reads 0, 0 and 1 from now on, and
+    /// nothing moves. Rotate and scale fold into `frozen`; translate moves
+    /// `origin` to the pivot, which stays where it is.
+    pub fn freeze(&mut self, i: usize, translate: bool, rotate: bool, scale: bool) {
+        let o = &mut self.objects[i];
+        if translate {
+            o.origin = o.pivot;
+        }
+        let old = o.frame();
+        if rotate {
+            o.rotation = Vec3::ZERO;
+        }
+        if scale {
+            o.scale = Vec3::ONE;
+        }
+        o.frozen = o.frame().inverse() * old * o.frozen;
+    }
+
+    /// Give object `i` (placed as if nothing were frozen) what a scene file
+    /// says was frozen: its geometry takes it, its channels stay.
+    pub fn set_frozen(&mut self, i: usize, frozen: glam::Affine3A, origin: Vec3) {
+        let o = &self.objects[i];
+        let (p, r, s) = o.rest;
+        let to = o.frame() * frozen * frame_of(p, r, s).inverse();
+        let (_, q, _) = linear_parts(&(to * o.xf.inverse()));
+        self.move_geometry(i, to, q, false);
+        self.objects[i].frozen = frozen;
+        self.objects[i].origin = origin;
+    }
+
     /// `set_object` for object `i` alone.
     fn place_one(&mut self, i: usize, pivot: Vec3, rotation: Vec3, scale: Vec3) {
         let o = self.objects[i].clone();
         let q = euler_quat(rotation) * euler_quat(o.rotation).inverse();
+        let (rp, rr, rs) = o.rest;
+        let to = frame_of(pivot, rotation, scale) * o.frozen * frame_of(rp, rr, rs).inverse();
+        let even = uniform(scale) && uniform(o.scale) && uniform(rs) && is_conformal(&o.frozen);
+        self.move_geometry(i, to, q, even);
+        let ob = &mut self.objects[i];
+        ob.pivot = pivot;
+        ob.rotation = rotation;
+        ob.scale = scale;
+        self.world_bounds(i);
+        let (lo, hi) = (self.objects[i].lo, self.objects[i].hi);
+        self.bounds_min = self.bounds_min.min(lo);
+        self.bounds_max = self.bounds_max.max(hi);
+    }
+
+    /// Put object `i`'s geometry at `to` (from as stored to the world;
+    /// the move from where it is turns by about `q`, and `even` when its
+    /// scale is the same on every axis): its transform, its clusters'
+    /// transforms, bounds and normals, its samples. Its channels stay.
+    /// A cluster's transform is made from `to` and its quantisation box,
+    /// not from the last one, so going very small and back loses nothing.
+    fn move_geometry(&mut self, i: usize, to: glam::Affine3A, q: glam::Quat, even: bool) {
+        let o = self.objects[i].clone();
         if o.clusters.is_empty() {
-            let ob = &mut self.objects[i];
-            ob.pivot = pivot;
-            ob.rotation = rotation;
-            ob.scale = scale;
-            self.world_bounds(i);
             return;
         }
         // The vertices stay as stored; the object's transform and its
         // clusters' bounds move.
-        let d = frame_of(pivot, rotation, scale) * o.frame().inverse();
+        let d = to * o.xf.inverse();
         let (k, _, nd) = linear_parts(&d);
-        let even = uniform(scale) && uniform(o.scale);
+        let (_, qa, na) = linear_parts(&to);
         let map = |p: Vec3| d.transform_point3(p);
         {
             use rayon::prelude::*;
             self.clusters[o.clusters.clone()].par_iter_mut().for_each(|c| {
-                c.xf = d * c.xf;
-                c.nmat = nd * if c.turned { c.nmat } else { glam::Mat3::IDENTITY };
-                c.turn = (q * c.turn).normalize();
+                let qb = glam::Affine3A::from_scale_rotation_translation(c.qstep, glam::Quat::IDENTITY, c.qlo);
+                // Clusters where the object's transform says (all but
+                // copies made by an old file's INST) are placed afresh.
+                let far = Vec3::splat(65535.0);
+                let size = (c.qstep * 65535.0).length() + 1.0;
+                let fresh = (o.xf * qb).transform_point3(Vec3::ZERO).distance(c.xf.transform_point3(Vec3::ZERO)) < 1e-3 * size && (o.xf * qb).transform_point3(far).distance(c.xf.transform_point3(far)) < 1e-3 * size;
+                if fresh {
+                    c.xf = to * qb;
+                    c.nmat = na;
+                    c.turn = qa;
+                } else {
+                    c.xf = d * c.xf;
+                    c.nmat = nd * if c.turned { c.nmat } else { glam::Mat3::IDENTITY };
+                    c.turn = (q * c.turn).normalize();
+                }
                 c.turned = true;
                 c.centre = map(c.centre);
                 // A hair wider: the bounds move by arithmetic, not by
-                // measuring the vertices again.
-                c.radius = c.radius * k * (1.0 + 1e-5) + 1e-6;
+                // measuring the vertices again, and floats round.
+                c.radius = c.radius * k * (1.0 + 1e-5) + 1e-6 + c.centre.abs().max_element() * 1e-6;
                 if even {
                     c.cone_axis = q * c.cone_axis;
                 } else {
@@ -1349,7 +1425,7 @@ impl Scene {
                 c.move_lod(map, k);
             });
         }
-        self.objects[i].xf = d * o.xf;
+        self.objects[i].xf = to;
         let r = self.samples_in(o.clusters.clone());
         let a = area_scale(&d);
         for s in &mut self.samples[r] {
@@ -1358,14 +1434,7 @@ impl Scene {
             s.area *= a;
             s.sky = turned_sky(&s.sky, q, k);
         }
-        let ob = &mut self.objects[i];
-        ob.pivot = pivot;
-        ob.rotation = rotation;
-        ob.scale = scale;
         self.world_bounds(i);
-        let (lo, hi) = (self.objects[i].lo, self.objects[i].hi);
-        self.bounds_min = self.bounds_min.min(lo);
-        self.bounds_max = self.bounds_max.max(hi);
     }
 
     /// Append a mesh already in world space, cutting it into clusters.

@@ -179,10 +179,35 @@ enum Selection {
 
 /// A camera of the scene, as Maya's: a name and where it looks from. The
 /// view looks through one of them or through the perspective camera.
+impl Selection {
+    /// Itself when `on`, else nothing.
+    fn clone_if(self, on: bool) -> Selection {
+        if on { self } else { Selection::Nothing }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct SceneCamera {
     name: String,
     cam: OrbitCamera,
+}
+
+/// What is drawn over the picture, each on its own (the viewport's Show
+/// menu; the lights are `LightRig::show`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Overlays {
+    /// Selected objects' boxes.
+    selection: bool,
+    manipulator: bool,
+    cameras: bool,
+    /// The selected light's line down to the floor.
+    light_line: bool,
+}
+
+impl Default for Overlays {
+    fn default() -> Self {
+        Overlays { selection: true, manipulator: true, cameras: true, light_line: true }
+    }
 }
 
 /// A manipulator handle being dragged, and how things were when it was
@@ -233,6 +258,7 @@ struct App {
     /// Other objects selected with it (the outliner's Ctrl and Shift
     /// clicks); `selection` is the last one picked, as Maya's lead.
     extra: Vec<usize>,
+    overlays: Overlays,
     manip: Option<ManipDrag>,
     /// The handle under the pointer.
     hot: Option<manip::Handle>,
@@ -307,6 +333,7 @@ impl App {
             tool: manip::Tool::Move,
             selection: Selection::Nothing,
             extra: Vec::new(),
+            overlays: Overlays::default(),
             manip: None,
             hot: None,
             alt: false,
@@ -665,7 +692,7 @@ impl App {
             let floor = self.floor();
             for (i, l) in self.rig.lights.iter().enumerate() {
                 let sel = i == self.rig.selected;
-                if sel {
+                if sel && self.overlays.light_line {
                     // A dashed line down to the floor and a small mark there,
                     // so the light's height reads at a glance.
                     let foot = Vec3::new(l.position.x, floor, l.position.z);
@@ -683,7 +710,7 @@ impl App {
         // Cameras, as Maya draws them: a small body and the frustum ahead,
         // not the one looked through.
         for (n, c) in self.cameras.iter().enumerate() {
-            if self.through == Some(n) {
+            if self.through == Some(n) || !self.overlays.cameras {
                 continue;
             }
             let sel = self.selection == Selection::Camera(n);
@@ -705,7 +732,7 @@ impl App {
         }
         // The selection and its manipulator.
         let k = self.render_scale.max(0.25);
-        if let Selection::Object(i) = self.selection {
+        if let Selection::Object(i) = self.selection.clone_if(self.overlays.selection) {
             // Each box turns with its object; a group shows those under it.
             // The others selected with it are drawn paler.
             let others: Vec<usize> = self.extra.iter().copied().filter(|&j| j != i && j < self.scene.objects.len()).collect();
@@ -727,6 +754,9 @@ impl App {
 
     /// Where the manipulator is and which one: lights only move.
     fn gizmo(&self) -> Option<(Vec3, manip::Tool)> {
+        if !self.overlays.manipulator {
+            return None;
+        }
         match self.selection {
             Selection::Object(i) => self.scene.objects.get(i).map(|o| (o.pivot, self.tool)),
             Selection::Light(i) if self.tool == manip::Tool::Move && self.rig.show => self.rig.lights.get(i).map(|l| (l.position, self.tool)),
@@ -871,7 +901,7 @@ impl App {
     fn select_at_pointer(&mut self) -> Option<usize> {
         self.extra.clear();
         // A camera's eye, drawn as a dot.
-        {
+        if self.overlays.cameras {
             let cam = self.render_camera();
             let r = 9.0 * self.render_scale.max(0.25);
             for (k, c) in self.cameras.iter().enumerate() {
