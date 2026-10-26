@@ -5,8 +5,8 @@ API is linked: the frame is made on the cores with rayon and copied to the
 window through shared memory (softbuffer), or straight to the Linux
 framebuffer where there is no window system.
 
-The name: Fuck Jensen. Jensen Huang co-founded Nvidia, whose graphics cards
-have been priced out of reach of the people who make pictures with them.
+*The name: Fuck Jensen. Jensen Huang co-founded Nvidia, whose graphics cards
+have been priced out of reach of the people who make pictures with them.*
 
 The aim is one program that runs the same scenes on anything from a
 Raspberry Pi 1 to a Threadripper, without a GPU at all: it measures the
